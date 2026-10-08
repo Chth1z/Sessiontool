@@ -1,3 +1,4 @@
+// 服务模式和导出的独立文件共用这一份脚本；独立文件里没有的控件都先判断再用
 (function () {
   'use strict';
   function $(s, r) { return (r || document).querySelector(s); }
@@ -15,11 +16,60 @@
   function store(k, v) {
     try {
       if (v === undefined) return localStorage.getItem(k);
-      localStorage.setItem(k, v);
+      if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v);
     } catch (e) { return null; }
+  }
+  function typing(e) {
+    var t = e.target;
+    return t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable;
+  }
+  function terms(q) { return q.toLowerCase().split(/\s+/).filter(Boolean); }
+
+  /* ---------- 主题：跟随系统 → 浅色 → 深色 ---------- */
+
+  var themeBtn = $('#theme');
+  var THEMES = [[null, '◐ 跟随系统'], ['light', '☀ 浅色'], ['dark', '☾ 深色']];
+  function themeIndex() {
+    var cur = document.documentElement.dataset.theme || null;
+    for (var i = 0; i < THEMES.length; i++) if (THEMES[i][0] === cur) return i;
+    return 0;
+  }
+  if (themeBtn) {
+    themeBtn.textContent = THEMES[themeIndex()][1];
+    themeBtn.onclick = function () {
+      var next = THEMES[(themeIndex() + 1) % THEMES.length];
+      if (next[0]) document.documentElement.dataset.theme = next[0];
+      else delete document.documentElement.dataset.theme;
+      store('theme', next[0]);
+      themeBtn.textContent = next[1];
+    };
+  }
+
+  /* ---------- 有新记录时提示刷新 ---------- */
+
+  var body = document.body;
+  if (body.dataset.state) {
+    var told = false;
+    setInterval(function () {
+      if (told || document.hidden) return;
+      fetch(body.dataset.state).then(function (r) { return r.json(); }).then(function (j) {
+        if (told || j.sig === body.dataset.sig) return;
+        told = true;
+        var toast = el('div', 'toast');
+        toast.appendChild(el('span', null, '有新的记录'));
+        var b = el('button', null, '刷新');
+        b.onclick = function () { location.reload(); };
+        toast.appendChild(b);
+        body.appendChild(toast);
+      }).catch(function () {});
+    }, 8000);
   }
 
   /* ---------- 会话页 ---------- */
+
+  function reveal(node) {
+    for (var p = node; p; p = p.parentNode) if (p.tagName === 'DETAILS') p.open = true;
+  }
 
   // 工具详情在展开时才向本地服务要，页面本身只带一行摘要
   function fillTool(d) {
@@ -59,13 +109,15 @@
         box.appendChild(el('div', 'k', '完整输出（保存在 tool-results 里的文件）'));
         box.appendChild(el('pre', null, j.full));
       }
-      j.images.forEach(function (src) {
-        var a = el('a'), im = el('img', 'pic');
-        a.href = src; a.target = '_blank';
-        im.loading = 'lazy'; im.alt = '截图'; im.src = src;
-        a.appendChild(im);
-        box.appendChild(a);
-      });
+      if (j.images.length) {
+        var pics = el('div', 'pics');
+        j.images.forEach(function (src) {
+          var im = el('img', 'pic');
+          im.loading = 'lazy'; im.alt = '截图'; im.src = src;
+          pics.appendChild(im);
+        });
+        box.appendChild(pics);
+      }
       if (activeQ) highlight(activeQ, d);     // 从搜索结果跳到这次工具调用时，把命中的地方标出来
     }).catch(function () {
       d.dataset.done = '';
@@ -77,9 +129,31 @@
     if (d.classList && d.classList.contains('tool') && d.open) fillTool(d);
   }, true);
 
-  function reveal(node) {
-    for (var p = node; p; p = p.parentNode) if (p.tagName === 'DETAILS') p.open = true;
-  }
+  // 点图片放大，再点或按 Esc 关闭
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    $$('details.menu[open]').forEach(function (m) { if (!m.contains(t)) m.open = false; });
+    if (t.classList && t.classList.contains('pic')) {
+      var box = el('div', 'box'), im = el('img');
+      im.src = t.src;
+      box.appendChild(im);
+      box.onclick = function () { box.remove(); };
+      body.appendChild(box);
+    } else if (t.classList && t.classList.contains('copy')) {
+      var text = $('.body', t.closest('.msg')).innerText;
+      var done = function () {
+        t.textContent = '已复制';
+        setTimeout(function () { t.textContent = '复制'; }, 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done);
+      else {
+        var ta = el('textarea');
+        ta.value = text; body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch (err) {}
+        ta.remove();
+      }
+    }
+  });
 
   // 会话内搜索：把命中的文字包进 <mark>，右下角切换
   var marks = [], cur = -1, bar = null, activeQ = '';
@@ -100,37 +174,44 @@
     var m = marks[cur];
     m.classList.add('cur');
     reveal(m);
-    m.scrollIntoView({ block: 'center' });
+    m.scrollIntoView({ block: 'center', behavior: 'auto' });
     bar.firstChild.textContent = (cur + 1) + ' / ' + marks.length;
+  }
+  function markAll(root, word) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT), nodes = [], n;
+    while ((n = walker.nextNode())) {
+      if (n.parentNode.tagName !== 'MARK' && n.nodeValue.toLowerCase().indexOf(word) >= 0) nodes.push(n);
+    }
+    nodes.forEach(function (node) {
+      var i;
+      while ((i = node.nodeValue.toLowerCase().indexOf(word)) >= 0) {
+        var hit = node.splitText(i);
+        node = hit.splitText(word.length);
+        var mk = el('mark', null, hit.nodeValue);
+        hit.parentNode.replaceChild(mk, hit);
+        marks.push(mk);
+      }
+    });
   }
   function highlight(q, near) {
     clearMarks();
     activeQ = q;
-    if (!q) return;
-    var lq = q.toLowerCase();
+    var words = terms(q);
+    if (!words.length) return;
     $$('main .msg .body, main details.fold > .body, main details.tool[open] > .tc').forEach(function (root) {
-      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT), nodes = [], n;
-      while ((n = walker.nextNode())) if (n.nodeValue.toLowerCase().indexOf(lq) >= 0) nodes.push(n);
-      nodes.forEach(function (node) {
-        var i;
-        while ((i = node.nodeValue.toLowerCase().indexOf(lq)) >= 0) {
-          var hit = node.splitText(i);
-          node = hit.splitText(q.length);
-          var mk = el('mark', null, hit.nodeValue);
-          hit.parentNode.replaceChild(mk, hit);
-          marks.push(mk);
-        }
-      });
+      words.forEach(function (w) { markAll(root, w); });
     });
+    marks.sort(function (a, b) { return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1; });
     bar = el('div', 'find');
     bar.appendChild(el('span', null, marks.length ? '' : '对话文字里没有找到（工具调用展开后才会被搜索）'));
     if (marks.length) {
       var up = el('button', null, '↑'), down = el('button', null, '↓');
+      up.title = '上一处（Shift+Enter）'; down.title = '下一处（Enter）';
       up.onclick = function () { go(-1); };
       down.onclick = function () { go(1); };
       bar.appendChild(up); bar.appendChild(down);
     }
-    document.body.appendChild(bar);
+    body.appendChild(bar);
     if (!marks.length) return;
     var start = 0;
     if (near) {
@@ -147,56 +228,108 @@
     if (!t && h.slice(0, 2) === 'r-') t = $('[data-r="' + h.slice(2).replace(/[^\w]/g, '') + '"]');
     if (!t) return null;
     reveal(t);
-    t.scrollIntoView({ block: 'start' });
+    t.scrollIntoView({ block: 'start', behavior: 'auto' });
     $$('.flash').forEach(function (x) { x.classList.remove('flash'); });
     t.classList.add('flash');
     return t;
   }
 
-  if (document.body.classList.contains('session')) {
+  if (body.classList.contains('session')) {
     var only = $('#onlychat');
     only.checked = store('onlychat') === '1';
-    document.body.classList.toggle('chat', only.checked);
+    body.classList.toggle('chat', only.checked);
     only.onchange = function () {
       store('onlychat', only.checked ? '1' : '0');
-      document.body.classList.toggle('chat', only.checked);
+      body.classList.toggle('chat', only.checked);
     };
-    $('[data-act="tools"]').onclick = function () {
+    var toolsBtn = $('[data-act="tools"]');
+    toolsBtn.onclick = function () {
       var all = $$('details.tools'), open = !all.some(function (x) { return x.open; });
       all.forEach(function (x) { x.open = open; });
+      toolsBtn.textContent = open ? '收起工具' : '展开工具';
     };
+    $('[data-act="top"]').onclick = function () { window.scrollTo({ top: 0, behavior: 'auto' }); };
+    $('[data-act="end"]').onclick = function () { window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' }); };
+
+    // 左侧目录跟随阅读位置
+    var prompts = $$('main > .msg.user[id]'), links = {};
+    $$('nav a[href^="#m-"]').forEach(function (a) { links[a.getAttribute('href').slice(1)] = a; });
+    var active = null;
+    function spy() {
+      var best = null;
+      for (var i = 0; i < prompts.length; i++) {
+        if (prompts[i].getBoundingClientRect().top <= window.innerHeight * 0.4) best = prompts[i]; else break;
+      }
+      var a = best && links[best.id];
+      if (a === active) return;
+      if (active) active.classList.remove('on');
+      active = a;
+      if (a) {
+        a.classList.add('on');
+        a.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+      }
+    }
+    window.addEventListener('scroll', debounce(spy, 60), { passive: true });
+
+    function step(dir) {
+      var idx = -1;
+      for (var i = 0; i < prompts.length; i++) if (prompts[i].getBoundingClientRect().top <= 80) idx = i;
+      var next = prompts[Math.max(0, Math.min(prompts.length - 1, idx + dir))];
+      if (next) next.scrollIntoView({ block: 'start', behavior: 'auto' });
+    }
+
     var fq = $('#fq'), target = jump();
-    var q0 = new URLSearchParams(location.search).get('q') || '';
-    if (q0) { fq.value = q0; highlight(q0, target); }
-    fq.oninput = debounce(function () { highlight(fq.value.trim(), null); }, 250);
-    fq.onkeydown = function (e) { if (e.key === 'Enter') go(e.shiftKey ? -1 : 1); };
+    if (fq) {
+      var q0 = new URLSearchParams(location.search).get('q') || '';
+      if (q0) { fq.value = q0; highlight(q0, target); }
+      fq.oninput = debounce(function () { highlight(fq.value.trim(), null); }, 250);
+      fq.onkeydown = function (e) {
+        if (e.key === 'Enter') go(e.shiftKey ? -1 : 1);
+        if (e.key === 'Escape') { fq.value = ''; highlight('', null); fq.blur(); }
+      };
+    }
     window.addEventListener('hashchange', jump);
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { var box = $('.box'); if (box) box.remove(); }
+      if (e.key === 'Escape') $$('details.menu[open]').forEach(function (m) { m.open = false; });
+      if (typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === 'j') step(1);
+      else if (e.key === 'k') step(-1);
+      else if (e.key === '/' && fq) { e.preventDefault(); fq.focus(); fq.select(); }
+    });
+    spy();
   }
 
   /* ---------- 索引页 ---------- */
 
-  if (document.body.classList.contains('index')) {
-    var q = $('#q'), pj = $('#pj'), ar = $('#ar'), tl = $('#tl'), hits = $('#hits'), cnt = $('#cnt');
-    var rows = $$('tbody tr'), seq = 0;
-    var WHO = { user: '你', asst: 'Claude', tool: '工具' };
+  if (body.classList.contains('index')) {
+    var q = $('#q'), ar = $('#ar'), tl = $('#tl'), hits = $('#hits'), cnt = $('#cnt');
+    var rows = $$('#list .row'), chips = $$('#pj .chip'), project = '', seq = 0;
+    var WHO = { user: ['你', 'who-you'], asst: ['Claude', 'who-claude'], tool: ['工具', ''] };
 
-    function filter(pages) {
-      var v = q.value.trim().toLowerCase(), p = pj.value, n = 0;
+    // 有搜索词时列表只留标题命中的会话：内容命中的已经在上面的结果里
+    function filter() {
+      var words = terms(q.value), n = 0;
       rows.forEach(function (r) {
-        var ok = (!p || r.dataset.p === p) && (ar.checked || !r.dataset.a);
-        if (ok && v) ok = r.dataset.t.indexOf(v) >= 0 || (pages && pages[r.dataset.page]);
+        var ok = (!project || r.dataset.p === project) && (ar.checked || !r.dataset.a);
+        if (ok && words.length) ok = words.every(function (w) { return r.dataset.t.indexOf(w) >= 0; });
         r.hidden = !ok;
         if (ok) n++;
       });
+      $$('#list .bucket').forEach(function (b) { b.hidden = !$('.row:not([hidden])', b); });
       cnt.textContent = n;
+    }
+    function allowed(page) {
+      var row = rows.filter(function (r) { return r.dataset.page === page; })[0];
+      return !row || ((!project || row.dataset.p === project) && (ar.checked || !row.dataset.a));
     }
     function show(j) {
       hits.textContent = '';
-      var pages = {};
-      j.sessions.forEach(function (s) {
-        pages[s.page] = 1;
-        var row = rows.filter(function (r) { return r.dataset.page === s.page; })[0];
-        if (row && ((pj.value && row.dataset.p !== pj.value) || (!ar.checked && row.dataset.a))) return;
+      var shown = j.sessions.filter(function (s) { return allowed(s.page); });
+      var total = shown.reduce(function (n, s) { return n + s.n; }, 0);
+      hits.appendChild(el('div', 'meta', shown.length ? '对话内容：' + total + ' 处，分布在 ' + shown.length + ' 个会话'
+        : '对话内容里没有找到“' + j.q + '”。'));
+      shown.forEach(function (s) {
         var box = el('div', 'hs'), base = '/s/' + s.page + '?q=' + encodeURIComponent(j.q);
         var a = el('a', null, s.title);
         a.href = base;
@@ -206,30 +339,48 @@
         s.hits.forEach(function (h) {
           var li = el('li'), link = el('a');
           link.href = base + '#' + h.anchor;
-          link.appendChild(el('small', null, h.time + ' · ' + WHO[h.who] + '　'));
+          link.appendChild(el('small', null, h.time + '　'));
+          link.appendChild(el('small', WHO[h.who][1], WHO[h.who][0] + '　'));
           link.appendChild(document.createTextNode('…' + h.pre));
           link.appendChild(el('mark', null, h.hit));
           link.appendChild(document.createTextNode(h.post + '…'));
           li.appendChild(link);
           ul.appendChild(li);
         });
-        if (s.n > s.hits.length) ul.appendChild(el('li', null, '')).appendChild(el('small', null, '　还有 ' + (s.n - s.hits.length) + ' 处，点标题进入会话查看'));
+        if (s.n > s.hits.length) {
+          var more = el('li'), ml = el('a', null, '还有 ' + (s.n - s.hits.length) + ' 处，进入会话查看 →');
+          ml.href = base;
+          more.appendChild(ml);
+          ul.appendChild(more);
+        }
         box.appendChild(ul);
         hits.appendChild(box);
       });
-      if (!j.sessions.length) hits.appendChild(el('div', 'meta', '对话内容里没有找到“' + j.q + '”。'));
-      filter(pages);
+      filter();
+      if ($('#list .row:not([hidden])')) hits.appendChild(el('div', 'meta', '标题匹配的会话：'));
     }
     function run() {
       var v = q.value.trim(), mine = ++seq;
-      if (!v) { hits.textContent = ''; filter(null); return; }
+      if (!v) { hits.textContent = ''; filter(); return; }
       fetch('/api/search?q=' + encodeURIComponent(v) + '&tools=' + (tl.checked ? 1 : 0))
         .then(function (r) { return r.json(); })
         .then(function (j) { if (mine === seq) show(j); })
-        .catch(function () { if (mine === seq) hits.textContent = '搜索失败：本地服务没有响应。'; });
+        .catch(function () { if (mine === seq) hits.textContent = '搜索失败：本地服务没有响应，请确认 Sessiontool 的窗口还开着。'; });
     }
+    chips.forEach(function (c) {
+      c.onclick = function () {
+        chips.forEach(function (x) { x.classList.toggle('on', x === c); });
+        project = c.dataset.p;
+        run();
+      };
+    });
     q.oninput = debounce(run, 200);
-    pj.onchange = ar.onchange = tl.onchange = run;
-    filter(null);
+    ar.onchange = tl.onchange = run;
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && e.target === q) { q.value = ''; run(); }
+      if (typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === '/') { e.preventDefault(); q.focus(); q.select(); }
+    });
+    if (q.value) run(); else filter();
   }
 })();

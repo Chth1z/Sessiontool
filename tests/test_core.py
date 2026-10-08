@@ -230,6 +230,36 @@ class SearchAndDetailsTest(Case):
         hit = cat.search('独角兽', tools=True)[0]['hits']
         self.assertEqual(sorted(h['anchor'] for h in hit), ['r-r1', 't-a1'])
         self.assertEqual(cat.search('100%'), [])
+        # 多个词：每个都要出现在同一条消息里
+        self.assertEqual(sum(g['n'] for g in cat.search('蓝鲸 复刻')), 1)
+        self.assertEqual(cat.search('蓝鲸 独角兽'), [])
+        self.assertEqual(cat.search('   '), [])
+
+    def test_forks_are_listed_under_their_parent_and_state_tracks_new_records(self):
+        cat = self.build()
+        entries = self.app.entries()
+        self.assertEqual([(s.id, depth) for s, _, depth, _ in entries], [('local_a', 0), ('local_f', 1)])
+        self.assertEqual(entries[0][3], entries[1][1]['last'])      # 家族按最近活动的成员排序
+        state = lambda: (cat.state(), cat.state(cat.by_page[entries[0][0].page]), cat.state(cat.by_page[entries[1][0].page]))
+        before = state()
+        self.write('ffff0002', [user('f2', 'f1', '又来一条', 12, 'ffff0002')], mode='a')
+        cat.refresh(force=True)
+        after = state()
+        self.assertNotEqual(after[0], before[0])
+        self.assertEqual(after[1], before[1])       # 原会话没有新记录
+        self.assertNotEqual(after[2], before[2])
+
+    def test_changed_files_are_summarised(self):
+        edit = lambda i, path: [{'type': 'tool_use', 'id': 'e%d' % i, 'name': 'Edit', 'input': {'file_path': path, 'old_string': 'a', 'new_string': 'b'}}]
+        long_path = 'C:/work/proj/' + 'deep/' * 30 + 'file.py'
+        self.write('eeee0001', [user('u1', None, '改一下', 1, 'eeee0001'),
+                                asst('a1', 'u1', edit(1, long_path), 2, 'eeee0001'), asst('a2', 'a1', edit(2, long_path), 3, 'eeee0001'),
+                                asst('a3', 'a2', [{'type': 'tool_use', 'id': 'b1', 'name': 'Bash', 'input': {'command': 'ls'}}], 4, 'eeee0001')])
+        s, c = self.content(self.open(), 'file_eeee0001')
+        self.assertEqual(c['changed'], [(long_path, 2, 'a1')])
+        page = render.session_page(s, c, render.ServerMode())
+        self.assertIn('修改过 1 个文件', page)
+        self.assertIn('href="#t-a1"', page)
 
     def test_images_and_full_tool_output_load_on_demand(self):
         cat = self.build()
@@ -293,6 +323,9 @@ class SearchAndDetailsTest(Case):
             self.assertEqual(get('/s/nope')[0], 404)
             self.assertEqual(get('/local?p=' + self.secret.replace('\\', '/'))[0], 404)
             self.assertEqual(get('/', host='evil.example.com')[0], 403)
+            self.assertEqual(json.loads(get('/api/state?page=' + s.page)[1])['sig'], cat.state(s))
+            self.assertEqual(get('/static/theme.js')[0], 200)
+            self.assertEqual(get('/static/../server.py')[0], 404)
         finally:
             httpd.shutdown()
             httpd.server_close()

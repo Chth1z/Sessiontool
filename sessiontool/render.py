@@ -6,6 +6,7 @@ import collections
 import html
 import os
 import re
+import zlib
 from datetime import datetime
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
@@ -152,8 +153,63 @@ def fmt(iso, f='%Y-%m-%d %H:%M'):
     return t.strftime(f) if t else ''
 
 
+def when(iso, now=None):
+    """列表里用的简短时间：今天只写时刻，昨天写“昨天”，再早写日期。"""
+    t = local(iso)
+    if not t:
+        return ''
+    now = now or datetime.now().astimezone()
+    days = (now.date() - t.date()).days
+    if days == 0:
+        return t.strftime('%H:%M')
+    if days == 1:
+        return '昨天 ' + t.strftime('%H:%M')
+    return t.strftime('%m-%d %H:%M' if t.year == now.year else '%Y-%m-%d')
+
+
+def bucket(iso, now=None):
+    t = local(iso)
+    if not t:
+        return '更早'
+    now = now or datetime.now().astimezone()
+    days = (now.date() - t.date()).days
+    if days <= 0:
+        return '今天'
+    if days == 1:
+        return '昨天'
+    if days < 7:
+        return '近 7 天'
+    return '%d 月' % t.month if t.year == now.year else '%d 年 %d 月' % (t.year, t.month)
+
+
+def size(n):
+    return '%.1f GB' % (n / 1073741824) if n >= 1073741824 else '%.1f MB' % (n / 1048576)
+
+
 def tokens(n):
     return '%.0fk' % (n / 1000.0) if isinstance(n, (int, float)) else '?'
+
+
+def looks_like_path(s):
+    return bool(re.match(r'([A-Za-z]:[\\/]|/|~[\\/])', s)) and '\n' not in s
+
+
+def short_path(path, cwd='', keep=64):
+    """长路径只留有辨识度的部分：在项目内的写相对路径，否则留末尾。"""
+    norm = lambda p: p.replace('/', '\\').rstrip('\\').lower()
+    if cwd and norm(path).startswith(norm(cwd) + '\\'):
+        path = path[len(cwd.rstrip('\\/')) + 1:]
+    return path if len(path) <= keep else '…' + path[-keep:]
+
+
+def preview(text):
+    """列表里的一行摘要：@"C:\\很长\\的路径\\文件.doc" 只留文件名。"""
+    text = re.sub(r'@"([^"]+)"', lambda m: '@' + re.split(r'[\\/]', m.group(1).rstrip('\\/'))[-1], text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def hue(name):
+    return zlib.crc32(name.encode('utf-8')) % 360
 
 
 def static_text(name):
@@ -162,9 +218,22 @@ def static_text(name):
 
 
 def head(title, standalone):
-    style = '<style>%s</style>' % static_text('app.css') if standalone else '<link rel="stylesheet" href="/static/app.css">'
+    """主题脚本放在 head 里同步执行，免得深色模式下先闪一下白底。"""
+    if standalone:
+        assets = '<style>' + static_text('app.css') + '</style><script>' + static_text('theme.js') + '</script>'
+    else:
+        assets = ('<link rel="icon" href="/static/icon.svg"><link rel="stylesheet" href="/static/app.css">'
+                  '<script src="/static/theme.js"></script>')
     return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title>%s</head>' % (esc(title), style))
+            '<meta name="viewport" content="width=device-width,initial-scale=1"><title>' + esc(title) + '</title>'
+            + assets + '</head>')
+
+
+def scripts(standalone):
+    return '<script>' + static_text('app.js') + '</script>' if standalone else '<script src="/static/app.js"></script>'
+
+
+THEME_BUTTON = '<button type="button" id="theme" title="切换浅色 / 深色 / 跟随系统"></button>'
 
 # ---------- 会话页 ----------
 
@@ -185,8 +254,9 @@ class ServerMode:
 
 
 class Renderer:
-    def __init__(self, mode):
+    def __init__(self, mode, cwd=''):
         self.mode = mode
+        self.cwd = cwd
         self.ids = set()
         self.toc = []
         self.day = None
@@ -198,25 +268,32 @@ class Renderer:
         self.ids.add(key)
         return ' id="%s"' % key
 
+    def stamp(self, iso):
+        return '<time title="%s">%s</time>' % (fmt(iso, '%Y-%m-%d %H:%M:%S'), fmt(iso, '%H:%M'))
+
     def pics(self, refs):
         out = []
         for ref in refs:
             url = self.mode.image(ref)
             if url:
-                out.append('<a href="%s" target="_blank"><img class="pic" loading="lazy" src="%s" alt="图片"></a>' % (url, url))
-        return ''.join(out)
+                out.append('<img class="pic" loading="lazy" src="%s" alt="图片">' % url)
+        return '<div class="pics">%s</div>' % ''.join(out) if out else ''
 
     def tool(self, t):
         badges = ''
         if t['error']:
-            badges += ' <span class="badge err">失败</span>'
+            badges += '<span class="badge err">失败</span>'
         if t['nimg']:
-            badges += ' <span class="badge">%d 图</span>' % t['nimg']
+            badges += '<span class="badge">%d 图</span>' % t['nimg']
         if not t['res']:
-            badges += ' <span class="badge">无输出记录</span>'
+            badges += '<span class="badge">无输出记录</span>'
+        hint = short_path(t['hint'], self.cwd) if looks_like_path(t['hint']) else t['hint']
         attrs = self.anchor('t-', t['u']) + (' data-r="%s"' % t['ru'] if t['ru'] else '') + self.mode.tool_attrs(t)
-        return ('<details class="tool"%s><summary><code>%s</code> <span class="hint">%s</span>%s</summary>%s</details>'
-                % (attrs, esc(t['name']), esc(t['hint']), badges, self.mode.tool_body(t)))
+        return ('<details class="tool"%s><summary><code>%s</code><span class="hint" title="%s">%s</span>%s</summary>%s</details>'
+                % (attrs, esc(t['name']), esc(t['hint']), esc(hint), badges, self.mode.tool_body(t)))
+
+    def line(self, text, iso, attrs=''):
+        return '<div class="line"%s><span>%s · %s</span></div>' % (attrs, text, fmt(iso, '%H:%M'))
 
     def items(self, items, main=True):
         out = []
@@ -226,117 +303,159 @@ class Renderer:
             if main and t and t.date() != self.day and k in ('user', 'asst', 'tools'):
                 self.day = t.date()
                 label = '%s 周%s' % (t.strftime('%Y-%m-%d'), WEEK[t.weekday()])
-                out.append('<div class="day">%s</div>' % label)
+                out.append('<div class="day"><span>%s</span></div>' % label)
                 self.toc.append('<div class="d">%s</div>' % label)
             if k == 'user':
-                num = '#%d' % it['n'] if it.get('n') else ''
-                tag = ' <span class="badge">回复进行中追加</span>' if it.get('queued') else ''
-                if main and it.get('n'):
-                    self.toc.append('<a href="#m-%s" title="%s"><small>%s</small> %s</a>' % (
-                        it['u'], esc(it['text'][:300]), fmt(it['ts'], '%H:%M'), esc(it['text'][:40].replace('\n', ' ') or '（图片）')))
-                out.append('<section class="msg user"%s><header><b>你</b> · %s · %s%s</header><div class="body">%s%s</div></section>'
-                           % (self.anchor('m-', it['u']), fmt(it['ts']), num, tag, md(it['text']), self.pics(it['imgs'])))
+                anchor = self.anchor('m-', it['u'])
+                num = '<a class="num" href="#m-%s">#%d</a>' % (it['u'], it['n']) if it.get('n') else ''
+                tag = '<span class="badge">回复进行中追加</span>' if it.get('queued') else ''
+                if main and it.get('n') and anchor:
+                    self.toc.append('<a href="#m-%s" title="%s"><small>%s</small>%s</a>' % (
+                        it['u'], esc(it['text'][:300]), fmt(it['ts'], '%H:%M'), esc(preview(it['text'])[:60] or '（图片）')))
+                out.append('<section class="msg user"%s><header><span class="who">你</span>%s%s%s<button type="button" class="copy">复制</button>'
+                           '</header><div class="body">%s%s</div></section>'
+                           % (anchor, self.stamp(it['ts']), num, tag, md(it['text']), self.pics(it['imgs'])))
             elif k == 'asst':
-                out.append('<section class="msg asst"%s><header><b>Claude</b> · %s</header><div class="body">%s</div></section>'
-                           % (self.anchor('m-', it['u']), fmt(it['ts']), md(it['text'])))
+                out.append('<section class="msg asst"%s><header><span class="who">Claude</span>%s<button type="button" class="copy">复制</button>'
+                           '</header><div class="body">%s</div></section>'
+                           % (self.anchor('m-', it['u']), self.stamp(it['ts']), md(it['text'])))
             elif k == 'notice':
-                out.append('<div class="line"%s>%s · %s</div>' % (self.anchor('m-', it['u']), esc(it['text'][:300]), fmt(it['ts'], '%H:%M')))
+                out.append(self.line(esc(it['text'][:300]), it['ts'], self.anchor('m-', it['u'])))
             elif k == 'tools':
                 cnt = collections.Counter(x['name'] for x in it['tools'])
-                label = '、'.join('%s×%d' % (n, c) if c > 1 else n for n, c in cnt.most_common())
+                label = '、'.join('%s ×%d' % (n, c) if c > 1 else n for n, c in cnt.most_common())
                 fails = sum(1 for x in it['tools'] if x['error'])
-                out.append('<details class="tools"><summary>工具调用 %d 次：%s%s</summary>%s</details>' % (
-                    len(it['tools']), esc(label), ' <span class="badge err">%d 次失败</span>' % fails if fails else '',
+                out.append('<details class="tools"><summary><span class="n">%d 次工具调用</span><span class="hint">%s</span>%s</summary>%s</details>' % (
+                    len(it['tools']), esc(label), '<span class="badge err">%d 次失败</span>' % fails if fails else '',
                     ''.join(self.tool(x) for x in it['tools'])))
             elif k == 'think':
                 out.append('<details class="fold think"><summary>思考过程</summary><div class="body">%s</div></details>' % md(it['text']))
             elif k == 'summary':
                 out.append('<details class="fold"%s><summary>上下文压缩摘要 · %s</summary><div class="body">%s</div></details>'
-                           % (self.anchor('m-', it['u']), fmt(it['ts']), md(it['text'])))
+                           % (self.anchor('m-', it['u']), fmt(it['ts'], '%H:%M'), md(it['text'])))
             elif k == 'compact':
                 how = {'auto': '自动', 'manual': '手动'}.get(it['trigger'], '')
-                out.append('<div class="line">上下文已%s压缩（%s → %s tokens）· %s</div>' % (how, tokens(it['pre']), tokens(it['post']), fmt(it['ts'], '%H:%M')))
+                out.append(self.line('上下文已%s压缩（%s → %s tokens）' % (how, tokens(it['pre']), tokens(it['post'])), it['ts']))
             elif k == 'note':
-                out.append('<details class="fold sys"><summary>系统通知 · %s</summary><pre>%s</pre></details>' % (fmt(it['ts']), esc(it['text'][:5000])))
+                out.append('<details class="fold sys"><summary>系统通知 · %s</summary><pre>%s</pre></details>' % (fmt(it['ts'], '%H:%M'), esc(it['text'][:5000])))
             elif k == 'cmd':
                 out.append('<details class="fold sys"><summary>本地命令 <code>%s</code> · %s</summary><pre>%s</pre></details>'
-                           % (esc((it['cmd'] + ' ' + it['args']).strip()[:120]), fmt(it['ts']), esc(it['out'])))
+                           % (esc((it['cmd'] + ' ' + it['args']).strip()[:120]), fmt(it['ts'], '%H:%M'), esc(it['out'])))
             elif k == 'stop':
-                out.append('<div class="line">你中断了这次回复 · %s</div>' % fmt(it['ts'], '%H:%M'))
+                out.append(self.line('你中断了这次回复', it['ts']))
             elif k == 'auto':
-                out.append('<div class="line">额度恢复，应用自动发送了“继续” · %s</div>' % fmt(it['ts'], '%H:%M'))
+                out.append(self.line('额度恢复，应用自动发送了“继续”', it['ts']))
             elif k == 'fork':
-                out.append('<div class="forkline">以上来自原会话 · 从这里开始是复刻后的内容</div>')
-                self.toc.append('<div class="d">—— 复刻点 ——</div>')
+                out.append('<div class="forkline"><span>以上来自原会话 · 从这里开始是复刻后的内容</span></div>')
+                self.toc.append('<div class="d fk">复刻点</div>')
             elif k == 'branch':
                 n = sum(1 for x in it['items'] if x['kind'] in ('user', 'asst'))
                 out.append('<details class="fold branch"><summary>改写前的旧分支（%d 条消息，应用里已不显示）· %s</summary>%s</details>'
-                           % (n, fmt(it['ts']), ''.join(self.items(it['items'], main=False))))
+                           % (n, fmt(it['ts'], '%H:%M'), ''.join(self.items(it['items'], main=False))))
         return out
 
 
-def session_page(s, c, mode, parent=None):
-    """parent: (页面编号, 标题)，仅复刻的会话有。"""
-    r = Renderer(mode)
+def changed_files(c, cwd):
+    if not c['changed']:
+        return ''
+    rows = []
+    for path, n, u in c['changed']:
+        name = re.split(r'[\\/]', path)[-1]
+        folder = path[:len(path) - len(name)].rstrip('\\/')
+        same = folder.replace('\\', '/').lower() == cwd.replace('\\', '/').rstrip('/').lower()
+        rows.append('<li><a href="#t-%s" title="%s"><b>%s</b>%s</a>%s</li>' % (
+            u, esc(path), esc(name), '' if same or not folder else '<small>%s</small>' % esc(short_path(folder, cwd, 70)),
+            '<small>×%d</small>' % n if n > 1 else ''))
+    rows = ''.join(rows)
+    return '<details class="files"><summary>修改过 %d 个文件</summary><ul>%s</ul></details>' % (len(c['changed']), rows)
+
+
+def session_page(s, c, mode, parent=None, state=''):
+    """parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此发现新记录。"""
+    r = Renderer(mode, s.cwd)
     body = r.items(c['items'])
-    extra = ''
+    facts = ['<span title="%s">%s</span>' % (esc(s.cwd), esc(s.proj)),
+             '%s → %s' % (fmt(c['first'], '%m-%d %H:%M'), fmt(c['last'], '%m-%d %H:%M')),
+             '%d 问 · %d 答 · %d 次工具调用' % (c['n_user'], c['n_asst'], c['n_tools'])]
     if parent:
-        extra += '　·　复刻自 ' + (esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1])))
+        facts.append('复刻自 ' + (esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1]))))
     if c['nfiles'] > 1:
-        extra += '　·　由 %d 份记录合并' % c['nfiles']
+        facts.append('由 %d 份记录合并' % c['nfiles'])
     if c['n_branch']:
-        extra += '　·　%d 处改写' % c['n_branch']
-    meta = '%s　·　%s → %s　·　你 %d 条 / Claude %d 段 / 工具 %d 次%s' % (
-        esc(s.cwd), fmt(c['first']), fmt(c['last']), c['n_user'], c['n_asst'], c['n_tools'], extra)
+        facts.append('%d 处改写' % c['n_branch'])
+    tools = '<label class="tg"><input type="checkbox" id="onlychat"> 只看对话</label><button type="button" data-act="tools">展开工具</button>'
     if mode.standalone:
-        bar = ('<div class="bar"><button data-act="tools">展开/收起工具调用</button><label><input type="checkbox" id="onlychat"> 只看对话</label></div>')
-        back = ''
-        script = '<script>%s</script>' % static_text('standalone.js')
+        bar, back, attrs = '<div class="bar">' + tools + '<span class="sp"></span>' + THEME_BUTTON + '</div>', '', ''
     else:
-        bar = ('<div class="bar"><input id="fq" type="search" placeholder="在本会话中搜索…">'
-               '<label><input type="checkbox" id="onlychat"> 只看对话</label>'
-               '<button data-act="tools">展开/收起工具调用</button>'
-               '<a class="btn" href="/export/%s.html" title="单个 HTML 文件，可离线打开">导出 HTML</a>'
-               '<a class="btn" href="/export/%s.md">导出 Markdown</a></div>' % (s.page, s.page))
+        app = '' if s.orphan else '<a class="btn" href="claude://claude.ai/epitaxy/%s" title="在 Claude 桌面应用里打开这个会话">在应用中打开</a>' % esc(s.id)
+        export = ('<details class="menu"><summary class="btn">导出</summary><div>'
+                  '<a href="/export/%s.html">HTML<small>单个文件，可离线打开</small></a>'
+                  '<a href="/export/%s.html?images=1">HTML（含工具截图）<small>文件可能很大</small></a>'
+                  '<a href="/export/%s.md">Markdown<small>只有对话文字</small></a></div></details>' % (s.page, s.page, s.page))
+        bar = ('<div class="bar"><input id="fq" type="search" placeholder="搜索本会话…" title="空格分隔多个词；按 / 聚焦，Enter 下一处">' + tools
+               + '<span class="sp"></span>' + app + export + THEME_BUTTON + '</div>')
         back = '<a class="back" href="/">← 全部会话</a>'
-        script = '<script src="/static/app.js"></script>'
+        attrs = ' data-state="/api/state?page=%s" data-sig="%s"' % (s.page, state)
+    nav = (back + '<div class="jump"><button type="button" data-act="top">↑ 开头</button>'
+           '<button type="button" data-act="end">↓ 最新</button></div>'
+           '<div class="navhead">你的 %d 条提问（J / K 切换）</div>' % c['n_user'] + ''.join(r.toc))
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号
-    return ''.join([head(c['title'], mode.standalone), '<body class="session"><div class="layout"><nav>', back, ''.join(r.toc),
-                    '</nav><main><h1>', esc(c['title']), '</h1><div class="meta">', meta, '</div>', bar, '\n'.join(body),
-                    '</main></div>', script, '</body></html>'])
+    return ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '><div class="layout"><nav>', nav,
+                    '</nav><main>', bar, '<h1>', esc(c['title']), '</h1><div class="meta">',
+                    '<i>·</i>'.join(facts), '</div>', changed_files(c, s.cwd), '\n'.join(body),
+                    '</main></div>', scripts(mode.standalone), '</body></html>'])
 
 # ---------- 索引页 ----------
 
 
-def index_page(entries):
-    """entries: [(session, content, parent_title)]，已按最后活动时间倒序。"""
-    rows = []
-    for s, c, parent_title in entries:
-        tags = ''
-        if s.parent:
-            tags += '<span class="badge">复刻</span>'
-        if s.archived:
-            tags += '<span class="badge">已归档</span>'
-        if s.orphan:
-            tags += '<span class="badge">不在应用列表中</span>'
-        sub = esc(c['first_prompt'][:100])
-        if parent_title:
-            sub = '复刻自「%s」　' % esc(parent_title) + sub
-        rows.append('<tr data-page="%s" data-p="%s" data-t="%s" data-a="%s"><td><a href="/s/%s">%s</a>%s<small>%s</small></td>'
-                    '<td class="n">%s</td><td class="n">%s</td><td class="n">%d</td><td class="n">%.1f MB</td></tr>'
-                    % (s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', s.page, esc(c['title']), tags, sub,
-                       esc(s.proj), fmt(c['last']), c['n_user'], s.size / 1048576))
-    projects = sorted(set(s.proj for s, _, _ in entries))
-    opts = '<option value="">全部项目</option>' + ''.join('<option>%s</option>' % esc(p) for p in projects)
+def index_row(s, c, depth, parent_title, now):
+    tags = ''
+    if s.parent:
+        tags += '<span class="badge">复刻</span>'
+    if s.archived:
+        tags += '<span class="badge">已归档</span>'
+    if s.orphan:
+        tags += '<span class="badge">不在应用列表中</span>'
+    return ('<a class="row%s" href="/s/%s" data-page="%s" data-p="%s" data-t="%s" data-a="%s" style="--d:%d">'
+            '<div class="r1"><span class="title">%s</span>%s<time title="%s">%s</time></div>'
+            '<div class="r2">%s</div>'
+            '<div class="r3"><span class="proj"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span><i>·</i>%d 问<i>·</i>%d 答<i>·</i>%s</div></a>'
+            % (' child' if depth else '', s.page, s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', min(depth, 3),
+               esc(c['title']), tags, fmt(c['last']), when(c['last'], now),
+               esc(preview(c['first_prompt'])) or '（没有文字提问）',
+               hue(s.proj), esc(s.proj), c['n_user'], c['n_asst'], size(s.size)))
+
+
+def index_page(entries, state=''):
+    """entries: [(session, content, 层级, 所在家族的最后活动时间)]，复刻的会话紧跟在原会话后面。"""
+    now = datetime.now().astimezone()
+    out, last_bucket = [], None
+    for s, c, depth, family_last in entries:
+        b = bucket(family_last, now)
+        if b != last_bucket:
+            if last_bucket is not None:
+                out.append('</section>')
+            out.append('<section class="bucket"><h2>%s</h2>' % b)
+            last_bucket = b
+        out.append(index_row(s, c, depth, None, now))
+    if last_bucket is not None:
+        out.append('</section>')
+    counts = collections.Counter(s.proj for s, _, _, _ in entries)
+    chips = '<button type="button" class="chip on" data-p="">全部<small>%d</small></button>' % len(entries) + ''.join(
+        '<button type="button" class="chip" data-p="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s<small>%d</small></button>'
+        % (esc(p), hue(p), esc(p), n) for p, n in counts.most_common())
+    total = sum(s.size for s, _, _, _ in entries)
+    empty = '' if entries else '<p class="empty">还没有找到任何会话记录。</p>'
     return ''.join([
-        head('Claude 会话记录', False), '<body class="index"><main><h1>Claude 会话记录</h1>',
-        '<div class="meta">显示 <span id="cnt">%d</span> / %d 个会话 · 刷新页面即读取最新记录</div>' % (len(rows), len(rows)),
-        '<div class="bar"><input id="q" type="search" placeholder="搜索全部会话的对话内容…" autofocus>',
-        '<select id="pj">', opts, '</select>',
-        '<label><input type="checkbox" id="tl"> 含工具调用与输出</label>',
-        '<label><input type="checkbox" id="ar" checked> 含已归档</label></div><div id="hits"></div>',
-        '<table class="idx"><thead><tr><th>会话</th><th>项目</th><th>最后活动</th><th>提问</th><th>记录大小</th></tr></thead><tbody>',
-        '\n'.join(rows), '</tbody></table></main><script src="/static/app.js"></script></body></html>'])
+        head('Claude 会话记录', False), '<body class="index" data-state="/api/state" data-sig="', state, '"><main>',
+        '<header class="top"><h1>Claude 会话记录</h1>', THEME_BUTTON, '</header>',
+        '<div class="meta">%d 个会话<i>·</i>%d 个项目<i>·</i>记录共 %s<i>·</i>显示 <span id="cnt">%d</span> 个</div>'
+        % (len(entries), len(counts), size(total), len(entries)),
+        '<div class="bar"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词（按 / 聚焦）" autofocus>',
+        '<label class="tg"><input type="checkbox" id="tl"> 含工具调用与输出</label></div>',
+        '<div class="chips" id="pj">', chips, '<span class="sp"></span>',
+        '<label class="tg"><input type="checkbox" id="ar" checked> 含已归档</label></div>',
+        '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></main>', scripts(False), '</body></html>'])
 
 # ---------- Markdown 导出 ----------
 
@@ -345,7 +464,7 @@ def session_markdown(s, c):
     out = ['# %s\n' % c['title'],
            '%s　·　%s → %s　·　你 %d 条 / Claude %d 段\n' % (s.cwd, fmt(c['first']), fmt(c['last']), c['n_user'], c['n_asst'])]
 
-    def walk(items, depth=0):
+    def walk(items):
         for it in items:
             k = it['kind']
             if k == 'user':
@@ -364,7 +483,7 @@ def session_markdown(s, c):
                 out.append('\n*（你中断了这次回复）*\n')
             elif k == 'branch':
                 out.append('\n<details><summary>改写前的旧分支</summary>\n')
-                walk(it['items'], depth + 1)
+                walk(it['items'])
                 out.append('\n</details>\n')
 
     walk(c['items'])

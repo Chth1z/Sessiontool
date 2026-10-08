@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 
-SCHEMA = 4
+SCHEMA = 5
 
 DDL = """
 CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, cli TEXT, size INT, mtime INT,
@@ -29,7 +29,8 @@ def tool_hint(inp):
         return ''
     for k in HINT_KEYS:
         if inp.get(k):
-            return str(inp[k]).replace('\n', ' ')[:120]
+            # 路径要完整保留（用来汇总改过的文件），其余只是一行提示
+            return str(inp[k]).replace('\n', ' ')[:400 if k in ('file_path', 'path') else 120]
     return ''
 
 
@@ -267,9 +268,17 @@ class Index:
         except (OSError, ValueError):
             return None
 
-    def search(self, query, tools=False, limit=2000):
-        like = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-        sql = ("SELECT id,file,uuid,ts,kind,data,text,tool FROM rec WHERE kind IN ('user','assistant','queued') "
-               "AND (text LIKE ? ESCAPE '\\'" + (" OR tool LIKE ? ESCAPE '\\'" if tools else '') + ') ORDER BY ts LIMIT ?')
-        args = (like, like, limit) if tools else (like, limit)
-        return self.con().execute(sql, args).fetchall()
+    def search(self, terms, tools=False, limit=3000):
+        """每个词都要出现在同一条消息里（文字；tools=True 时工具调用与输出也算）。"""
+        conds, args = [], []
+        for term in terms:
+            like = '%' + term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+            if tools:
+                conds.append("(text LIKE ? ESCAPE '\\' OR tool LIKE ? ESCAPE '\\')")
+                args += [like, like]
+            else:
+                conds.append("text LIKE ? ESCAPE '\\'")
+                args.append(like)
+        sql = ("SELECT id,file,uuid,ts,kind,data,text,tool FROM rec WHERE kind IN ('user','assistant','queued') AND "
+               + ' AND '.join(conds) + ' ORDER BY ts LIMIT ?')
+        return self.con().execute(sql, args + [limit]).fetchall()

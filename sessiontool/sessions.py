@@ -15,6 +15,7 @@ import time
 AUTO_CONTINUE = 'I hit my usage limit while you were working'
 INTERRUPT = re.compile(r'\[Request interrupted by user[^\]]*\]')
 NOTE_PREFIX = ('<task-notification', '<ci-monitor-event')
+EDIT_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
 
 
 def clean_prompt(s):
@@ -166,7 +167,13 @@ def assemble(recs, links, own_ids, forked):
 def stats(items):
     prompts = [it for it in items if it['kind'] == 'user']
     stamps = [it['ts'] for it in items if it.get('ts')]
+    changed = collections.OrderedDict()         # 路径 → [次数, 第一次修改的锚点]
+    for it in items:
+        for t in it['tools'] if it['kind'] == 'tools' else ():
+            if t['name'] in EDIT_TOOLS and t['hint']:
+                changed.setdefault(t['hint'], [0, t['u']])[0] += 1
     return {'n_user': len(prompts), 'n_asst': sum(1 for it in items if it['kind'] == 'asst'),
+            'changed': [(path, n, u) for path, (n, u) in changed.items()],
             'n_tools': sum(len(it['tools']) for it in items if it['kind'] == 'tools'),
             'n_branch': sum(1 for it in items if it['kind'] == 'branch'),
             'first': min(stamps) if stamps else '', 'last': max(stamps) if stamps else '',
@@ -304,36 +311,48 @@ class Catalog:
         return [s for s in self.sessions
                 if s.page.startswith(key) or key in self.content(s)['title'].lower()]
 
+    def state(self, s=None):
+        """内容指纹：变了就说明磁盘上有新记录。页面用它提示刷新。"""
+        sig = self.signature(s) if s else tuple((f['id'], f['off']) for x in self.sessions for f in x.files)
+        return '%08x' % (hash(sig) & 0xffffffff)
+
     def search(self, query, tools=False, per_session=8):
-        """全文搜索 → [{session, n, hits}]，按会话最后活动时间倒序。同一条消息的副本只算一次。"""
-        rows = [r for r in self.index.search(query, tools) if r['file'] in self.owner]
+        """全文搜索 → [{session, n, hits}]，按会话最后活动时间倒序。
+
+        空格分开的每个词都要出现在同一条消息里。同一条消息的副本只算一次，记在最早的那个会话名下。
+        """
+        terms = [t.lower() for t in query.split()]
+        if not terms:
+            return []
+        rows = [r for r in self.index.search(terms, tools) if r['file'] in self.owner]
         rows.sort(key=lambda r: (self.owner[r['file']].created, r['ts'] or ''))
-        lq, seen, groups = query.lower(), set(), collections.OrderedDict()
+        seen, groups = set(), collections.OrderedDict()
+        flat = lambda x: re.sub(r'\s+', ' ', x)
         for r in rows:
             if r['uuid'] in seen:
                 continue
             seen.add(r['uuid'])
-            data = r['data'] or ''
-            if '"meta": 1' in data:
+            if '"meta": 1' in (r['data'] or ''):
                 continue
             text = clean_prompt(r['text'] or '') if r['kind'] != 'assistant' else (r['text'] or '')
-            u = r['uuid'][:8]
-            i = text.lower().find(lq)
-            if i >= 0:
-                who, anchor, src = ('asst' if r['kind'] == 'assistant' else 'user'), 'm-' + u, text
-            elif tools and (r['tool'] or '').lower().find(lq) >= 0:
-                src = r['tool']
-                i = src.lower().find(lq)
-                who, anchor = 'tool', ('t-' if r['kind'] == 'assistant' else 'r-') + u
-            else:
+            tool = (r['tool'] or '') if tools else ''
+            low_text, low_tool = text.lower(), tool.lower()
+            if not all(t in low_text or t in low_tool for t in terms):
                 continue
+            u = r['uuid'][:8]
+            in_text = [t for t in terms if t in low_text]
+            if len(in_text) == len(terms):
+                who, anchor, src, term = ('asst' if r['kind'] == 'assistant' else 'user'), 'm-' + u, text, terms[0]
+            else:
+                term = [t for t in terms if t not in low_text][0]
+                who, anchor, src = 'tool', ('t-' if r['kind'] == 'assistant' else 'r-') + u, tool
+            i = src.lower().find(term)
             s = self.owner[r['file']]
             g = groups.setdefault(s.id, {'session': s, 'n': 0, 'hits': []})
             g['n'] += 1
             if len(g['hits']) < per_session:
-                flat = lambda x: re.sub(r'\s+', ' ', x)
                 g['hits'].append({'ts': r['ts'], 'who': who, 'anchor': anchor, 'pre': flat(src[max(0, i - 40):i]),
-                                  'hit': src[i:i + len(query)], 'post': flat(src[i + len(query):i + len(query) + 90])})
+                                  'hit': src[i:i + len(term)], 'post': flat(src[i + len(term):i + len(term) + 90])})
         out = list(groups.values())
         out.sort(key=lambda g: self.content(g['session'])['last'], reverse=True)
         return out

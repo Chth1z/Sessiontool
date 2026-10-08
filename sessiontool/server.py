@@ -1,6 +1,6 @@
 """本地网页服务。只监听 127.0.0.1，只读，不向外发送任何内容。"""
+import collections
 import json
-import os
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -13,7 +13,8 @@ from .sessions import Catalog
 
 CSP = ("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
        "connect-src 'self'; base-uri 'none'; form-action 'none'")
-STATIC_TYPES = {'app.css': 'text/css; charset=utf-8', 'app.js': 'text/javascript; charset=utf-8'}
+STATIC_TYPES = {'app.css': 'text/css; charset=utf-8', 'app.js': 'text/javascript; charset=utf-8',
+                'theme.js': 'text/javascript; charset=utf-8', 'icon.svg': 'image/svg+xml'}
 LOCAL_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
 
 
@@ -25,9 +26,33 @@ class App:
         self.pages = {}
 
     def entries(self):
+        """[(会话, 内容, 层级, 家族最后活动时间)]：按家族最后活动倒序，复刻的会话紧跟在原会话后面。"""
         cat = self.catalog
-        out = [(s, cat.content(s), cat.content(s.parent)['title'] if s.parent else None) for s in cat.sessions]
-        out.sort(key=lambda e: e[1]['last'], reverse=True)
+        info = {s.id: cat.content(s) for s in cat.sessions}
+        kids, roots = collections.defaultdict(list), []
+        for s in cat.sessions:
+            (kids[s.parent.id] if s.parent else roots).append(s)
+        latest = {}
+
+        def family_last(s, seen=()):
+            if s.id not in latest:
+                latest[s.id] = max([info[s.id]['last']] + [family_last(k, seen + (s.id,)) for k in kids[s.id] if k.id not in seen])
+            return latest[s.id]
+
+        out, done = [], set()
+
+        def walk(s, depth, stamp):
+            if s.id in done:
+                return
+            done.add(s.id)
+            out.append((s, info[s.id], depth, stamp))
+            for k in sorted(kids[s.id], key=family_last, reverse=True):
+                walk(k, depth + 1, stamp)
+
+        for s in sorted(roots, key=family_last, reverse=True):
+            walk(s, 0, family_last(s))
+        for s in cat.sessions:          # 复刻关系成环时兜底，不让任何会话从列表里消失
+            walk(s, 0, info[s.id]['last'])
         return out
 
     def session_html(self, s):
@@ -36,7 +61,7 @@ class App:
         if hit and hit[0] == c['sig']:
             return hit[1]
         parent = (s.parent.page, self.catalog.content(s.parent)['title']) if s.parent else None
-        page = render.session_page(s, c, render.ServerMode(), parent)
+        page = render.session_page(s, c, render.ServerMode(), parent, self.catalog.state(s))
         self.pages[s.id] = (c['sig'], page)
         return page
 
@@ -88,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
         arg = lambda k: (qs.get(k) or [''])[0]
         if path == '/':
             app.catalog.refresh()
-            return self.reply(render.index_page(app.entries()))
+            return self.reply(render.index_page(app.entries(), app.catalog.state()))
         if path.startswith('/s/'):
             app.catalog.refresh()
             s = app.catalog.by_page.get(path[3:])
@@ -100,6 +125,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.not_found()
         if path == '/api/ping':
             return self.reply_json({'app': 'sessiontool', 'version': __version__})
+        if path == '/api/state':
+            app.catalog.refresh()
+            s = app.catalog.by_page.get(arg('page')) if arg('page') else None
+            return self.reply_json({'sig': app.catalog.state(s)})
         if path == '/api/search':
             q = arg('q').strip()
             if not q:

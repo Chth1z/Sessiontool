@@ -66,9 +66,10 @@ def cmd_serve(args):
 
 def cmd_list(args):
     app = open_app(args)
-    for s, c, _ in app.entries():
+    for s, c, depth, _ in app.entries():
         flags = ''.join(t for t, on in (('[复刻]', s.parent), ('[归档]', s.archived)) if on)
-        print('%-10s %s  %3d 问  %6.1f MB  %-14s %s %s' % (s.page, fmt(c['last']), c['n_user'], s.size / 1048576, s.proj[:14], c['title'], flags))
+        print('%-10s %s  %3d 问  %6.1f MB  %-14s %s%s %s' % (s.page, fmt(c['last']), c['n_user'], s.size / 1048576, s.proj[:14],
+                                                         '  ' * depth, c['title'], flags))
 
 
 def cmd_export(args):
