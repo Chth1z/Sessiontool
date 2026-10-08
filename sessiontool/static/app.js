@@ -28,7 +28,7 @@
   /* ---------- 主题：跟随系统 → 浅色 → 深色 ---------- */
 
   var themeBtn = $('#theme');
-  var THEMES = [[null, '◐ 跟随系统'], ['light', '☀ 浅色'], ['dark', '☾ 深色']];
+  var THEMES = [[null, '◐ 自动'], ['light', '☀ 浅色'], ['dark', '☾ 深色']];
   function themeIndex() {
     var cur = document.documentElement.dataset.theme || null;
     for (var i = 0; i < THEMES.length; i++) if (THEMES[i][0] === cur) return i;
@@ -49,10 +49,11 @@
 
   var body = document.body;
   if (body.dataset.state) {
-    var told = false;
-    setInterval(function () {
+    var told = false, misses = 0;       // 服务关掉后连续几次连不上就不再问了
+    var poll = setInterval(function () {
       if (told || document.hidden) return;
       fetch(body.dataset.state).then(function (r) { return r.json(); }).then(function (j) {
+        misses = 0;
         if (told || j.sig === body.dataset.sig) return;
         told = true;
         var toast = el('div', 'toast');
@@ -61,7 +62,7 @@
         b.onclick = function () { location.reload(); };
         toast.appendChild(b);
         body.appendChild(toast);
-      }).catch(function () {});
+      }).catch(function () { if (++misses >= 3) clearInterval(poll); });
     }, 8000);
   }
 
@@ -129,6 +130,12 @@
     if (d.classList && d.classList.contains('tool') && d.open) fillTool(d);
   }, true);
 
+  // 原文件已经不在的图片直接去掉，不留破图
+  document.addEventListener('error', function (e) {
+    var t = e.target;
+    if (t.tagName === 'IMG' && t.classList.contains('pic')) t.remove();
+  }, true);
+
   // 点图片放大，再点或按 Esc 关闭
   document.addEventListener('click', function (e) {
     var t = e.target;
@@ -140,7 +147,7 @@
       box.onclick = function () { box.remove(); };
       body.appendChild(box);
     } else if (t.classList && t.classList.contains('copy')) {
-      var text = $('.body', t.closest('.msg')).innerText;
+      var src = $('.body', t.closest('.msg')), text = src ? src.innerText : '';
       var done = function () {
         t.textContent = '已复制';
         setTimeout(function () { t.textContent = '复制'; }, 1200);
@@ -198,7 +205,7 @@
     activeQ = q;
     var words = terms(q);
     if (!words.length) return;
-    $$('main .msg .body, main details.fold > .body, main details.tool[open] > .tc').forEach(function (root) {
+    $$('main .msg .body, main .step > .body, main .sent, main details.fold > .body, main details.tool[open] > .tc').forEach(function (root) {
       words.forEach(function (w) { markAll(root, w); });
     });
     marks.sort(function (a, b) { return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1; });
@@ -235,24 +242,30 @@
   }
 
   if (body.classList.contains('session')) {
-    var only = $('#onlychat');
-    only.checked = store('onlychat') === '1';
-    body.classList.toggle('chat', only.checked);
-    only.onchange = function () {
-      store('onlychat', only.checked ? '1' : '0');
-      body.classList.toggle('chat', only.checked);
-    };
+    // 三种视图：完整 / 对话（隐藏工具调用）/ 结果（折起每轮的中间过程，只留最终答复）
+    var views = $$('#view button');
+    function setView(v, keep) {
+      if (['full', 'chat', 'result'].indexOf(v) < 0) v = 'full';
+      views.forEach(function (b) { b.classList.toggle('on', b.dataset.v === v); });
+      body.classList.toggle('chat', v === 'chat');
+      $$('details.steps').forEach(function (d) { d.open = v !== 'result'; });
+      if (keep) store('view', v);
+    }
+    views.forEach(function (b) { b.onclick = function () { setView(b.dataset.v, true); }; });
+    setView(store('view') || 'full', false);
     var toolsBtn = $('[data-act="tools"]');
     toolsBtn.onclick = function () {
       var all = $$('details.tools'), open = !all.some(function (x) { return x.open; });
+      if (open) $$('details.steps').forEach(function (d) { d.open = true; });
       all.forEach(function (x) { x.open = open; });
-      toolsBtn.textContent = open ? '收起工具' : '展开工具';
+      toolsBtn.textContent = open ? '收起全部工具调用' : '展开全部工具调用';
+      toolsBtn.closest('details').open = false;
     };
     $('[data-act="top"]').onclick = function () { window.scrollTo({ top: 0, behavior: 'auto' }); };
     $('[data-act="end"]').onclick = function () { window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' }); };
 
     // 左侧目录跟随阅读位置
-    var prompts = $$('main > .msg.user[id]'), links = {};
+    var prompts = $$('main > .turn > .msg.user[id]'), links = {};
     $$('nav a[href^="#m-"]').forEach(function (a) { links[a.getAttribute('href').slice(1)] = a; });
     var active = null;
     function spy() {
@@ -304,7 +317,7 @@
 
   if (body.classList.contains('index')) {
     var q = $('#q'), ar = $('#ar'), tl = $('#tl'), hits = $('#hits'), cnt = $('#cnt');
-    var rows = $$('#list .row'), chips = $$('#pj .chip'), project = '', seq = 0;
+    var rows = $$('#list .row'), chips = $$('#pj .tab'), project = '', seq = 0;
     var WHO = { user: ['你', 'who-you'], asst: ['Claude', 'who-claude'], tool: ['工具', ''] };
 
     // 有搜索词时列表只留标题命中的会话：内容命中的已经在上面的结果里

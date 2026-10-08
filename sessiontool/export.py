@@ -5,7 +5,7 @@ import os
 import re
 
 from . import render
-from .details import load_image, load_local_image, load_tool
+from .details import load_image, load_local_image, load_sent_image, load_tool
 
 
 class StandaloneMode:
@@ -22,6 +22,18 @@ class StandaloneMode:
 
     def image(self, ref):
         return self._uri(load_image(self.index, ref))
+
+    def shot(self, ref):
+        return self._uri(load_image(self.index, ref)) if self.images else ''
+
+    def local(self, path):
+        return self._uri(load_local_image(self.sources, path)) if self.images else ''
+
+    def sent(self, ref, path):
+        return self._uri(load_sent_image(self.index, ref)) if self.images else ''
+
+    def agent(self, agent_id):
+        return ''
 
     def tool_attrs(self, t):
         return ''
@@ -46,12 +58,9 @@ class StandaloneMode:
         if text:
             out.append('<div class="k">%s</div><pre class="%s">%s</pre>' % ('输出（失败）' if d['error'] else '输出',
                                                                            'err' if d['error'] else '', render.esc(self._cut(text))))
+        # 截图在工具调用下方的缩略图里（带 --images 导出时），这里只说明没带的情况
         n = len(d['images']) + len(d['local_images'])
-        if n and self.images:
-            uris = [self._uri(load_image(self.index, r)) for r in d['images']]
-            uris += [self._uri(load_local_image(self.sources, p)) for p in d['local_images']]
-            out.append(''.join('<img class="pic" loading="lazy" src="%s" alt="截图">' % u for u in uris if u))
-        elif n:
+        if n and not self.images:
             out.append('<div class="k">（%d 张截图未导出，导出时加 --images 可包含）</div>' % n)
         return '<div class="tc">%s</div>' % ''.join(out)
 

@@ -10,7 +10,8 @@ import re
 import sqlite3
 import threading
 
-SCHEMA = 5
+SCHEMA = 6
+LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
 
 DDL = """
 CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, cli TEXT, size INT, mtime INT,
@@ -49,17 +50,41 @@ def flatten_result(content):
     return '\n'.join(texts), images
 
 
+def is_agent_file(path):
+    """子代理的记录放在 <会话>/subagents/ 下，一个子代理一个文件。"""
+    return os.path.basename(os.path.dirname(path)) == 'subagents'
+
+
 def is_base64_image(block):
     src = block.get('source') or {}
     return src.get('type') == 'base64' and isinstance(src.get('data'), str)
 
 
-def parse_record(d):
-    """一行 JSON → (kind, data, text, tool)。只参与父子关系的行返回 ('link', None, '', '')。"""
+def prompt_blocks(prompt):
+    """回复进行中追加的消息（attachment.prompt）→ (块列表, 文字)。带的图片按下标登记。"""
+    if isinstance(prompt, str):
+        return ([['text', prompt]], prompt) if prompt.strip() else ([], '')
+    blocks, texts = [], []
+    for i, b in enumerate(prompt if isinstance(prompt, list) else []):
+        if not isinstance(b, dict):
+            continue
+        if b.get('type') == 'text' and (b.get('text') or '').strip():
+            texts.append(b['text'])
+        elif b.get('type') == 'image' and is_base64_image(b):
+            blocks.append(['img', i])
+    text = '\n'.join(texts)
+    return ([['text', text]] if text else []) + blocks, text
+
+
+def parse_record(d, sidechain=False):
+    """一行 JSON → (kind, data, text, tool)。只参与父子关系的行返回 ('link', None, '', '')。
+
+    sidechain=True 用于子代理自己的记录文件：那里每一行都带 isSidechain。
+    """
     link = ('link', None, '', '')
     t = d.get('type')
     if t in ('user', 'assistant'):
-        if d.get('isSidechain'):
+        if d.get('isSidechain') and not sidechain:
             return link
         msg = d.get('message') or {}
         content = msg.get('content')
@@ -88,12 +113,20 @@ def parse_record(d):
                 inp = b.get('input')
                 name = b.get('name') or '?'
                 hint = tool_hint(inp)
-                blocks.append(['use', b.get('id'), name, hint, i])
+                extra = None
+                if name == 'SendUserFile' and isinstance(inp, dict):
+                    # 发给你的文件：记下路径，页面上直接列出来，图片还能显示
+                    files = [f for f in inp.get('files') or [] if isinstance(f, str)]
+                    extra = {'files': files, 'caption': str(inp.get('caption') or '')[:500]}
+                blocks.append(['use', b.get('id'), name, hint, i, extra])
                 tools.append('%s %s %s' % (name, hint, json.dumps(inp, ensure_ascii=False)[:3000]))
             elif bt == 'tool_result':
                 text, images = flatten_result(b.get('content'))
-                blocks.append(['res', b.get('tool_use_id'), i, text[:300], len(text), len(images),
-                               bool(b.get('is_error'))])
+                local = LOCAL_IMAGE.findall(text)[:20]
+                result = d.get('toolUseResult')
+                agent = result.get('agentId') if isinstance(result, dict) else None
+                blocks.append(['res', b.get('tool_use_id'), i, text[:300], len(text), images,
+                               bool(b.get('is_error')), local, agent if isinstance(agent, str) else None])
                 tools.append(text[:6000])
         if not blocks:
             return link
@@ -113,11 +146,9 @@ def parse_record(d):
         a = d.get('attachment') or {}
         if (a.get('type') == 'queued_command' and a.get('commandMode') == 'prompt'
                 and (a.get('origin') or {}).get('kind') in (None, 'human')):
-            p = a.get('prompt')
-            if isinstance(p, list):
-                p = '\n'.join(b.get('text') or '' for b in p if isinstance(b, dict) and b.get('type') == 'text')
-            if isinstance(p, str) and p.strip():
-                return 'queued', {'b': [['text', p]]}, p, ''
+            blocks, text = prompt_blocks(a.get('prompt'))
+            if blocks:
+                return 'queued', {'b': blocks}, text, ''
         return link
     if t == 'system':
         sub = d.get('subtype')
@@ -215,6 +246,7 @@ class Index:
             fid = con.execute('INSERT INTO files(path, cli, size, mtime, off, guard) VALUES(?,?,0,0,0,?)',
                               (path, cli, '')).lastrowid
         rows, off = [], start
+        sidechain = is_agent_file(path)
         with open(path, 'rb') as f:
             f.seek(start)
             while True:
@@ -234,7 +266,7 @@ class Index:
                     cwd = cwd or d.get('cwd')
                     if d.get('uuid'):
                         last_ts = d.get('timestamp') or last_ts
-                        kind, data, text, tool = parse_record(d)
+                        kind, data, text, tool = parse_record(d, sidechain)
                         rows.append((fid, off, d['uuid'], d.get('parentUuid'), last_ts, d.get('sessionId'), kind,
                                      json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
                 off += len(line)

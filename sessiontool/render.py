@@ -8,6 +8,7 @@ import os
 import re
 import zlib
 from datetime import datetime
+from urllib.parse import quote
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 WEEK = '一二三四五六日'
@@ -234,16 +235,87 @@ def scripts(standalone):
 
 
 THEME_BUTTON = '<button type="button" id="theme" title="切换浅色 / 深色 / 跟随系统"></button>'
+IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
+MINOR = ('stop', 'auto', 'notice', 'note', 'compact', 'cmd', 'summary', 'think')
+
+
+def duration(a, b):
+    ta, tb = local(a), local(b)
+    if not ta or not tb or tb < ta:
+        return ''
+    m = int((tb - ta).total_seconds() // 60)
+    if m < 1:
+        return '不到 1 分钟'
+    if m < 60:
+        return '%d 分钟' % m
+    return '%d 小时 %d 分' % divmod(m, 60) if m % 60 else '%d 小时' % (m // 60)
+
+
+def split_turns(items):
+    """条目 → 轮次。一轮 = 你的一条消息，加上之后直到你下一条消息之前的全部内容。
+
+    每轮是 {'prompt', 'steps', 'finals', 'tail', 'plain'}：finals 是这一轮末尾连续的 Claude 回复（最终答复），
+    steps 是它之前的中间过程，tail 是答复之后的零碎提示；plain 表示 steps 里没有真正的过程，不必单独成块。
+    复刻点、旧分支这类标记单独成一项 {'mark': 条目}。
+    """
+    turns, cur = [], None
+
+    def close():
+        nonlocal cur
+        if cur is None:
+            return
+        prompt, rest = cur
+        cur = None
+        tail, finals = [], []
+        while rest and rest[-1]['kind'] in MINOR:
+            tail.insert(0, rest.pop())
+        while rest and rest[-1]['kind'] == 'asst':
+            finals.insert(0, rest.pop())
+        if not finals:              # 没有最终答复：零碎提示放回原处，保持时间顺序
+            rest, tail = rest + tail, []
+        plain = not any(it['kind'] in ('asst', 'tools', 'sent') for it in rest)
+        if prompt or rest or finals or tail:
+            turns.append({'prompt': prompt, 'steps': rest, 'finals': finals, 'tail': tail, 'plain': plain})
+
+    for it in items:
+        if it['kind'] in ('fork', 'branch'):
+            close()
+            turns.append({'mark': it})
+        elif it['kind'] == 'user':
+            close()
+            cur = (it, [])
+        else:
+            if cur is None:
+                cur = (None, [])
+            cur[1].append(it)
+    close()
+    return turns
 
 # ---------- 会话页 ----------
 
 
 class ServerMode:
-    """工具详情和图片留给浏览器按需请求。"""
+    """工具详情和图片留给浏览器按需向本地服务请求。"""
     standalone = False
 
-    def image(self, ref):
+    def __init__(self, agents=()):
+        self.agents = agents
+
+    def image(self, ref):               # 你发的图片
         return '/img/' + ref
+
+    def shot(self, ref):                # 工具输出里的截图
+        return '/img/' + ref
+
+    def local(self, path):              # 应用另存到 tool-results 的截图；别处的路径服务端不给读，这里就不放
+        ok = os.path.basename(os.path.dirname(path)) == 'tool-results' and os.path.isfile(path)
+        return '/local?p=' + quote(path, safe='') if ok else ''
+
+    def sent(self, ref, path):          # 发给你的图片文件，原位置还在才显示
+        return '/sent/' + ref if os.path.isfile(path) else ''
+
+    def agent(self, agent_id):
+        return '/agent/' + quote(agent_id, safe='') if agent_id in self.agents else ''
 
     def tool_body(self, t):
         return '<div class="tc"></div>'
@@ -271,13 +343,42 @@ class Renderer:
     def stamp(self, iso):
         return '<time title="%s">%s</time>' % (fmt(iso, '%Y-%m-%d %H:%M:%S'), fmt(iso, '%H:%M'))
 
-    def pics(self, refs):
-        out = []
-        for ref in refs:
-            url = self.mode.image(ref)
-            if url:
-                out.append('<img class="pic" loading="lazy" src="%s" alt="图片">' % url)
-        return '<div class="pics">%s</div>' % ''.join(out) if out else ''
+    def daymark(self, it, main):
+        t = local(it.get('ts'))
+        if not main or not t or t.date() == self.day:
+            return ''
+        self.day = t.date()
+        label = '%s 周%s' % (t.strftime('%Y-%m-%d'), WEEK[t.weekday()])
+        self.toc.append('<div class="d">%s</div>' % label)
+        return '<div class="day"><span>%s</span></div>' % label
+
+    def pics(self, urls, cls='pics'):
+        urls = [u for u in urls if u]
+        if not urls:
+            return ''
+        return '<div class="%s">%s</div>' % (cls, ''.join('<img class="pic" loading="lazy" src="%s" alt="图片">' % u for u in urls))
+
+    # ----- 各种条目 -----
+
+    def user(self, it, main):
+        anchor = self.anchor('m-', it['u'])
+        num = '<a class="num" href="#m-%s">#%d</a>' % (it['u'], it['n']) if it.get('n') else ''
+        tag = '<span class="badge">回复进行中追加</span>' if it.get('queued') else ''
+        if main and it.get('n') and anchor:
+            self.toc.append('<a href="#m-%s" title="%s"><b>%d</b><span>%s</span></a>' % (
+                it['u'], esc(fmt(it['ts']) + '\n' + it['text'][:300]), it['n'], esc(preview(it['text'])[:60] or '（图片）')))
+        body = '<div class="body">%s</div>' % md(it['text']) if it['text'] else ''
+        return ('<section class="msg user"%s><div class="av">你</div><div class="mc"><header><b>你</b>%s%s%s'
+                '<button type="button" class="copy">复制</button></header>%s%s</div></section>'
+                % (anchor, self.stamp(it['ts']), num, tag, body, self.pics(self.mode.image(r) for r in it['imgs'])))
+
+    def final(self, it):
+        return ('<section class="msg asst"%s><div class="av">C</div><div class="mc"><header><b>Claude</b>%s'
+                '<button type="button" class="copy">复制</button></header><div class="body">%s</div></div></section>'
+                % (self.anchor('m-', it['u']), self.stamp(it['ts']), md(it['text'])))
+
+    def step(self, it):
+        return '<div class="step"%s>%s<div class="body">%s</div></div>' % (self.anchor('m-', it['u']), self.stamp(it['ts']), md(it['text']))
 
     def tool(self, t):
         badges = ''
@@ -287,71 +388,116 @@ class Renderer:
             badges += '<span class="badge">%d 图</span>' % t['nimg']
         if not t['res']:
             badges += '<span class="badge">无输出记录</span>'
+        sub = self.mode.agent(t['agent']) if t['agent'] else ''
+        if sub:
+            badges += '<a class="badge go" href="%s">查看子代理的过程 →</a>' % sub
         hint = short_path(t['hint'], self.cwd) if looks_like_path(t['hint']) else t['hint']
         attrs = self.anchor('t-', t['u']) + (' data-r="%s"' % t['ru'] if t['ru'] else '') + self.mode.tool_attrs(t)
         return ('<details class="tool"%s><summary><code>%s</code><span class="hint" title="%s">%s</span>%s</summary>%s</details>'
                 % (attrs, esc(t['name']), esc(t['hint']), esc(hint), badges, self.mode.tool_body(t)))
 
+    def tools(self, it):
+        cnt = collections.Counter(x['name'] for x in it['tools'])
+        label = '、'.join('%s ×%d' % (n, c) if c > 1 else n for n, c in cnt.most_common())
+        fails = sum(1 for x in it['tools'] if x['error'])
+        shots = [self.mode.shot(r) for x in it['tools'] for r in x['imgs']] + [self.mode.local(p) for x in it['tools'] for p in x['local']]
+        return ('<details class="tools"><summary><span class="n">%d 次工具调用</span><span class="hint">%s</span>%s</summary>%s</details>%s' % (
+            len(it['tools']), esc(label), '<span class="badge err">%d 次失败</span>' % fails if fails else '',
+            ''.join(self.tool(x) for x in it['tools']), self.pics(shots, 'thumbs')))
+
+    def sent(self, it):
+        shown, names = [], []
+        for path, ref in it['files']:
+            name = re.split(r'[\\/]', path)[-1]
+            url = self.mode.sent(ref, path) if path.lower().endswith(IMAGE_EXT) else ''
+            if url:
+                shown.append(url)
+            else:
+                gone = '' if os.path.exists(path) else '<small>已不在原位置</small>'
+                names.append('<span class="file" title="%s">%s%s</span>' % (esc(path), esc(name), gone))
+        return ('<div class="sent"%s><div class="k">发给你的文件 · %s</div>%s%s%s</div>' % (
+            self.anchor('t-', it['u']), fmt(it['ts'], '%H:%M'), '<p>%s</p>' % esc(it['caption']) if it['caption'] else '',
+            self.pics(shown), '<div class="files-sent">%s</div>' % ''.join(names) if names else ''))
+
     def line(self, text, iso, attrs=''):
         return '<div class="line"%s><span>%s · %s</span></div>' % (attrs, text, fmt(iso, '%H:%M'))
 
-    def items(self, items, main=True):
+    def minor(self, it):
+        k = it['kind']
+        if k == 'think':
+            return '<details class="fold think"><summary>思考过程</summary><div class="body">%s</div></details>' % md(it['text'])
+        if k == 'summary':
+            return ('<details class="fold"%s><summary>上下文压缩摘要 · %s</summary><div class="body">%s</div></details>'
+                    % (self.anchor('m-', it['u']), fmt(it['ts'], '%H:%M'), md(it['text'])))
+        if k == 'compact':
+            how = {'auto': '自动', 'manual': '手动'}.get(it['trigger'], '')
+            return self.line('上下文已%s压缩（%s → %s tokens）' % (how, tokens(it['pre']), tokens(it['post'])), it['ts'])
+        if k == 'note':
+            return '<details class="fold sys"><summary>系统通知 · %s</summary><pre>%s</pre></details>' % (fmt(it['ts'], '%H:%M'), esc(it['text'][:5000]))
+        if k == 'cmd':
+            return ('<details class="fold sys"><summary>本地命令 <code>%s</code> · %s</summary><pre>%s</pre></details>'
+                    % (esc((it['cmd'] + ' ' + it['args']).strip()[:120]), fmt(it['ts'], '%H:%M'), esc(it['out'])))
+        if k == 'stop':
+            return self.line('你中断了这次回复', it['ts'])
+        if k == 'auto':
+            return self.line('额度恢复，应用自动发送了“继续”', it['ts'])
+        if k == 'notice':
+            return self.line(esc(it['text'][:300]), it['ts'], self.anchor('m-', it['u']))
+        return ''
+
+    def flow(self, items, main):
+        """一轮里的中间内容，按时间顺序。"""
         out = []
         for it in items:
             k = it['kind']
-            t = local(it.get('ts'))
-            if main and t and t.date() != self.day and k in ('user', 'asst', 'tools'):
-                self.day = t.date()
-                label = '%s 周%s' % (t.strftime('%Y-%m-%d'), WEEK[t.weekday()])
-                out.append('<div class="day"><span>%s</span></div>' % label)
-                self.toc.append('<div class="d">%s</div>' % label)
-            if k == 'user':
-                anchor = self.anchor('m-', it['u'])
-                num = '<a class="num" href="#m-%s">#%d</a>' % (it['u'], it['n']) if it.get('n') else ''
-                tag = '<span class="badge">回复进行中追加</span>' if it.get('queued') else ''
-                if main and it.get('n') and anchor:
-                    self.toc.append('<a href="#m-%s" title="%s"><small>%s</small>%s</a>' % (
-                        it['u'], esc(it['text'][:300]), fmt(it['ts'], '%H:%M'), esc(preview(it['text'])[:60] or '（图片）')))
-                out.append('<section class="msg user"%s><header><span class="who">你</span>%s%s%s<button type="button" class="copy">复制</button>'
-                           '</header><div class="body">%s%s</div></section>'
-                           % (anchor, self.stamp(it['ts']), num, tag, md(it['text']), self.pics(it['imgs'])))
-            elif k == 'asst':
-                out.append('<section class="msg asst"%s><header><span class="who">Claude</span>%s<button type="button" class="copy">复制</button>'
-                           '</header><div class="body">%s</div></section>'
-                           % (self.anchor('m-', it['u']), self.stamp(it['ts']), md(it['text'])))
-            elif k == 'notice':
-                out.append(self.line(esc(it['text'][:300]), it['ts'], self.anchor('m-', it['u'])))
-            elif k == 'tools':
-                cnt = collections.Counter(x['name'] for x in it['tools'])
-                label = '、'.join('%s ×%d' % (n, c) if c > 1 else n for n, c in cnt.most_common())
-                fails = sum(1 for x in it['tools'] if x['error'])
-                out.append('<details class="tools"><summary><span class="n">%d 次工具调用</span><span class="hint">%s</span>%s</summary>%s</details>' % (
-                    len(it['tools']), esc(label), '<span class="badge err">%d 次失败</span>' % fails if fails else '',
-                    ''.join(self.tool(x) for x in it['tools'])))
-            elif k == 'think':
-                out.append('<details class="fold think"><summary>思考过程</summary><div class="body">%s</div></details>' % md(it['text']))
-            elif k == 'summary':
-                out.append('<details class="fold"%s><summary>上下文压缩摘要 · %s</summary><div class="body">%s</div></details>'
-                           % (self.anchor('m-', it['u']), fmt(it['ts'], '%H:%M'), md(it['text'])))
-            elif k == 'compact':
-                how = {'auto': '自动', 'manual': '手动'}.get(it['trigger'], '')
-                out.append(self.line('上下文已%s压缩（%s → %s tokens）' % (how, tokens(it['pre']), tokens(it['post'])), it['ts']))
-            elif k == 'note':
-                out.append('<details class="fold sys"><summary>系统通知 · %s</summary><pre>%s</pre></details>' % (fmt(it['ts'], '%H:%M'), esc(it['text'][:5000])))
-            elif k == 'cmd':
-                out.append('<details class="fold sys"><summary>本地命令 <code>%s</code> · %s</summary><pre>%s</pre></details>'
-                           % (esc((it['cmd'] + ' ' + it['args']).strip()[:120]), fmt(it['ts'], '%H:%M'), esc(it['out'])))
-            elif k == 'stop':
-                out.append(self.line('你中断了这次回复', it['ts']))
-            elif k == 'auto':
-                out.append(self.line('额度恢复，应用自动发送了“继续”', it['ts']))
-            elif k == 'fork':
+            if k in ('asst', 'tools', 'sent'):
+                out.append(self.daymark(it, main))
+            out.append(self.step(it) if k == 'asst' else self.tools(it) if k == 'tools' else self.sent(it) if k == 'sent' else self.minor(it))
+        return out
+
+    def steps(self, t, main):
+        """中间过程：可以整块折起来，只留最终答复。"""
+        says = sum(1 for it in t['steps'] if it['kind'] == 'asst')
+        calls = sum(len(it['tools']) for it in t['steps'] if it['kind'] == 'tools')
+        shots = sum(x['nimg'] for it in t['steps'] if it['kind'] == 'tools' for x in it['tools'])
+        parts = [p for p in ('%d 段说明' % says if says else '', '%d 次工具调用' % calls if calls else '',
+                             '%d 张截图' % shots if shots else '') if p]
+        start = (t['prompt'] or t['steps'][0]).get('ts')
+        end = (t['finals'][0] if t['finals'] else t['steps'][-1]).get('ts')
+        took = duration(start, end)
+        if took:
+            parts.append('用时 ' + took)
+        if not t['finals']:
+            parts.append('这一轮没有最终答复')
+        return ('<details class="steps" open><summary><b>过程</b><span>%s</span></summary><div class="rail">%s</div></details>'
+                % (' · '.join(parts), ''.join(self.flow(t['steps'], main))))
+
+    def conversation(self, items, main=True):
+        out = []
+        for t in split_turns(items):
+            mark = t.get('mark')
+            if mark and mark['kind'] == 'fork':
                 out.append('<div class="forkline"><span>以上来自原会话 · 从这里开始是复刻后的内容</span></div>')
                 self.toc.append('<div class="d fk">复刻点</div>')
-            elif k == 'branch':
-                n = sum(1 for x in it['items'] if x['kind'] in ('user', 'asst'))
+            elif mark:
+                n = sum(1 for x in mark['items'] if x['kind'] in ('user', 'asst'))
                 out.append('<details class="fold branch"><summary>改写前的旧分支（%d 条消息，应用里已不显示）· %s</summary>%s</details>'
-                           % (n, fmt(it['ts'], '%H:%M'), ''.join(self.items(it['items'], main=False))))
+                           % (n, fmt(mark['ts'], '%H:%M'), ''.join(self.conversation(mark['items'], main=False))))
+            else:
+                first = t['prompt'] or (t['steps'] + t['finals'] + t['tail'])[0]
+                out.append(self.daymark(first, main))
+                out.append('<article class="turn">')
+                if t['prompt']:
+                    out.append(self.user(t['prompt'], main))
+                if t['plain']:
+                    out += self.flow(t['steps'], main)
+                else:
+                    out.append(self.steps(t, main))
+                for f in t['finals']:
+                    out.append(self.daymark(f, main))
+                    out.append(self.final(f))
+                out += self.flow(t['tail'], main)
+                out.append('</article>')
         return out
 
 
@@ -366,49 +512,58 @@ def changed_files(c, cwd):
         rows.append('<li><a href="#t-%s" title="%s"><b>%s</b>%s</a>%s</li>' % (
             u, esc(path), esc(name), '' if same or not folder else '<small>%s</small>' % esc(short_path(folder, cwd, 70)),
             '<small>×%d</small>' % n if n > 1 else ''))
-    rows = ''.join(rows)
-    return '<details class="files"><summary>修改过 %d 个文件</summary><ul>%s</ul></details>' % (len(c['changed']), rows)
+    return '<details class="files"><summary>修改过 %d 个文件</summary><ul>%s</ul></details>' % (len(c['changed']), ''.join(rows))
 
 
-def session_page(s, c, mode, parent=None, state=''):
-    """parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此发现新记录。"""
+VIEW = ('<div class="seg" id="view" title="完整：全部内容；对话：隐藏工具调用；结果：折起中间过程，只留每轮的最终答复">'
+        '<button type="button" data-v="full">完整</button><button type="button" data-v="chat">对话</button>'
+        '<button type="button" data-v="result">结果</button></div>')
+
+
+def session_page(s, c, mode, parent=None, state='', back=None):
+    """parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此发现新记录。
+    back: (地址, 文字)，子代理页用它回到调用它的会话。"""
     r = Renderer(mode, s.cwd)
-    body = r.items(c['items'])
-    facts = ['<span title="%s">%s</span>' % (esc(s.cwd), esc(s.proj)),
-             '%s → %s' % (fmt(c['first'], '%m-%d %H:%M'), fmt(c['last'], '%m-%d %H:%M')),
-             '%d 问 · %d 答 · %d 次工具调用' % (c['n_user'], c['n_asst'], c['n_tools'])]
+    body = r.conversation(c['items'])
+    facts = ['<span class="proj" title="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span>' % (esc(s.cwd), hue(s.proj), esc(s.proj)),
+             '<span>%s → %s</span>' % (fmt(c['first'], '%m-%d %H:%M'), fmt(c['last'], '%m-%d %H:%M')),
+             '<span>%d 问</span><span>%d 答</span><span>%d 次工具调用</span>' % (c['n_user'], c['n_asst'], c['n_tools'])]
     if parent:
-        facts.append('复刻自 ' + (esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1]))))
+        facts.append('<span>复刻自 %s</span>' % (esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1]))))
     if c['nfiles'] > 1:
-        facts.append('由 %d 份记录合并' % c['nfiles'])
+        facts.append('<span>由 %d 份记录合并</span>' % c['nfiles'])
     if c['n_branch']:
-        facts.append('%d 处改写' % c['n_branch'])
-    tools = '<label class="tg"><input type="checkbox" id="onlychat"> 只看对话</label><button type="button" data-act="tools">展开工具</button>'
-    if mode.standalone:
-        bar, back, attrs = '<div class="bar">' + tools + '<span class="sp"></span>' + THEME_BUTTON + '</div>', '', ''
+        facts.append('<span>%d 处改写</span>' % c['n_branch'])
+    more = '<button type="button" data-act="tools">展开全部工具调用</button>'
+    if mode.standalone or back:
+        attrs, search, app = '', '', ''
     else:
-        app = '' if s.orphan else '<a class="btn" href="claude://claude.ai/epitaxy/%s" title="在 Claude 桌面应用里打开这个会话">在应用中打开</a>' % esc(s.id)
-        export = ('<details class="menu"><summary class="btn">导出</summary><div>'
-                  '<a href="/export/%s.html">HTML<small>单个文件，可离线打开</small></a>'
-                  '<a href="/export/%s.html?images=1">HTML（含工具截图）<small>文件可能很大</small></a>'
-                  '<a href="/export/%s.md">Markdown<small>只有对话文字</small></a></div></details>' % (s.page, s.page, s.page))
-        bar = ('<div class="bar"><input id="fq" type="search" placeholder="搜索本会话…" title="空格分隔多个词；按 / 聚焦，Enter 下一处">' + tools
-               + '<span class="sp"></span>' + app + export + THEME_BUTTON + '</div>')
-        back = '<a class="back" href="/">← 全部会话</a>'
         attrs = ' data-state="/api/state?page=%s" data-sig="%s"' % (s.page, state)
-    nav = (back + '<div class="jump"><button type="button" data-act="top">↑ 开头</button>'
+        app = '' if s.orphan else '<a class="btn" href="claude://claude.ai/epitaxy/%s" title="在 Claude 桌面应用里打开这个会话">在应用中打开</a>' % esc(s.id)
+        more += ('<a href="/export/%s.html">导出 HTML<small>单个文件，可离线打开</small></a>'
+                 '<a href="/export/%s.html?images=1">导出 HTML（含截图）<small>文件可能很大</small></a>'
+                 '<a href="/export/%s.md">导出 Markdown<small>只有对话文字</small></a>' % (s.page, s.page, s.page))
+    if not mode.standalone:
+        search = '<input id="fq" type="search" placeholder="搜索本会话…" title="空格分隔多个词；按 / 聚焦，Enter 下一处">'
+    bar = ('<div class="bar">' + search + VIEW + '<span class="sp"></span>' + app
+           + '<details class="menu"><summary class="btn">更多</summary><div>' + more + '</div></details>' + THEME_BUTTON + '</div>')
+    if back:
+        home = '<a class="back" href="%s">← %s</a>' % (back[0], esc(back[1]))
+    else:
+        home = '' if mode.standalone else '<a class="back" href="/">← 全部会话</a>'
+    nav = (home + '<div class="jump"><button type="button" data-act="top">↑ 开头</button>'
            '<button type="button" data-act="end">↓ 最新</button></div>'
-           '<div class="navhead">你的 %d 条提问（J / K 切换）</div>' % c['n_user'] + ''.join(r.toc))
+           '<div class="navhead">提问目录 · J / K 切换</div>' + ''.join(r.toc))
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号
     return ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '><div class="layout"><nav>', nav,
-                    '</nav><main>', bar, '<h1>', esc(c['title']), '</h1><div class="meta">',
-                    '<i>·</i>'.join(facts), '</div>', changed_files(c, s.cwd), '\n'.join(body),
+                    '</nav><main>', bar, '<header class="head"><h1>', esc(c['title']), '</h1><div class="facts">',
+                    ''.join(facts), '</div>', changed_files(c, s.cwd), '</header>', '\n'.join(body),
                     '</main></div>', scripts(mode.standalone), '</body></html>'])
 
 # ---------- 索引页 ----------
 
 
-def index_row(s, c, depth, parent_title, now):
+def index_row(s, c, depth, now):
     tags = ''
     if s.parent:
         tags += '<span class="badge">复刻</span>'
@@ -419,7 +574,7 @@ def index_row(s, c, depth, parent_title, now):
     return ('<a class="row%s" href="/s/%s" data-page="%s" data-p="%s" data-t="%s" data-a="%s" style="--d:%d">'
             '<div class="r1"><span class="title">%s</span>%s<time title="%s">%s</time></div>'
             '<div class="r2">%s</div>'
-            '<div class="r3"><span class="proj"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span><i>·</i>%d 问<i>·</i>%d 答<i>·</i>%s</div></a>'
+            '<div class="r3"><span class="proj"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span><span>%d 问</span><span>%d 答</span><span>%s</span></div></a>'
             % (' child' if depth else '', s.page, s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', min(depth, 3),
                esc(c['title']), tags, fmt(c['last']), when(c['last'], now),
                esc(preview(c['first_prompt'])) or '（没有文字提问）',
@@ -437,25 +592,30 @@ def index_page(entries, state=''):
                 out.append('</section>')
             out.append('<section class="bucket"><h2>%s</h2>' % b)
             last_bucket = b
-        out.append(index_row(s, c, depth, None, now))
+        out.append(index_row(s, c, depth, now))
     if last_bucket is not None:
         out.append('</section>')
-    counts = collections.Counter(s.proj for s, _, _, _ in entries)
-    chips = '<button type="button" class="chip on" data-p="">全部<small>%d</small></button>' % len(entries) + ''.join(
-        '<button type="button" class="chip" data-p="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s<small>%d</small></button>'
-        % (esc(p), hue(p), esc(p), n) for p, n in counts.most_common())
+    counts = collections.OrderedDict()          # 项目按最近活动排序，和列表一致
+    for s, _, _, _ in entries:
+        counts[s.proj] = counts.get(s.proj, 0) + 1
+    tabs = '<button type="button" class="tab on" data-p=""><span>全部会话</span><small>%d</small></button>' % len(entries) + ''.join(
+        '<button type="button" class="tab" data-p="%s"><i style="background:hsl(%d 55%% 55%%)"></i><span>%s</span><small>%d</small></button>'
+        % (esc(p), hue(p), esc(p), n) for p, n in counts.items())
     total = sum(s.size for s, _, _, _ in entries)
     empty = '' if entries else '<p class="empty">还没有找到任何会话记录。</p>'
     return ''.join([
-        head('Claude 会话记录', False), '<body class="index" data-state="/api/state" data-sig="', state, '"><main>',
-        '<header class="top"><h1>Claude 会话记录</h1>', THEME_BUTTON, '</header>',
-        '<div class="meta">%d 个会话<i>·</i>%d 个项目<i>·</i>记录共 %s<i>·</i>显示 <span id="cnt">%d</span> 个</div>'
-        % (len(entries), len(counts), size(total), len(entries)),
-        '<div class="bar"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词（按 / 聚焦）" autofocus>',
-        '<label class="tg"><input type="checkbox" id="tl"> 含工具调用与输出</label></div>',
-        '<div class="chips" id="pj">', chips, '<span class="sp"></span>',
-        '<label class="tg"><input type="checkbox" id="ar" checked> 含已归档</label></div>',
-        '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></main>', scripts(False), '</body></html>'])
+        head('Claude 会话记录', False), '<body class="index" data-state="/api/state" data-sig="', state, '"><div class="shell">',
+        '<aside><a class="brand" href="/"><img src="/static/icon.svg" width="28" height="28" alt="">'
+        '<span>Sessiontool<small>Claude 会话记录</small></span></a>',
+        '<div class="side-h">项目</div><div class="tabs" id="pj">', tabs, '</div>',
+        '<div class="side-h">选项</div>'
+        '<label class="tg"><input type="checkbox" id="ar" checked> 显示已归档的会话</label>'
+        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label>',
+        '<div class="side-foot"><span>%d 个会话 · %s</span>' % (len(entries), size(total)), THEME_BUTTON, '</div></aside>',
+        '<main><div class="search"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词" autofocus>'
+        '<kbd>/</kbd></div>',
+        '<div class="meta" id="status">显示 <span id="cnt">%d</span> 个会话</div>' % len(entries),
+        '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></main></div>', scripts(False), '</body></html>'])
 
 # ---------- Markdown 导出 ----------
 
@@ -475,6 +635,9 @@ def session_markdown(s, c):
                 out.append('\n### Claude　%s\n\n%s\n' % (fmt(it['ts']), it['text']))
             elif k == 'tools':
                 out.append('\n> 工具调用：' + '、'.join('%s（%s）' % (t['name'], t['hint']) if t['hint'] else t['name'] for t in it['tools']) + '\n')
+            elif k == 'sent':
+                out.append('\n> 发给你的文件：%s%s\n' % ('、'.join(re.split(r'[\\/]', p)[-1] for p, _ in it['files']),
+                                                    '（%s）' % it['caption'] if it['caption'] else ''))
             elif k == 'summary':
                 out.append('\n<details><summary>上下文压缩摘要　%s</summary>\n\n%s\n\n</details>\n' % (fmt(it['ts']), it['text']))
             elif k == 'fork':

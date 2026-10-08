@@ -7,10 +7,9 @@ import base64
 import os
 import re
 
-from .index import flatten_result, is_base64_image
+from .index import LOCAL_IMAGE, flatten_result, is_base64_image
 
 PERSISTED = re.compile(r'Full output saved to: ([^\r\n]+)')
-LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
 MAX_TEXT = 2_000_000
 IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp'}
 
@@ -27,8 +26,9 @@ def block(index, ref, parts=(3,)):
     nums = parse_ref(ref, parts)
     if not nums:
         return None, None
-    d = index.raw(nums[0], nums[1])
-    content = ((d or {}).get('message') or {}).get('content')
+    d = index.raw(nums[0], nums[1]) or {}
+    # 普通消息的内容在 message.content；回复进行中追加的消息在 attachment.prompt
+    content = (d.get('message') or {}).get('content') or (d.get('attachment') or {}).get('prompt')
     if not isinstance(content, list) or nums[2] >= len(content) or not isinstance(content[nums[2]], dict):
         return None, nums
     return content[nums[2]], nums
@@ -93,6 +93,22 @@ def load_image(index, ref):
         return None
     media = blk['source'].get('media_type') or 'image/png'
     return data, (media if media in IMAGE_TYPES.values() else 'image/png')
+
+
+def load_sent_image(index, ref):
+    """SendUserFile 发给你的图片。引用是 "文件.偏移.块.第几个文件"，路径取自记录本身，不接受外部传入。"""
+    blk, nums = block(index, ref, parts=(4,))
+    if blk is None or blk.get('type') != 'tool_use' or blk.get('name') != 'SendUserFile':
+        return None
+    files = (blk.get('input') or {}).get('files')
+    if not isinstance(files, list) or nums[3] >= len(files) or not isinstance(files[nums[3]], str):
+        return None
+    path = files[nums[3]]
+    media = IMAGE_TYPES.get(os.path.splitext(path)[1].lower())
+    if not media or not os.path.isfile(path):
+        return None
+    with open(path, 'rb') as f:
+        return f.read(), media
 
 
 def load_local_image(sources, path):

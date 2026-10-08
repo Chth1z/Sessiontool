@@ -12,6 +12,8 @@ import re
 import threading
 import time
 
+from .index import is_agent_file
+
 AUTO_CONTINUE = 'I hit my usage limit while you were working'
 INTERRUPT = re.compile(r'\[Request interrupted by user[^\]]*\]')
 NOTE_PREFIX = ('<task-notification', '<ci-monitor-event')
@@ -105,9 +107,10 @@ def assemble(recs, links, own_ids, forked):
         elif kind == 'cmd':
             target.append({'kind': 'cmd', 'ts': ts, 'cmd': d.get('cmd') or '', 'args': d.get('args') or '', 'out': d.get('out') or ''})
         elif kind == 'queued':
-            body = clean_prompt(d['b'][0][1])
-            if body and not body.startswith(NOTE_PREFIX):
-                prompt = {'kind': 'user', 'ts': ts, 'u': u, 'text': body, 'imgs': [], 'queued': True}
+            body = clean_prompt('\n\n'.join(b[1] for b in d['b'] if b[0] == 'text'))
+            imgs = ['%s.%d' % (ref, b[1]) for b in d['b'] if b[0] == 'img']
+            if (body or imgs) and not body.startswith(NOTE_PREFIX):
+                prompt = {'kind': 'user', 'ts': ts, 'u': u, 'text': body, 'imgs': imgs, 'queued': True}
         elif kind == 'user':
             texts, imgs = [], []
             for blk in d['b']:
@@ -118,7 +121,9 @@ def assemble(recs, links, own_ids, forked):
                 elif blk[0] == 'res':
                     tu = tools.get(blk[1])
                     if tu:
-                        tu.update(res='%s.%d' % (ref, blk[2]), preview=blk[3], size=blk[4], nimg=blk[5], error=blk[6], ru=u)
+                        tu.update(res='%s.%d' % (ref, blk[2]), preview=blk[3], size=blk[4], error=blk[6], ru=u,
+                                  imgs=['%s.%d.%d' % (ref, blk[2], j) for j in blk[5]], local=blk[7], agent=blk[8])
+                        tu['nimg'] = len(tu['imgs']) + len(tu['local'])
             if d.get('meta'):
                 continue
             body = clean_prompt('\n\n'.join(texts))
@@ -142,9 +147,12 @@ def assemble(recs, links, own_ids, forked):
                     target.append({'kind': 'think', 'ts': ts, 'text': blk[1]})
                 elif blk[0] == 'use':
                     tu = {'name': blk[2], 'hint': blk[3], 'use': '%s.%d' % (ref, blk[4]), 'res': None, 'preview': '',
-                          'size': 0, 'nimg': 0, 'error': False, 'u': u, 'ru': ''}
+                          'size': 0, 'nimg': 0, 'error': False, 'u': u, 'ru': '', 'imgs': [], 'local': [], 'agent': None}
                     tools[blk[1]] = tu
-                    if target and target[-1]['kind'] == 'tools':
+                    if blk[5]:      # 发给你的文件单独成一条，不埋在工具调用里
+                        target.append({'kind': 'sent', 'ts': ts, 'u': u, 'caption': blk[5]['caption'],
+                                       'files': [(path, '%s.%d.%d' % (ref, blk[4], k)) for k, path in enumerate(blk[5]['files'])]})
+                    elif target and target[-1]['kind'] == 'tools':
                         target[-1]['tools'].append(tu)
                     else:
                         target.append({'kind': 'tools', 'ts': ts, 'tools': [tu]})
@@ -191,7 +199,7 @@ class Catalog:
         self.sources = index.sources
         self.lock = threading.RLock()
         self.checked = 0
-        self.sessions, self.by_page, self.owner = [], {}, {}
+        self.sessions, self.by_page, self.owner, self.agents = [], {}, {}, {}
         self._merged, self._content = {}, {}
 
     def refresh(self, progress=None, force=False):
@@ -204,7 +212,12 @@ class Catalog:
             self.checked = time.time()
 
     def _build(self):
-        files = {f['cli']: f for f in self.index.files()}
+        files, self.agents = {}, {}
+        for f in self.index.files():
+            if is_agent_file(f['path']):        # 子代理的记录不是独立会话，按编号挂到调用它的地方
+                self.agents[re.sub(r'^agent-', '', f['cli'])] = f
+            else:
+                files[f['cli']] = f
         raw, used = {}, set()
         for sid, r in self.sources.app_sessions().items():
             ids = []
@@ -228,9 +241,11 @@ class Catalog:
                 n += 1
             taken.add(short[:n])
             cwd = r.get('cwd') or own[-1]['cwd'] or ''
+            # 没选文件夹就开始的会话，应用给它建了个临时目录，名字没有意义
+            proj = '无文件夹' if 'scratch-workspaces' in cwd else (os.path.basename(cwd.rstrip('\\/')) or cwd or '（未知）')
             sessions[sid] = Session(
                 id=sid, page=short[:n], record_title=r.get('title'), file_title=own[-1]['title'], cwd=cwd,
-                proj=os.path.basename(cwd.rstrip('\\/')) or cwd or '（未知）', archived=bool(r.get('isArchived')),
+                proj=proj, archived=bool(r.get('isArchived')),
                 created=r.get('createdAt') or 0, parent_id=r.get('forkedFromSessionId'), cli_ids=ids, files=own,
                 orphan=bool(r.get('_orphan')), parent=None, size=sum(f['size'] for f in own))
         for s in sessions.values():
@@ -301,6 +316,32 @@ class Catalog:
             c['nfiles'] = len(self.lineage(s))
             self._content[s.id] = c
             return c
+
+    def agent_content(self, agent_id):
+        """一个子代理自己的对话，整理成和会话一样的条目。没有这份记录时返回 None。"""
+        f = self.agents.get(agent_id)
+        if not f:
+            return None
+        with self.lock:
+            sig = (f['id'], f['off'])
+            c = self._content.get('agent:' + agent_id)
+            if c and c['sig'] == sig:
+                return c
+            recs = [{'file': r['file'], 'off': r['off'], 'uuid': r['uuid'], 'parent': r['parent'], 'ts': r['ts'] or '',
+                     'sid': r['sid'], 'kind': r['kind'], 'd': json.loads(r['data'])}
+                    for r in self.index.rows(f['id']) if r['kind'] != 'link']
+            items = assemble(recs, {}, set(), False)
+            c = {'sig': sig, 'items': items, 'nfiles': 1}
+            c.update(stats(items))
+            c['title'] = '子代理：' + (c['first_prompt'][:40] or agent_id)
+            self._content['agent:' + agent_id] = c
+            return c
+
+    def agent_owner(self, agent_id):
+        """子代理属于哪个会话：它的记录在 <项目>/<会话的记录编号>/subagents/ 下。"""
+        f = self.agents.get(agent_id)
+        cli = os.path.basename(os.path.dirname(os.path.dirname(f['path']))) if f else None
+        return next((s for s in self.sessions if cli in s.cli_ids), None)
 
     def find(self, key):
         """按页面编号前缀或标题片段找会话，返回匹配列表。"""

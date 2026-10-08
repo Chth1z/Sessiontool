@@ -8,7 +8,7 @@ import threading
 import unittest
 
 from sessiontool import render
-from sessiontool.details import load_image, load_tool
+from sessiontool.details import load_image, load_sent_image, load_tool
 from sessiontool.export import export_html, export_markdown
 from sessiontool.server import App, make_server
 from sessiontool.sources import Sources
@@ -193,6 +193,87 @@ class MergeTest(Case):
         s, c = self.content(self.open(), 'file_aaaa1111')
         self.assertEqual(self.texts(c['items'], 'user'), ['真正的问题'])
         self.assertEqual([it['kind'] for it in c['items']], ['user', 'auto', 'note', 'notice'])
+
+
+class TurnTest(Case):
+    def test_a_turn_separates_the_process_from_the_final_answer(self):
+        use = [{'type': 'tool_use', 'id': 't1', 'name': 'Bash', 'input': {'command': 'make'}}]
+        self.write('aaaa1111', [
+            user('u1', None, '帮我构建', 1, 'aaaa1111'),
+            asst('a1', 'u1', '先看一下项目结构。', 2, 'aaaa1111'), asst('a2', 'a1', use, 3, 'aaaa1111'),
+            user('r1', 'a2', [{'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'}], 4, 'aaaa1111'),
+            asst('a3', 'r1', '构建完成。', 65, 'aaaa1111'),
+            user('s1', 'a3', '[Request interrupted by user]', 66, 'aaaa1111'),
+            user('u2', 's1', '谢谢', 70, 'aaaa1111'), asst('a4', 'u2', '不客气。', 71, 'aaaa1111'),
+            user('u3', 'a4', '再跑一次', 80, 'aaaa1111'), asst('a5', 'u3', use, 81, 'aaaa1111')])
+        s, c = self.content(self.open(), 'file_aaaa1111')
+        first, second, third = render.split_turns(c['items'])
+        self.assertEqual([it['kind'] for it in first['steps']], ['asst', 'tools'])
+        self.assertEqual([it['text'] for it in first['finals']], ['构建完成。'])
+        self.assertEqual([it['kind'] for it in first['tail']], ['stop'])
+        self.assertTrue(second['plain'])                    # 一问一答，没有过程可折
+        self.assertEqual((third['finals'], third['plain']), ([], False))      # 还没等到最终答复
+        page = render.session_page(s, c, render.ServerMode())
+        self.assertEqual(page.count('<details class="steps" open>'), 2)
+        self.assertIn('1 段说明 · 1 次工具调用 · 用时 1 分钟', page)
+        self.assertEqual(render.duration(ts(0), '2026-01-01T02:05:00.000Z'), '2 小时 5 分')
+        self.assertIn('这一轮没有最终答复', page)
+        self.assertEqual(page.count('class="msg asst"'), 2)
+        self.assertEqual(page.count('class="step"'), 1)
+
+
+class ExtrasTest(Case):
+    def test_subagent_transcript_is_linked_from_the_call_that_started_it(self):
+        call = [{'type': 'tool_use', 'id': 'g1', 'name': 'Agent', 'input': {'description': '查资料', 'prompt': '去查'}}]
+        self.write('aaaa1111', [
+            user('u1', None, '调查一下', 1, 'aaaa1111'), asst('a1', 'u1', call, 2, 'aaaa1111'),
+            user('r1', 'a1', [{'type': 'tool_result', 'tool_use_id': 'g1', 'content': '查到了'}], 9, 'aaaa1111',
+                 toolUseResult={'agentId': 'abc123', 'totalToolUseCount': 1}),
+            asst('a2', 'r1', '结论如下。', 10, 'aaaa1111')])
+        sub = os.path.join(self.proj, 'aaaa1111', 'subagents')
+        os.makedirs(sub)
+        with open(os.path.join(sub, 'agent-abc123.jsonl'), 'w', encoding='utf-8', newline='\n') as f:
+            for r in (user('s1', None, '去查', 3, 'aaaa1111', isSidechain=True, agentId='abc123'),
+                      asst('s2', 's1', '子代理的发现', 4, 'aaaa1111', isSidechain=True, agentId='abc123')):
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        cat = self.open()
+        self.assertEqual(len(cat.sessions), 1)              # 子代理的记录不算独立会话
+        s, c = self.content(cat, 'file_aaaa1111')
+        self.assertIn('href="/agent/abc123"', render.session_page(s, c, render.ServerMode(cat.agents)))
+        inner = cat.agent_content('abc123')
+        self.assertEqual(self.texts(inner['items'], 'user') + self.texts(inner['items'], 'asst'), ['去查', '子代理的发现'])
+        self.assertIs(cat.agent_owner('abc123'), s)
+        self.assertIsNone(cat.agent_content('nope'))
+        self.assertEqual(cat.search('子代理的发现'), [])     # 不混进会话搜索
+
+    def test_queued_images_sent_files_and_tool_screenshots_are_shown(self):
+        img = {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': base64.b64encode(PNG).decode()}}
+        picture = os.path.join(self.tmp.name, 'chart.png')
+        with open(picture, 'wb') as f:
+            f.write(PNG)
+        send = [{'type': 'tool_use', 'id': 'f1', 'name': 'SendUserFile',
+                 'input': {'files': [picture, os.path.join(self.tmp.name, 'gone.pptx')], 'caption': '图表和幻灯片'}}]
+        shot = [{'type': 'tool_use', 'id': 'b1', 'name': 'Read', 'input': {'file_path': 'x.png'}}]
+        self.write('aaaa1111', [
+            user('u1', None, '开始', 1, 'aaaa1111'), asst('a1', 'u1', shot, 2, 'aaaa1111'),
+            user('r1', 'a1', [{'type': 'tool_result', 'tool_use_id': 'b1', 'content': [img]}], 3, 'aaaa1111'),
+            {'type': 'attachment', 'uuid': 'q1', 'parentUuid': 'r1', 'timestamp': ts(4), 'sessionId': 'aaaa1111',
+             'attachment': {'type': 'queued_command', 'commandMode': 'prompt', 'origin': {'kind': 'human'},
+                            'prompt': [{'type': 'text', 'text': '再看这张'}, img]}},
+            asst('a2', 'q1', send, 5, 'aaaa1111'), asst('a3', 'a2', '都发给你了。', 6, 'aaaa1111')])
+        s, c = self.content(self.open(), 'file_aaaa1111')
+        queued = [it for it in c['items'] if it['kind'] == 'user'][1]
+        self.assertEqual(load_image(self.app.index, queued['imgs'][0]), (PNG, 'image/png'))
+        sent = [it for it in c['items'] if it['kind'] == 'sent'][0]
+        self.assertEqual(load_sent_image(self.app.index, sent['files'][0][1]), (PNG, 'image/png'))
+        self.assertIsNone(load_sent_image(self.app.index, sent['files'][1][1]))             # 不是图片，也已不存在
+        tool = [t for it in c['items'] if it['kind'] == 'tools' for t in it['tools']][0]
+        self.assertIsNone(load_sent_image(self.app.index, tool['use'] + '.0'))              # 只认 SendUserFile 记下的路径
+        page = render.session_page(s, c, render.ServerMode())
+        self.assertIn('class="thumbs"><img class="pic" loading="lazy" src="/img/%s"' % tool['imgs'][0], page)
+        self.assertIn('src="/sent/%s"' % sent['files'][0][1], page)
+        self.assertIn('gone.pptx<small>已不在原位置</small>', page)
+        self.assertIn('图表和幻灯片', page)
 
 
 class SearchAndDetailsTest(Case):

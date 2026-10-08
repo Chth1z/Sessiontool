@@ -28,7 +28,9 @@ class Sources:
         self.home = os.path.abspath(home or os.environ.get('SESSIONTOOL_HOME') or os.path.join(user, '.sessiontool'))
 
     def transcripts(self):
-        return sorted(glob.glob(os.path.join(self.root, '*', '*.jsonl')))
+        """会话记录，以及各会话文件夹里子代理的记录。"""
+        return sorted(glob.glob(os.path.join(self.root, '*', '*.jsonl'))
+                      + glob.glob(os.path.join(self.root, '*', '*', 'subagents', '*.jsonl')))
 
     def app_sessions(self):
         """应用的会话清单：{sessionId: 记录}。一个会话在多个目录出现时取最近活动的那份。"""

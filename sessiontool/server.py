@@ -6,10 +6,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, render
-from .details import load_image, load_local_image, load_tool
+from .details import load_image, load_local_image, load_sent_image, load_tool
 from .export import export_html, export_markdown, safe_name
 from .index import Index
-from .sessions import Catalog
+from .sessions import Catalog, Session
 
 CSP = ("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
        "connect-src 'self'; base-uri 'none'; form-action 'none'")
@@ -61,7 +61,7 @@ class App:
         if hit and hit[0] == c['sig']:
             return hit[1]
         parent = (s.parent.page, self.catalog.content(s.parent)['title']) if s.parent else None
-        page = render.session_page(s, c, render.ServerMode(), parent, self.catalog.state(s))
+        page = render.session_page(s, c, render.ServerMode(self.catalog.agents), parent, self.catalog.state(s))
         self.pages[s.id] = (c['sig'], page)
         return page
 
@@ -144,6 +144,20 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith('/img/'):
             got = load_image(app.index, path[5:])
             return self.reply(got[0], got[1], cache='private, max-age=31536000, immutable') if got else self.not_found()
+        if path.startswith('/sent/'):
+            got = load_sent_image(app.index, path[6:])
+            return self.reply(got[0], got[1], cache='private, max-age=3600') if got else self.not_found()
+        if path.startswith('/agent/'):
+            app.catalog.refresh()
+            agent_id = path[7:]
+            c = app.catalog.agent_content(agent_id)
+            if not c:
+                return self.not_found()
+            owner = app.catalog.agent_owner(agent_id)
+            back = ('/s/' + owner.page, '回到会话') if owner else ('/', '全部会话')
+            pseudo = Session(id='agent:' + agent_id, page='', cwd=owner.cwd if owner else '', proj=owner.proj if owner else '子代理',
+                             orphan=True)
+            return self.reply(render.session_page(pseudo, c, render.ServerMode(app.catalog.agents), back=back))
         if path == '/local':
             got = load_local_image(app.sources, arg('p'))
             return self.reply(got[0], got[1], cache='private, max-age=86400') if got else self.not_found()
