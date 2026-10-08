@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sessiontool"
+dynamic = ["version"]
+description = "在本机完整查看 Claude 桌面应用 / Claude Code 的会话记录"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+sessiontool = "sessiontool.__main__:main"
+
+[tool.setuptools]
+packages = ["sessiontool"]
+
+[tool.setuptools.package-data]
+sessiontool = ["static/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "sessiontool.__version__"}

@@ -1,0 +1,92 @@
+:root{--bg:#fbfaf7;--fg:#1f1e1c;--mut:#77736b;--line:#e4e0d6;--user:#f0ece1;--acc:#b4552d;--code:#f1eee6;--hit:#ffe58a;--cur:#ffb347}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1a18;--fg:#e9e6df;--mut:#9a958b;--line:#35322d;--user:#2a2824;--acc:#e08a63;--code:#26241f;--hit:#6b5a17;--cur:#a8641a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+a{color:var(--acc)}
+main{max-width:920px;margin:0 auto;padding:24px 16px 96px;min-width:0;flex:1}
+h1{font-size:22px;margin:0 0 4px}
+.meta{color:var(--mut);font-size:13px;margin-bottom:16px}
+
+/* 会话页布局 */
+.layout{display:flex}
+nav{position:sticky;top:0;align-self:flex-start;width:270px;flex:none;height:100vh;overflow:auto;padding:16px 12px;border-right:1px solid var(--line);font-size:13px}
+nav a{display:block;padding:4px 6px;border-radius:6px;color:var(--fg);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+nav a:hover{background:var(--user)}
+nav .back{color:var(--acc);margin-bottom:8px}
+nav small{color:var(--mut)}
+nav .d{color:var(--mut);font-size:11px;margin:10px 6px 2px}
+@media(max-width:1000px){nav{display:none}}
+
+/* 工具栏 */
+.bar{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap;align-items:center;font-size:13px}
+.session .bar{position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:2;border-bottom:1px solid var(--line)}
+input[type=search],button,select,.btn{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);text-decoration:none}
+input[type=search]{flex:1;min-width:200px;font-size:14px}
+button,.btn{cursor:pointer}
+button:hover,.btn:hover{border-color:var(--mut)}
+label{color:var(--mut);white-space:nowrap}
+
+/* 消息 */
+.msg{margin:18px 0;scroll-margin-top:64px}
+.msg>header{font-size:12px;color:var(--mut);margin-bottom:4px}
+.msg>header b{color:var(--fg);font-size:13px}
+.user .body{background:var(--user);border-radius:12px;padding:10px 14px}
+.body p{margin:.5em 0}
+.body h3,.body h4,.body h5,.body h6{margin:1em 0 .3em;font-size:16px}
+.body h3{font-size:18px}
+pre{background:var(--code);padding:10px 12px;border-radius:8px;overflow:auto;max-height:520px;font:12.5px/1.5 Consolas,"Cascadia Mono",monospace;white-space:pre-wrap;word-break:break-word;margin:6px 0}
+code{background:var(--code);padding:1px 4px;border-radius:4px;font:.9em Consolas,"Cascadia Mono",monospace}
+pre code{padding:0;background:none}
+.tw{overflow:auto}
+table{border-collapse:collapse;margin:.6em 0;font-size:14px}
+th,td{border:1px solid var(--line);padding:4px 10px;text-align:left;vertical-align:top}
+blockquote{margin:.5em 0;padding-left:12px;border-left:3px solid var(--line);color:var(--mut)}
+hr{border:0;border-top:1px solid var(--line)}
+.flink{border-bottom:1px dotted var(--mut)}
+img.pic{max-width:360px;max-height:270px;border:1px solid var(--line);border-radius:6px;margin:6px 6px 0 0;vertical-align:top}
+
+/* 工具调用与折叠块 */
+details{margin:8px 0;font-size:13px;scroll-margin-top:64px}
+summary{cursor:pointer;color:var(--mut)}
+details.tools,details.fold{border-left:2px solid var(--line);padding-left:10px}
+details.tool{margin:4px 0 4px 8px}
+details.branch{border-left-color:var(--acc)}
+.hint{color:var(--mut)}
+.tc{margin:4px 0 10px 14px}
+.k{color:var(--mut);font-size:12px;margin-top:6px}
+.kv{display:flex;gap:10px;margin-top:4px}
+.kv .k{margin:0;flex:none}
+.kv .v{font:12.5px/1.6 Consolas,"Cascadia Mono",monospace;word-break:break-all}
+.err{color:#c0392b}
+.badge{display:inline-block;font-size:11px;line-height:1.6;padding:0 6px;border:1px solid var(--line);border-radius:10px;color:var(--mut);margin-left:6px;vertical-align:middle}
+.badge.err{color:#c0392b;border-color:#c0392b}
+
+/* 分隔线类 */
+.day,.forkline{display:flex;align-items:center;gap:12px;color:var(--mut);font-size:12px;margin:28px 0 8px}
+.day:before,.day:after,.forkline:before,.forkline:after{content:"";flex:1;border-top:1px solid var(--line)}
+.forkline{color:var(--acc)}
+.forkline:before,.forkline:after{border-color:var(--acc)}
+.line{color:var(--mut);font-size:12px;margin:10px 0;text-align:center;scroll-margin-top:64px}
+
+/* 只看对话 */
+body.chat details.tools,body.chat details.think,body.chat details.sys,body.chat .line{display:none}
+
+/* 搜索 */
+mark{background:var(--hit);color:inherit;border-radius:3px}
+mark.cur{background:var(--cur)}
+.flash{box-shadow:-4px 0 0 var(--acc)}
+.find{position:fixed;right:16px;bottom:16px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:6px 8px;display:flex;gap:6px;align-items:center;font-size:13px;box-shadow:0 2px 12px rgba(0,0,0,.18);z-index:3}
+#hits{margin:8px 0 20px}
+.hs{margin:14px 0;border-left:2px solid var(--line);padding-left:12px}
+.hs>a{font-weight:600}
+.hs small{color:var(--mut)}
+.hs ul{list-style:none;margin:4px 0;padding:0}
+.hs li a{display:block;color:var(--fg);text-decoration:none;font-size:13px;padding:3px 6px;border-radius:6px}
+.hs li a:hover{background:var(--user)}
+
+/* 索引表 */
+.idx{width:100%}
+.idx td{border-width:0 0 1px;padding:8px 10px}
+.idx th{border-width:0 0 2px;color:var(--mut);font-weight:500;font-size:12px;white-space:nowrap}
+.idx small{color:var(--mut);display:block}
+.idx td.n{white-space:nowrap;color:var(--mut);font-size:13px}

@@ -1,0 +1,86 @@
+# Sessiontool
+
+在本机完整查看 Claude 桌面应用（Code 标签页）和 Claude Code 的会话记录。
+
+桌面应用对过大的会话只显示最近一段（“Earlier messages aren't shown. This session is too large to load in full.”）。
+记录其实完整地保存在磁盘上，Sessiontool 读取它们，在浏览器里把每个会话从第一条消息开始显示出来。
+
+## 启动
+
+双击 `Sessiontool.bat`，或者在本文件夹运行：
+
+```bash
+python -m sessiontool
+```
+
+它会在本机启动一个网页服务并打开浏览器（默认 <http://127.0.0.1:7707/>）。保持那个窗口开着，关掉窗口即停止。
+需要 Python 3.10 或更高版本，没有第三方依赖。
+
+想在任意位置用 `sessiontool` 命令：
+
+```bash
+pip install -e .
+```
+
+## 功能
+
+- **完整历史**：一个应用会话在磁盘上常常对应多份记录（压缩或重启后会新建文件），本工具按应用自己的会话清单把它们合并去重，一个会话一页。
+- **复刻的会话**：补上只存在于原会话里的更早历史，并标出复刻点。
+- **全文搜索**：搜全部会话的对话内容，可选择同时搜工具调用与输出；点结果直接跳到那条消息并高亮。会话页里也可以单独搜索。
+- **工具调用**：默认只显示一行摘要，展开时才读取完整的输入和输出，包括截图和被应用另存到 `tool-results` 的超长输出。
+- **只看对话**：一键隐藏工具调用、思考过程和系统通知。
+- **改写过的消息**：回退并改写后，旧的那一支折叠成“改写前的旧分支”，和应用一样默认不显示。
+- **回复进行中追加的消息**、中断、上下文压缩、额度恢复后的自动继续，都按实际发生的位置标出来。
+- **导出**：任一会话可导出为单个 HTML（可离线打开）或 Markdown。
+- **随时最新**：刷新页面就会读取新增的记录，只读新增部分。
+
+## 命令行
+
+```bash
+python -m sessiontool                      # 启动网页（同 serve）
+python -m sessiontool serve --port 8000 --no-browser
+python -m sessiontool list                 # 列出全部会话
+python -m sessiontool export 36960785      # 按编号导出为 HTML，输出到 ./export
+python -m sessiontool export "PPT 设计" -f md -o D:\notes
+python -m sessiontool export --all --images  # 全部导出，并内嵌工具截图（文件很大）
+python -m sessiontool reindex              # 删除索引并重建
+```
+
+`--root 路径` 可以指定别的会话记录目录（默认 `~/.claude/projects`）。
+
+## 数据与隐私
+
+- **只读**：不修改、不删除任何会话记录。
+- **不联网**：服务只监听 `127.0.0.1`，拒绝非本机地址的请求，页面不加载任何外部资源。
+- **读取的位置**
+  - 会话记录：`~/.claude/projects/<项目>/<会话>.jsonl`
+  - 应用的会话清单（标题、哪些记录属于同一会话、复刻关系）：`%APPDATA%\Claude\claude-code-sessions`；
+    Windows 商店版在 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions`
+- **写入的位置**：只有索引 `~/.sessiontool/index.db`（可用环境变量 `SESSIONTOOL_HOME` 改位置）。
+  索引只存文字和位置，图片和工具的完整输出留在原记录里按需读取，所以索引远小于记录本身。删掉它不影响任何记录，下次启动会重建。
+- 导出的文件包含对话内容，注意存放位置。
+
+## 已知的限制
+
+- 应用清单里没有的记录（终端里直接运行的 Claude Code、或清单已被删除的会话）各自显示为一个会话，带“不在应用列表中”标记，不会互相合并。
+- 复刻会话里与原会话重复的消息，搜索结果只列在原会话下。
+- 回复进行中追加的消息如果带图片，只显示文字。
+- 子代理（sidechain）的内部对话不显示，只显示它的调用和返回结果。
+- 思考过程只有在记录里保存了文字时才显示；多数情况下应用不保存。
+- 只覆盖 Code 标签页的会话，不包括普通聊天和 Cowork。
+
+## 开发
+
+```bash
+python -m unittest discover -s tests
+```
+
+| 模块 | 作用 |
+|---|---|
+| `sources.py` | 找到会话记录、应用会话清单和索引的位置 |
+| `index.py` | 把 `.jsonl` 增量解析进 SQLite |
+| `sessions.py` | 合并同一会话的多份记录，识别复刻与改写分支，整理成条目；搜索 |
+| `details.py` | 按偏移量从原记录取工具的完整输入输出和图片 |
+| `render.py` | 条目 → HTML / Markdown |
+| `server.py` | 本地网页服务 |
+| `export.py` | 导出单个文件 |

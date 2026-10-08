@@ -7,3 +7,4 @@ __pycache__/
 *.egg-info/
 # 导出的对话内容属于私人数据，不进仓库
 /PPT设计和优化_完整会话记录.md
+.claude/
