@@ -68,7 +68,7 @@ class StandaloneMode:
 def export_html(catalog, s, images=False):
     c = catalog.content(s)
     parent = (s.parent.page, catalog.content(s.parent)['title']) if s.parent else None
-    return render.session_page(s, c, StandaloneMode(catalog.index, catalog.sources, images), parent)
+    return render.session_page(s, c, StandaloneMode(catalog.index, catalog.sources, images), parent, info=catalog.info(s))
 
 
 def export_markdown(catalog, s):

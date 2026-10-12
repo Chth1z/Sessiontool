@@ -3,6 +3,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
@@ -73,6 +74,23 @@ class Case(unittest.TestCase):
     def content(self, cat, sid):
         s = [x for x in cat.sessions if x.id == sid][0]
         return s, cat.content(s)
+
+    def serve(self):
+        """启动一个只在测试里用的服务，返回 get(path) → (状态码, 正文, 响应)。"""
+        httpd = make_server(self.app, 0)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def get(path, host=None):
+            con = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+            con.request('GET', path, headers={'Host': host or '127.0.0.1:%d' % port})
+            r = con.getresponse()
+            body = r.read()
+            con.close()
+            return r.status, body, r
+        return get
 
     @staticmethod
     def texts(items, kind):
@@ -159,6 +177,31 @@ class MergeTest(Case):
         self.assertEqual(self.texts(branch[0]['items'], 'user') + self.texts(branch[0]['items'], 'asst'), ['旧问法', '旧回答'])
         self.assertEqual(c['n_user'], 2)
 
+    def test_rewind_is_detected_through_hook_records_and_a_new_record_file(self):
+        hook = lambda uuid, parent, n: {'type': 'system', 'subtype': 'stop_hook_summary', 'uuid': uuid, 'parentUuid': parent,
+                                        'timestamp': ts(n), 'sessionId': 'aaaa1111'}
+        # 旧的提问挂在一条钩子小结上；改写后应用换了一份记录文件，新的提问直接挂在上一条回复上
+        self.write('aaaa1111', [user('u1', None, '开头', 1, 'aaaa1111'), asst('a1', 'u1', '好的', 2, 'aaaa1111'), hook('h1', 'a1', 3),
+                                user('u2', 'h1', '说得太简略的旧问法', 4, 'aaaa1111'), asst('a2', 'u2', '对旧问法的回答', 5, 'aaaa1111')])
+        self.write('bbbb2222', [user('u1', None, '开头', 1, 'bbbb2222'), asst('a1', 'u1', '好的', 2, 'bbbb2222'),
+                                user('u3', 'a1', '补充了细节的新问法', 6, 'bbbb2222'), asst('a3', 'u3', '对新问法的回答', 7, 'bbbb2222')])
+        self.session('local_s1', 'bbbb2222', prior=['aaaa1111'])
+        s, c = self.content(self.open(), 'local_s1')
+        self.assertEqual(self.texts(c['items'], 'user'), ['开头', '补充了细节的新问法'])
+        branch = [it for it in c['items'] if it['kind'] == 'branch']
+        self.assertEqual(len(branch), 1)
+        self.assertEqual(self.texts(branch[0]['items'], 'asst'), ['对旧问法的回答'])
+
+    def test_interrupt_then_new_message_is_not_a_rewind(self):
+        # 中断后接着发的消息挂在中断标记上，是正常的下一条，不是改写
+        self.write('aaaa1111', [user('u1', None, '开头', 1, 'aaaa1111'), asst('a1', 'u1', '好的', 2, 'aaaa1111'),
+                                user('u2', 'a1', '第一个问题', 3, 'aaaa1111'),
+                                user('s1', 'u2', '[Request interrupted by user]', 4, 'aaaa1111'),
+                                user('u3', 's1', '换一个问题', 5, 'aaaa1111'), asst('a3', 'u3', '回答', 6, 'aaaa1111')])
+        s, c = self.content(self.open(), 'file_aaaa1111')
+        self.assertEqual(self.texts(c['items'], 'user'), ['开头', '第一个问题', '换一个问题'])
+        self.assertEqual(c['n_branch'], 0)
+
     def test_parallel_tool_calls_are_not_mistaken_for_branches(self):
         use = lambda i: [{'type': 'tool_use', 'id': 't%d' % i, 'name': 'Bash', 'input': {'command': 'echo %d' % i}}]
         res = lambda i: [{'type': 'tool_result', 'tool_use_id': 't%d' % i, 'content': 'out %d' % i}]
@@ -243,8 +286,64 @@ class ExtrasTest(Case):
         inner = cat.agent_content('abc123')
         self.assertEqual(self.texts(inner['items'], 'user') + self.texts(inner['items'], 'asst'), ['去查', '子代理的发现'])
         self.assertIs(cat.agent_owner('abc123'), s)
+        status, body, _ = self.serve()('/agent/abc123')
+        self.assertEqual(status, 200)
+        self.assertIn('子代理的发现', body.decode())
+        self.assertIn('回到会话', body.decode())
         self.assertIsNone(cat.agent_content('nope'))
         self.assertEqual(cat.search('子代理的发现'), [])     # 不混进会话搜索
+
+    def test_details_carry_ids_models_and_token_usage(self):
+        def reply(uuid, parent, mid, content, n, out):
+            return asst(uuid, parent, content, n, 'bbbb2222', message={
+                'role': 'assistant', 'id': mid, 'model': 'claude-test-1', 'content': content,
+                'usage': {'input_tokens': 10, 'output_tokens': out, 'cache_read_input_tokens': 1000, 'cache_creation_input_tokens': 5}})
+
+        say = lambda t: [{'type': 'text', 'text': t}]
+        use = [{'type': 'tool_use', 'id': 't1', 'name': 'Edit', 'input': {'file_path': 'C:/work/proj/a.py', 'old_string': 'a', 'new_string': 'b'}}]
+        self.write('aaaa1111', [user('u1', None, '第一条提问，写得比较长一些', 1, 'aaaa1111')])
+        self.write('bbbb2222', [
+            user('u1', None, '第一条提问，写得比较长一些', 1, 'bbbb2222'),
+            # 一次回复拆成两行，各带同一份用量：只能算一次
+            reply('a1', 'u1', 'msg_1', say('先改文件'), 2, 100), reply('a2', 'a1', 'msg_1', use, 2, 100),
+            user('r1', 'a2', [{'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'}], 3, 'bbbb2222'),
+            reply('a3', 'r1', 'msg_2', say('改好了'), 4, 50),
+            user('u2', 'a3', '继续', 5, 'bbbb2222'), reply('a4', 'u2', 'msg_3', say('好'), 6, 7)])
+        self.session('local_s1', 'bbbb2222', prior=['aaaa1111'], model='claude-test-1', effort='high', permissionMode='auto',
+                     completedTurns=2, writtenBranches=['C:/work/proj' + chr(0) + 'feature-x'],
+                     postTurnSummary={'status_category': 'completed', 'status_detail': 'done', 'needs_action': ''})
+        cat = self.open()
+        s, c = self.content(cat, 'local_s1')
+        info = json.loads(json.dumps(cat.info(s)))          # 必须能原样转成 JSON
+        self.assertEqual((info['id'], info['cli'], info['resume']), ('local_s1', 'bbbb2222', 'claude --resume bbbb2222'))
+        self.assertEqual([(f['id'], f['current']) for f in info['files']], [('aaaa1111', False), ('bbbb2222', True)])
+        self.assertEqual(info['tokens'], {'input': 30, 'output': 157, 'cache_read': 3000, 'cache_write': 15})
+        self.assertEqual(info['models'], [['claude-test-1', 3]])
+        counts = info['counts']
+        self.assertEqual((counts['prompts'], counts['tools'], counts['changed'], counts['records']), (2, 1, 1, 2))
+        self.assertEqual((info['effort'], info['turns'], info['branches'], info['status']['status_detail']), ('high', 2, ['feature-x'], 'done'))
+        self.assertEqual(c['last_prompt'], '第一条提问，写得比较长一些')        # “继续”太短，不拿来当“最近在做什么”
+        page = render.session_page(s, c, render.ServerMode(), info=info)
+        self.assertIn('data-copy="local_s1"', page)
+        self.assertIn('<script type="application/json" id="info">', page)
+
+    def test_refresh_only_replaces_blocks_that_changed(self):
+        def keys(page):
+            return re.findall(r'<(?:article class="turn"|div class="day"|div class="forkline"|details class="fold branch") data-k="(\w+)"', page)
+
+        self.write('aaaa1111', [user('u1', None, '第一轮', 1, 'aaaa1111'), asst('a1', 'u1', '答一', 2, 'aaaa1111'),
+                                user('u2', 'a1', '第二轮', 3, 'aaaa1111'), asst('a2', 'u2', '答二（还没说完', 4, 'aaaa1111')])
+        cat = self.open()
+        s, c = self.content(cat, 'file_aaaa1111')
+        before = keys(render.session_page(s, c, render.ServerMode()))
+        self.assertEqual(len(before), 3)                    # 日期分隔 + 两轮
+        self.write('aaaa1111', [asst('a3', 'a2', '说完了）', 5, 'aaaa1111'), user('u3', 'a3', '第三轮', 6, 'aaaa1111')], mode='a')
+        cat.refresh(force=True)
+        s, c = self.content(cat, 'file_aaaa1111')
+        after = keys(render.session_page(s, c, render.ServerMode()))
+        self.assertEqual(after[:2], before[:2])             # 没变的块指纹不变，页面上原样保留
+        self.assertNotEqual(after[2], before[2])            # 第二轮多了内容
+        self.assertEqual(len(after), 4)                     # 新增第三轮
 
     def test_queued_images_sent_files_and_tool_screenshots_are_shown(self):
         img = {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': base64.b64encode(PNG).decode()}}
@@ -372,44 +471,43 @@ class SearchAndDetailsTest(Case):
 
     def test_http_server(self):
         cat = self.build()
-        httpd = make_server(self.app, 0)
-        port = httpd.server_address[1]
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        get = self.serve()
+        s, c = self.content(cat, 'local_a')
+        status, body, _ = get('/')
+        self.assertEqual(status, 200)
+        self.assertIn('local_a', body.decode())
+        status, body, r = get('/s/' + s.page)
+        self.assertEqual(status, 200)
+        self.assertIn('图里是一头蓝鲸', body.decode())
+        self.assertIn("script-src 'self'", r.getheader('Content-Security-Policy'))
+        t1 = [t for it in c['items'] if it['kind'] == 'tools' for t in it['tools']][0]
+        status, body, _ = get('/api/tool?u=%s&r=%s' % (t1['use'], t1['res']))
+        tool = json.loads(body)
+        self.assertEqual(tool['input']['command'], 'grep -r 独角兽 .')
+        self.assertEqual(get(tool['images'][0])[1], PNG)
+        found = json.loads(get('/api/search?q=%E8%93%9D%E9%B2%B8')[1])
+        self.assertEqual(found['total'], 3)
+        self.assertEqual(get('/export/%s.md' % s.page)[0], 200)
+        self.assertEqual(get('/s/nope')[0], 404)
+        self.assertEqual(get('/local?p=' + self.secret.replace(os.sep, '/'))[0], 404)
+        self.assertEqual(get('/', host='evil.example.com')[0], 403)
+        self.assertEqual(json.loads(get('/api/state?page=' + s.page)[1])['sig'], cat.state(s))
+        self.assertEqual(get('/static/theme.js')[0], 200)
+        self.assertEqual(get('/static/../server.py')[0], 404)
+        info = json.loads(get('/api/info?page=' + s.page)[1])
+        self.assertEqual((info['id'], info['cli'], info['children'][0]['title']), ('local_a', 'aaaa1111', 'local_f'))
+        self.assertEqual(get('/api/info?page=nope')[0], 404)
 
-        def get(path, host=None):
-            con = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
-            con.request('GET', path, headers={'Host': host or '127.0.0.1:%d' % port})
-            r = con.getresponse()
-            body = r.read()
-            con.close()
-            return r.status, body, r
-
-        try:
-            s, c = self.content(cat, 'local_a')
-            status, body, _ = get('/')
-            self.assertEqual(status, 200)
-            self.assertIn('local_a', body.decode())
-            status, body, r = get('/s/' + s.page)
-            self.assertEqual(status, 200)
-            self.assertIn('图里是一头蓝鲸', body.decode())
-            self.assertIn("script-src 'self'", r.getheader('Content-Security-Policy'))
-            t1 = [t for it in c['items'] if it['kind'] == 'tools' for t in it['tools']][0]
-            status, body, _ = get('/api/tool?u=%s&r=%s' % (t1['use'], t1['res']))
-            tool = json.loads(body)
-            self.assertEqual(tool['input']['command'], 'grep -r 独角兽 .')
-            self.assertEqual(get(tool['images'][0])[1], PNG)
-            found = json.loads(get('/api/search?q=%E8%93%9D%E9%B2%B8')[1])
-            self.assertEqual(found['total'], 3)
-            self.assertEqual(get('/export/%s.md' % s.page)[0], 200)
-            self.assertEqual(get('/s/nope')[0], 404)
-            self.assertEqual(get('/local?p=' + self.secret.replace('\\', '/'))[0], 404)
-            self.assertEqual(get('/', host='evil.example.com')[0], 403)
-            self.assertEqual(json.loads(get('/api/state?page=' + s.page)[1])['sig'], cat.state(s))
-            self.assertEqual(get('/static/theme.js')[0], 200)
-            self.assertEqual(get('/static/../server.py')[0], 404)
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
+    def test_refresh_button_rereads_the_disk_at_once(self):
+        cat = self.build()
+        get = self.serve()
+        s, _ = self.content(cat, 'local_f')
+        self.assertNotIn('刚刚写进磁盘', get('/s/' + s.page)[1].decode())
+        self.write('ffff0002', [user('f9', 'f1', '刚刚写进磁盘', 30, 'ffff0002')], mode='a')
+        # 普通打开两秒内不重复同步；带 fresh=1（刷新按钮）则立刻重读
+        self.assertNotIn('刚刚写进磁盘', get('/s/' + s.page)[1].decode())
+        self.assertIn('刚刚写进磁盘', get('/s/' + s.page + '?fresh=1')[1].decode())
+        self.assertIn('刚刚写进磁盘', get('/?fresh=1')[1].decode())
 
 
 class MarkdownTest(unittest.TestCase):

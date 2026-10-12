@@ -20,7 +20,7 @@ def progress(i, n, path, size):
 
 
 def open_app(args):
-    app = App(Sources(root=args.root))
+    app = App(Sources(root=args.root, home=args.home))
     if not os.path.isdir(app.sources.root):
         sys.exit('找不到会话记录目录：%s' % app.sources.root)
     if not app.index.files():
@@ -93,7 +93,7 @@ def cmd_export(args):
 
 
 def cmd_reindex(args):
-    sources = Sources(root=args.root)
+    sources = Sources(root=args.root, home=args.home)
     for name in ('index.db', 'index.db-wal', 'index.db-shm'):
         path = os.path.join(sources.home, name)
         if os.path.exists(path):
@@ -109,6 +109,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='sessiontool', description='在本机完整查看 Claude 桌面应用 / Claude Code 的会话记录')
     ap.add_argument('--version', action='version', version=__version__)
     ap.add_argument('--root', help='会话记录目录（默认 ~/.claude/projects）')
+    ap.add_argument('--home', help='索引存放的文件夹（默认 ~/.sessiontool）')
     sub = ap.add_subparsers(dest='cmd')
     p = sub.add_parser('serve', help='启动本地网页并打开浏览器（默认）')
     p.add_argument('--port', type=int, default=DEFAULT_PORT)

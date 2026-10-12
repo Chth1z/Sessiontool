@@ -56,13 +56,17 @@ class App:
         return out
 
     def session_html(self, s):
-        c = self.catalog.content(s)
+        cat = self.catalog
+        c = cat.content(s)
+        # 页面里还有标题、复刻关系这些来自应用清单的信息，所以缓存要连它们一起比
+        info = cat.info(s)
+        key = (cat.state(s), json.dumps(info, sort_keys=True, ensure_ascii=False))
         hit = self.pages.get(s.id)
-        if hit and hit[0] == c['sig']:
+        if hit and hit[0] == key:
             return hit[1]
-        parent = (s.parent.page, self.catalog.content(s.parent)['title']) if s.parent else None
-        page = render.session_page(s, c, render.ServerMode(self.catalog.agents), parent, self.catalog.state(s))
-        self.pages[s.id] = (c['sig'], page)
+        parent = (s.parent.page, cat.content(s.parent)['title']) if s.parent else None
+        page = render.session_page(s, c, render.ServerMode(cat.agents), parent, cat.state(s), info=info)
+        self.pages[s.id] = (key, page)
         return page
 
 
@@ -72,6 +76,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def finish(self):
+        # 每个连接一个线程，线程各有自己的数据库连接；连接结束时顺手关掉，不等垃圾回收
+        try:
+            super().finish()
+        finally:
+            app = getattr(self.server, 'app', None)
+            if app:
+                app.index.close()
 
     def reply(self, body, ctype='text/html; charset=utf-8', status=200, cache='no-store', extra=None):
         if isinstance(body, str):
@@ -111,13 +124,17 @@ class Handler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         path, qs = unquote(url.path), parse_qs(url.query)
         arg = lambda k: (qs.get(k) or [''])[0]
+        fresh = arg('fresh') == '1'         # 刷新按钮：跳过两秒内不重复同步的节流，立刻重读磁盘
         if path == '/':
-            app.catalog.refresh()
+            app.catalog.refresh(force=fresh)
             return self.reply(render.index_page(app.entries(), app.catalog.state()))
         if path.startswith('/s/'):
-            app.catalog.refresh()
+            app.catalog.refresh(force=fresh)
             s = app.catalog.by_page.get(path[3:])
             return self.reply(app.session_html(s)) if s else self.not_found()
+        if path == '/api/info':
+            s = app.catalog.by_page.get(arg('page'))
+            return self.reply_json(app.catalog.info(s)) if s else self.not_found()
         if path.startswith('/static/'):
             name = path[8:]
             if name in STATIC_TYPES:

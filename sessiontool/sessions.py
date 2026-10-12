@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+import zlib
 
 from .index import is_agent_file
 
@@ -52,7 +53,8 @@ def is_prompt(r):
 def find_abandoned(recs, links):
     """回退并改写消息后，旧的那一支仍留在记录里。返回 {uuid: 该分支起点的 uuid}。
 
-    判据：同一个父节点下有两条以上你亲手发的消息，最晚的一条是现行的，其余各自带着的后续都是旧分支。
+    判据：接在同一条对话消息后面的、你亲手发的消息有两条以上，最晚的一条是现行的，其余各自带着的后续都是旧分支。
+    “接在后面”要跳过中间只起连接作用的记录：旧的那条常常挂在一条钩子小结上，新的那条直接挂在上一条回复上。
     并行工具调用也会产生分叉，但分叉的不是用户消息，不会被误判。
     """
     by = {r['uuid']: r for r in recs if r['uuid']}
@@ -60,22 +62,37 @@ def find_abandoned(recs, links):
     for u, p in links.items():
         if p:
             children[p].append(u)
+
+    def anchor(u):
+        p, hops = links.get(u), 0
+        while p and p not in by and hops < 50:
+            p, hops = links.get(p), hops + 1
+        return p
+
+    groups = collections.defaultdict(list)
+    for r in recs:
+        if r['uuid'] and is_prompt(r):
+            a = anchor(r['uuid'])
+            if a:
+                groups[a].append(r)
     dead = {}
-    for kids in children.values():
-        prompts = [by[k] for k in kids if k in by and is_prompt(by[k])]
+    for prompts in groups.values():
         if len(prompts) < 2:
             continue
         prompts.sort(key=lambda r: r['ts'] or '')
         keep = prompt_text(prompts[-1])
         for r in prompts[:-1]:
-            if prompt_text(r) == keep:
-                continue                    # 原样重发，交给 assemble 里的去重
-            stack = [r['uuid']]
+            tree, stack = [], [r['uuid']]
             while stack:
                 u = stack.pop()
-                if u not in dead:
-                    dead[u] = r['uuid']
+                if u not in tree:
+                    tree.append(u)
                     stack.extend(children.get(u, ()))
+            # 原样重发、而且前一次什么都没来得及做：不算分支，交给 assemble 里的去重悄悄合并
+            if prompt_text(r) == keep and not any(u in by and by[u]['kind'] == 'assistant' for u in tree):
+                continue
+            for u in tree:
+                dead.setdefault(u, r['uuid'])
     return dead
 
 
@@ -176,16 +193,44 @@ def stats(items):
     prompts = [it for it in items if it['kind'] == 'user']
     stamps = [it['ts'] for it in items if it.get('ts')]
     changed = collections.OrderedDict()         # 路径 → [次数, 第一次修改的锚点]
+    names = collections.Counter()
+    shots = 0
     for it in items:
         for t in it['tools'] if it['kind'] == 'tools' else ():
+            names[t['name']] += 1
+            shots += t['nimg']
             if t['name'] in EDIT_TOOLS and t['hint']:
                 changed.setdefault(t['hint'], [0, t['u']])[0] += 1
+    sent = [it for it in items if it['kind'] == 'sent']
+    if sent:
+        names['SendUserFile'] += len(sent)
+    line = lambda it: it['text'][:160].replace('\n', ' ')
+    # 列表里显示“最近在做什么”：取最后一条有内容的提问，跳过“继续”“Try again”这类
+    recent = next((it for it in reversed(prompts) if len(it['text'].strip()) >= 12), prompts[-1] if prompts else None)
     return {'n_user': len(prompts), 'n_asst': sum(1 for it in items if it['kind'] == 'asst'),
             'changed': [(path, n, u) for path, (n, u) in changed.items()],
-            'n_tools': sum(len(it['tools']) for it in items if it['kind'] == 'tools'),
+            'n_tools': sum(names.values()), 'tool_counts': names.most_common(),
+            'n_shots': shots, 'n_images': sum(len(it['imgs']) for it in prompts),
+            'n_sent': sum(len(it['files']) for it in sent),
+            'n_compact': sum(1 for it in items if it['kind'] == 'compact'),
             'n_branch': sum(1 for it in items if it['kind'] == 'branch'),
             'first': min(stamps) if stamps else '', 'last': max(stamps) if stamps else '',
-            'first_prompt': prompts[0]['text'][:120].replace('\n', ' ') if prompts else ''}
+            'first_prompt': line(prompts[0]) if prompts else '', 'last_prompt': line(recent) if recent else ''}
+
+
+def usage(recs):
+    """模型与 token 用量。一次回复在记录里拆成多行、各带同一份用量，按消息编号去重后再加总。"""
+    seen, models = {}, collections.Counter()
+    for r in recs:
+        d = r['d']
+        mid = d.get('mid') if r['kind'] == 'assistant' else None
+        if mid and mid not in seen:
+            seen[mid] = d.get('usage') or [0, 0, 0, 0]
+            if d.get('model'):
+                models[d['model']] += 1
+    total = [sum(u[i] for u in seen.values()) for i in range(4)]
+    return {'models': models.most_common(), 'n_replies': len(seen),
+            'tokens': dict(zip(('input', 'output', 'cache_read', 'cache_write'), total))}
 
 
 class Session:
@@ -243,11 +288,17 @@ class Catalog:
             cwd = r.get('cwd') or own[-1]['cwd'] or ''
             # 没选文件夹就开始的会话，应用给它建了个临时目录，名字没有意义
             proj = '无文件夹' if 'scratch-workspaces' in cwd else (os.path.basename(cwd.rstrip('\\/')) or cwd or '（未知）')
+            status = r.get('postTurnSummary') if isinstance(r.get('postTurnSummary'), dict) else {}
+            branches = [b.split('\x00')[-1] for b in r.get('writtenBranches') or [] if isinstance(b, str)]
             sessions[sid] = Session(
                 id=sid, page=short[:n], record_title=r.get('title'), file_title=own[-1]['title'], cwd=cwd,
                 proj=proj, archived=bool(r.get('isArchived')),
                 created=r.get('createdAt') or 0, parent_id=r.get('forkedFromSessionId'), cli_ids=ids, files=own,
-                orphan=bool(r.get('_orphan')), parent=None, size=sum(f['size'] for f in own))
+                orphan=bool(r.get('_orphan')), parent=None, size=sum(f['size'] for f in own),
+                # 以下只用于“详情”：应用自己记下的设置和最近状态
+                model=r.get('model') or '', effort=r.get('effort') or '', permission=r.get('permissionMode') or '',
+                turns=r.get('completedTurns'), branches=branches,
+                status={k: str(status.get(k) or '') for k in ('status_category', 'status_detail', 'needs_action')})
         for s in sessions.values():
             p = sessions.get(s.parent_id)
             s.parent = p if p is not s else None
@@ -306,16 +357,38 @@ class Catalog:
         with self.lock:
             sig = self.signature(s)
             c = self._content.get(s.id)
-            if c and c['sig'] == sig:
-                return c
-            recs, links = self.merged(s)
-            items = assemble(recs, links, set(s.cli_ids), bool(s.parent))
-            c = {'sig': sig, 'items': items}
-            c.update(stats(items))
+            if not c or c['sig'] != sig:
+                recs, links = self.merged(s)
+                items = assemble(recs, links, set(s.cli_ids), bool(s.parent))
+                c = {'sig': sig, 'items': items, 'nfiles': len(self.lineage(s))}
+                c.update(stats(items))
+                c.update(usage(recs))
+                self._content[s.id] = c
+            # 标题可以在应用里随时改，不跟着记录文件变，所以每次现取
             c['title'] = (s.record_title or s.file_title or c['first_prompt'][:40] or '（无标题）').replace('\n', ' ')
-            c['nfiles'] = len(self.lineage(s))
-            self._content[s.id] = c
             return c
+
+    def info(self, s):
+        """详情面板用的全部信息，可直接转成 JSON。"""
+        c = self.content(s)
+        current = s.cli_ids[-1]
+        link = lambda x: {'page': x.page, 'title': self.content(x)['title']}
+        return {
+            'page': s.page, 'title': c['title'], 'id': None if s.orphan else s.id, 'cli': current,
+            'orphan': s.orphan, 'archived': s.archived, 'cwd': s.cwd, 'proj': s.proj,
+            'files': [{'id': f['cli'], 'path': f['path'], 'size': f['size'], 'current': f['cli'] == current} for f in s.files],
+            'created': s.created or None, 'first': c['first'], 'last': c['last'],
+            'model': s.model, 'effort': s.effort, 'permission': s.permission, 'models': c['models'],
+            'turns': s.turns, 'branches': s.branches, 'status': s.status if any(s.status.values()) else None,
+            'counts': {'prompts': c['n_user'], 'replies': c['n_asst'], 'tools': c['n_tools'], 'shots': c['n_shots'],
+                       'images': c['n_images'], 'sent': c['n_sent'], 'changed': len(c['changed']),
+                       'compact': c['n_compact'], 'branch': c['n_branch'], 'records': c['nfiles']},
+            'tools': c['tool_counts'][:10], 'tokens': c['tokens'], 'size': s.size,
+            'first_prompt': c['first_prompt'], 'last_prompt': c['last_prompt'],
+            'parent': link(s.parent) if s.parent else None,
+            'children': [link(x) for x in self.sessions if x.parent is s],
+            'link': None if s.orphan else 'claude://claude.ai/epitaxy/' + s.id,
+            'resume': 'claude --resume ' + current}
 
     def agent_content(self, agent_id):
         """一个子代理自己的对话，整理成和会话一样的条目。没有这份记录时返回 None。"""
@@ -354,8 +427,12 @@ class Catalog:
 
     def state(self, s=None):
         """内容指纹：变了就说明磁盘上有新记录。页面用它提示刷新。"""
-        sig = self.signature(s) if s else tuple((f['id'], f['off']) for x in self.sessions for f in x.files)
-        return '%08x' % (hash(sig) & 0xffffffff)
+        meta = lambda x: (x.record_title, x.archived, x.status['status_detail'])       # 应用里改了标题、归档了，也算有变化
+        if s:
+            sig = (self.signature(s), meta(s))
+        else:
+            sig = tuple((x.id, meta(x), tuple((f['id'], f['off']) for f in x.files)) for x in self.sessions)
+        return '%08x' % (zlib.crc32(repr(sig).encode('utf-8')) & 0xffffffff)
 
     def search(self, query, tools=False, per_session=8):
         """全文搜索 → [{session, n, hits}]，按会话最后活动时间倒序。

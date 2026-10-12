@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 
-SCHEMA = 6
+SCHEMA = 7
 LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
 
 DDL = """
@@ -137,6 +137,13 @@ def parse_record(d, sidechain=False):
             data['compact'] = 1
         if msg.get('model') == '<synthetic>' or d.get('isApiErrorMessage'):
             data['synthetic'] = 1
+        elif t == 'assistant' and msg.get('id'):
+            # 一次回复按内容块拆成多行，每行都带同一份用量；统计时按消息编号只算一次
+            u = msg.get('usage') or {}
+            data['mid'] = msg['id']
+            data['model'] = msg.get('model') or ''
+            data['usage'] = [int(u.get(k) or 0) for k in ('input_tokens', 'output_tokens', 'cache_read_input_tokens',
+                                                           'cache_creation_input_tokens')]
         origin = (d.get('origin') or {}).get('kind')
         if origin:
             data['origin'] = origin

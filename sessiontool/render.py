@@ -4,6 +4,7 @@
 """
 import collections
 import html
+import json
 import os
 import re
 import zlib
@@ -64,12 +65,15 @@ def md(text):
         st = ln.strip()
         if st.startswith('```'):
             flush()
+            lang = re.sub(r'[^\w+#.-]', '', st[3:].strip().split(' ')[0])[:20]
             buf = []
             i += 1
             while i < len(lines) and not lines[i].strip().startswith('```'):
                 buf.append(lines[i])
                 i += 1
-            out.append('<pre><code>' + html.escape('\n'.join(buf)) + '</code></pre>')
+            # 外面包一层，页面脚本在这层上放“复制”按钮；data-lang 用来显示语言
+            out.append('<div class="code"%s><pre><code>%s</code></pre></div>'
+                       % (' data-lang="%s"' % lang if lang else '', html.escape('\n'.join(buf))))
             i += 1
             continue
         if not st:
@@ -233,10 +237,48 @@ def head(title, standalone):
 def scripts(standalone):
     return '<script>' + static_text('app.js') + '</script>' if standalone else '<script src="/static/app.js"></script>'
 
+# ---------- 图标 ----------
 
-THEME_BUTTON = '<button type="button" id="theme" title="切换浅色 / 深色 / 跟随系统"></button>'
+# 24×24 的线条图标，放进页面里的一张雪碧图；服务端和页面脚本都用 <use href="#i-名字"> 引用
+ICONS = {
+    'refresh': '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+    'info': '<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.6v.4"/>',
+    'copy': '<rect x="8.5" y="8.5" width="12" height="12" rx="2"/><path d="M15.5 8.5v-3a2 2 0 0 0-2-2h-8a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/>',
+    'check': '<path d="M5 12.5l4.5 4.5L19 7"/>',
+    'sun': '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4l1.4-1.4M18 6l1.4-1.4"/>',
+    'moon': '<path d="M20 14.2A8 8 0 0 1 9.8 4a7.5 7.5 0 1 0 10.2 10.2z"/>',
+    'auto': '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/>',
+    'more': '<path d="M5 12h.01M12 12h.01M19 12h.01" stroke-width="2.8"/>',
+    'open': '<path d="M14 4h6v6"/><path d="M20 4l-8.5 8.5"/><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"/>',
+    'x': '<path d="M6 6l12 12M18 6L6 18"/>',
+    'up': '<path d="M12 19V5M6 11l6-6 6 6"/>',
+    'down': '<path d="M12 5v14M6 13l6 6 6-6"/>',
+    'left': '<path d="M15 5l-7 7 7 7"/>',
+    'right': '<path d="M9 5l7 7-7 7"/>',
+    'search': '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+    'keys': '<rect x="3" y="6" width="18" height="12" rx="2.5"/><path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8" stroke-width="2.2"/>',
+}
+SPRITE = ('<svg xmlns="http://www.w3.org/2000/svg" style="display:none">'
+          + ''.join('<symbol id="i-%s" viewBox="0 0 24 24">%s</symbol>' % kv for kv in ICONS.items()) + '</svg>')
+
+
+def icon(name):
+    return '<svg class="ic" aria-hidden="true"><use href="#i-%s"/></svg>' % name
+
+
+def ibutton(name, title, attrs=''):
+    """只有图标的按钮；文字说明放在 title 和 aria-label 里。"""
+    return '<button type="button" class="ib" title="%s" aria-label="%s"%s>%s</button>' % (title, title, attrs, icon(name))
+
+
+THEME_BUTTON = '<button type="button" class="ib" id="theme" title="切换浅色 / 深色 / 跟随系统" aria-label="切换主题"></button>'
 IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
 MINOR = ('stop', 'auto', 'notice', 'note', 'compact', 'cmd', 'summary', 'think')
+
+
+def keyed(block):
+    """给顶层的块打上内容指纹。页面刷新时只替换指纹变了的块，其余块的展开状态和已加载的内容都不动。"""
+    return block.replace('>', ' data-k="%08x">' % (zlib.crc32(block.encode('utf-8')) & 0xffffffff), 1)
 
 
 def duration(a, b):
@@ -362,7 +404,7 @@ class Renderer:
 
     def user(self, it, main):
         anchor = self.anchor('m-', it['u'])
-        num = '<a class="num" href="#m-%s">#%d</a>' % (it['u'], it['n']) if it.get('n') else ''
+        num = '<a class="num" href="#m-%s" title="这条提问的链接">#%d</a>' % (it['u'], it['n']) if it.get('n') else ''
         tag = '<span class="badge">回复进行中追加</span>' if it.get('queued') else ''
         if main and it.get('n') and anchor:
             self.toc.append('<a href="#m-%s" title="%s"><b>%d</b><span>%s</span></a>' % (
@@ -469,40 +511,41 @@ class Renderer:
             parts.append('用时 ' + took)
         if not t['finals']:
             parts.append('这一轮没有最终答复')
-        return ('<details class="steps" open><summary><b>过程</b><span>%s</span></summary><div class="rail">%s</div></details>'
-                % (' · '.join(parts), ''.join(self.flow(t['steps'], main))))
+        # 过程长的时候，读到底部也给一个折起的入口，不用滚回去找开头那一行
+        fold = '<button type="button" class="fold-up" data-act="fold">收起这段过程</button>' if len(t['steps']) >= 5 else ''
+        return ('<details class="steps" open><summary title="点击折起或展开这一轮的中间过程"><b>过程</b><span>%s</span></summary>'
+                '<div class="rail">%s%s</div></details>' % (' · '.join(parts), ''.join(self.flow(t['steps'], main)), fold))
 
     def conversation(self, items, main=True):
+        """→ 顶层块的列表：日期分隔、一轮对话、复刻点、旧分支。主对话里的块带内容指纹。"""
         out = []
+
+        def emit(block):
+            if block:
+                out.append(keyed(block) if main else block)
+
         for t in split_turns(items):
             mark = t.get('mark')
             if mark and mark['kind'] == 'fork':
-                out.append('<div class="forkline"><span>以上来自原会话 · 从这里开始是复刻后的内容</span></div>')
+                emit('<div class="forkline"><span>以上来自原会话 · 从这里开始是复刻后的内容</span></div>')
                 self.toc.append('<div class="d fk">复刻点</div>')
             elif mark:
                 n = sum(1 for x in mark['items'] if x['kind'] in ('user', 'asst'))
-                out.append('<details class="fold branch"><summary>改写前的旧分支（%d 条消息，应用里已不显示）· %s</summary>%s</details>'
-                           % (n, fmt(mark['ts'], '%H:%M'), ''.join(self.conversation(mark['items'], main=False))))
+                emit('<details class="fold branch"><summary>改写前的旧分支（%d 条消息，应用里已不显示）· %s</summary>%s</details>'
+                     % (n, fmt(mark['ts'], '%H:%M'), ''.join(self.conversation(mark['items'], main=False))))
             else:
-                first = t['prompt'] or (t['steps'] + t['finals'] + t['tail'])[0]
-                out.append(self.daymark(first, main))
-                out.append('<article class="turn">')
-                if t['prompt']:
-                    out.append(self.user(t['prompt'], main))
-                if t['plain']:
-                    out += self.flow(t['steps'], main)
-                else:
-                    out.append(self.steps(t, main))
+                emit(self.daymark(t['prompt'] or (t['steps'] + t['finals'] + t['tail'])[0], main))
+                parts = [self.user(t['prompt'], main)] if t['prompt'] else []
+                parts += self.flow(t['steps'], main) if t['plain'] else [self.steps(t, main)]
                 for f in t['finals']:
-                    out.append(self.daymark(f, main))
-                    out.append(self.final(f))
-                out += self.flow(t['tail'], main)
-                out.append('</article>')
+                    parts += [self.daymark(f, main), self.final(f)]
+                parts += self.flow(t['tail'], main)
+                emit('<article class="turn">%s</article>' % ''.join(parts))
         return out
 
 
 def changed_files(c, cwd):
-    if not c['changed']:
+    if not c.get('changed'):
         return ''
     rows = []
     for path, n, u in c['changed']:
@@ -515,55 +558,82 @@ def changed_files(c, cwd):
     return '<details class="files"><summary>修改过 %d 个文件</summary><ul>%s</ul></details>' % (len(c['changed']), ''.join(rows))
 
 
-VIEW = ('<div class="seg" id="view" title="完整：全部内容；对话：隐藏工具调用；结果：折起中间过程，只留每轮的最终答复">'
+VIEW = ('<div class="seg" id="view" title="完整：全部内容；对话：隐藏工具调用；结果：折起中间过程，只留每轮的最终答复（按 1 / 2 / 3 切换）">'
         '<button type="button" data-v="full">完整</button><button type="button" data-v="chat">对话</button>'
         '<button type="button" data-v="result">结果</button></div>')
 
 
-def session_page(s, c, mode, parent=None, state='', back=None):
+def embed(name, data):
+    """把数据放进页面，供页面脚本读取（导出的独立文件也靠它，不需要服务）。"""
+    return '<script type="application/json" id="%s">%s</script>' % (name, json.dumps(data, ensure_ascii=False).replace('</', '<\\/'))
+
+
+def session_page(s, c, mode, parent=None, state='', back=None, info=None):
     """parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此发现新记录。
-    back: (地址, 文字)，子代理页用它回到调用它的会话。"""
+    back: (地址, 文字)，子代理页用它回到调用它的会话。info: 详情面板的数据。"""
     r = Renderer(mode, s.cwd)
     body = r.conversation(c['items'])
-    facts = ['<span class="proj" title="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span>' % (esc(s.cwd), hue(s.proj), esc(s.proj)),
-             '<span>%s → %s</span>' % (fmt(c['first'], '%m-%d %H:%M'), fmt(c['last'], '%m-%d %H:%M')),
-             '<span>%d 问</span><span>%d 答</span><span>%d 次工具调用</span>' % (c['n_user'], c['n_asst'], c['n_tools'])]
-    if parent:
-        facts.append('<span>复刻自 %s</span>' % (esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1]))))
+    live = not mode.standalone and not back         # 有本地服务可问、并且是一个真正的会话
+    ident = (info or {}).get('id') or (info or {}).get('cli')
+    facts = []
+    if ident:
+        facts.append('<button type="button" class="idchip" data-copy="%s" data-copied="会话 ID" title="点击复制完整的会话 ID：%s">'
+                     '<span>ID</span><code>%s</code>%s</button>' % (esc(ident), esc(ident), esc(s.page or ident[:8]), icon('copy')))
+    facts.append('<span>%s → %s</span>' % (fmt(c['first'], '%m-%d %H:%M'), fmt(c['last'], '%m-%d %H:%M')))
+    facts.append('<span>%d 问</span><span>%d 答</span><span>%d 次工具调用</span>' % (c['n_user'], c['n_asst'], c['n_tools']))
     if c['nfiles'] > 1:
         facts.append('<span>由 %d 份记录合并</span>' % c['nfiles'])
-    if c['n_branch']:
+    if c.get('n_branch'):
         facts.append('<span>%d 处改写</span>' % c['n_branch'])
+    if info:
+        facts.append('<button type="button" class="linkish" data-act="info">详情</button>')
+    crumbs = '<span class="proj" title="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span>' % (esc(s.cwd), hue(s.proj), esc(s.proj))
+    if parent:
+        crumbs += '<span class="badge">复刻自 %s</span>' % (
+            esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1])))
+    if getattr(s, 'archived', False):
+        crumbs += '<span class="badge">已归档</span>'
+
     more = '<button type="button" data-act="tools">展开全部工具调用</button>'
-    if mode.standalone or back:
-        attrs, search, app = '', '', ''
-    else:
-        attrs = ' data-state="/api/state?page=%s" data-sig="%s"' % (s.page, state)
-        app = '' if s.orphan else '<a class="btn" href="claude://claude.ai/epitaxy/%s" title="在 Claude 桌面应用里打开这个会话">在应用中打开</a>' % esc(s.id)
-        more += ('<a href="/export/%s.html">导出 HTML<small>单个文件，可离线打开</small></a>'
+    tools = ''
+    if info:
+        tools += ibutton('info', '会话详情（I）', ' data-act="info"')
+    if live:
+        tools = ibutton('refresh', '刷新，读取最新记录（R）', ' data-act="refresh"') + tools
+        if not s.orphan:
+            tools += ('<a class="ib" href="claude://claude.ai/epitaxy/%s" title="在 Claude 应用中打开这个会话" aria-label="在 Claude 应用中打开">%s</a>'
+                      % (esc(s.id), icon('open')))
+        more += ('<button type="button" data-act="auto" role="menuitemcheckbox">有新记录时自动刷新</button>'
+                 '<a href="/export/%s.html">导出 HTML<small>单个文件，可离线打开</small></a>'
                  '<a href="/export/%s.html?images=1">导出 HTML（含截图）<small>文件可能很大</small></a>'
                  '<a href="/export/%s.md">导出 Markdown<small>只有对话文字</small></a>' % (s.page, s.page, s.page))
+    more += '<button type="button" data-act="keys">键盘快捷键<small>按 ? 也可以打开</small></button>'
+    search = ''
     if not mode.standalone:
-        search = '<input id="fq" type="search" placeholder="搜索本会话…" title="空格分隔多个词；按 / 聚焦，Enter 下一处">'
-    bar = ('<div class="bar">' + search + VIEW + '<span class="sp"></span>' + app
-           + '<details class="menu"><summary class="btn">更多</summary><div>' + more + '</div></details>' + THEME_BUTTON + '</div>')
+        search = ('<label class="find-in">%s<input id="fq" type="search" placeholder="搜索本会话…" '
+                  'title="空格分隔多个词；按 / 聚焦，Enter 下一处，Shift+Enter 上一处"></label>' % icon('search'))
+    bar = ('<div class="bar">' + search + VIEW + '<span class="sp"></span>' + tools
+           + '<details class="menu"><summary class="ib" title="更多" aria-label="更多">' + icon('more') + '</summary><div>' + more
+           + '</div></details>' + THEME_BUTTON + '</div>')
     if back:
-        home = '<a class="back" href="%s">← %s</a>' % (back[0], esc(back[1]))
+        home = '<a class="back" href="%s">%s%s</a>' % (back[0], icon('left'), esc(back[1]))
     else:
-        home = '' if mode.standalone else '<a class="back" href="/">← 全部会话</a>'
-    nav = (home + '<div class="jump"><button type="button" data-act="top">↑ 开头</button>'
-           '<button type="button" data-act="end">↓ 最新</button></div>'
-           '<div class="navhead">提问目录 · J / K 切换</div>' + ''.join(r.toc))
+        home = '' if mode.standalone else '<a class="back" href="/">%s全部会话</a>' % icon('left')
+    nav = (home + '<div class="jump"><button type="button" data-act="top">%s开头</button>'
+           '<button type="button" data-act="end">%s最新</button></div>'
+           '<div class="navhead">提问目录</div><div class="toc">' % (icon('up'), icon('down')) + ''.join(r.toc) + '</div>')
+    attrs = ' data-page="%s" data-state="/api/state?page=%s" data-sig="%s"' % (s.page, s.page, state) if live else ''
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号
-    return ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '><div class="layout"><nav>', nav,
-                    '</nav><main>', bar, '<header class="head"><h1>', esc(c['title']), '</h1><div class="facts">',
-                    ''.join(facts), '</div>', changed_files(c, s.cwd), '</header>', '\n'.join(body),
-                    '</main></div>', scripts(mode.standalone), '</body></html>'])
+    return ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '>', SPRITE,
+                    '<div class="progress"></div><div class="layout"><nav>', nav, '</nav><main>', bar,
+                    '<header class="head"><div class="crumbs">', crumbs, '</div><h1>', esc(c['title']), '</h1><div class="facts">',
+                    ''.join(facts), '</div>', changed_files(c, s.cwd), '</header><div id="flow">', '\n'.join(body),
+                    '</div></main></div>', embed('info', info) if info else '', scripts(mode.standalone), '</body></html>'])
 
 # ---------- 索引页 ----------
 
 
-def index_row(s, c, depth, now):
+def index_row(s, c, depth, now, i):
     tags = ''
     if s.parent:
         tags += '<span class="badge">复刻</span>'
@@ -571,28 +641,39 @@ def index_row(s, c, depth, now):
         tags += '<span class="badge">已归档</span>'
     if s.orphan:
         tags += '<span class="badge">不在应用列表中</span>'
-    return ('<a class="row%s" href="/s/%s" data-page="%s" data-p="%s" data-t="%s" data-a="%s" style="--d:%d">'
+    first, recent = preview(c['first_prompt']), preview(c['last_prompt'])
+    if c['n_user'] > 1 and recent and recent != first:      # 聊了不止一轮：显示最近在做什么，比重复开头有用
+        sub = '<span class="lbl">最近</span>' + esc(recent)
+    else:
+        sub = esc(first) or '（没有文字提问）'
+    ident = s.cli_ids[-1] if s.orphan else s.id
+    acts = ('<button type="button" class="ib sm" data-copy="%s" data-copied="会话 ID" title="复制会话 ID" aria-label="复制会话 ID">%s</button>'
+            '<button type="button" class="ib sm" data-act="info" title="详情" aria-label="详情">%s</button>'
+            % (esc(ident), icon('copy'), icon('info')))
+    return ('<div class="row%s" data-page="%s" data-p="%s" data-t="%s" data-a="%s" style="--d:%d;--i:%d;--c:hsl(%d 55%% 55%%)">'
+            '<a class="cover" href="/s/%s" aria-label="%s"></a>'
             '<div class="r1"><span class="title">%s</span>%s<time title="%s">%s</time></div>'
             '<div class="r2">%s</div>'
-            '<div class="r3"><span class="proj"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span><span>%d 问</span><span>%d 答</span><span>%s</span></div></a>'
-            % (' child' if depth else '', s.page, s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', min(depth, 3),
-               esc(c['title']), tags, fmt(c['last']), when(c['last'], now),
-               esc(preview(c['first_prompt'])) or '（没有文字提问）',
-               hue(s.proj), esc(s.proj), c['n_user'], c['n_asst'], size(s.size)))
+            '<div class="r3"><span class="proj"><i></i>%s</span><span>%d 问</span><span>%d 答</span><span>%s</span>'
+            '<span class="acts">%s</span></div></div>'
+            % (' child' if depth else '', s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', min(depth, 3),
+               min(i, 16), hue(s.proj), s.page, esc(c['title']),
+               esc(c['title']), tags, fmt(c['last']), when(c['last'], now), sub,
+               esc(s.proj), c['n_user'], c['n_asst'], size(s.size), acts))
 
 
 def index_page(entries, state=''):
     """entries: [(session, content, 层级, 所在家族的最后活动时间)]，复刻的会话紧跟在原会话后面。"""
     now = datetime.now().astimezone()
     out, last_bucket = [], None
-    for s, c, depth, family_last in entries:
+    for i, (s, c, depth, family_last) in enumerate(entries):
         b = bucket(family_last, now)
         if b != last_bucket:
             if last_bucket is not None:
                 out.append('</section>')
             out.append('<section class="bucket"><h2>%s</h2>' % b)
             last_bucket = b
-        out.append(index_row(s, c, depth, now))
+        out.append(index_row(s, c, depth, now, i))
     if last_bucket is not None:
         out.append('</section>')
     counts = collections.OrderedDict()          # 项目按最近活动排序，和列表一致
@@ -604,17 +685,20 @@ def index_page(entries, state=''):
     total = sum(s.size for s, _, _, _ in entries)
     empty = '' if entries else '<p class="empty">还没有找到任何会话记录。</p>'
     return ''.join([
-        head('Claude 会话记录', False), '<body class="index" data-state="/api/state" data-sig="', state, '"><div class="shell">',
-        '<aside><a class="brand" href="/"><img src="/static/icon.svg" width="28" height="28" alt="">'
+        head('Claude 会话记录', False), '<body class="index" data-state="/api/state" data-sig="', state, '">', SPRITE,
+        '<div class="shell"><aside><a class="brand" href="/"><img src="/static/icon.svg" width="28" height="28" alt="">'
         '<span>Sessiontool<small>Claude 会话记录</small></span></a>',
         '<div class="side-h">项目</div><div class="tabs" id="pj">', tabs, '</div>',
         '<div class="side-h">选项</div>'
         '<label class="tg"><input type="checkbox" id="ar" checked> 显示已归档的会话</label>'
-        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label>',
-        '<div class="side-foot"><span>%d 个会话 · %s</span>' % (len(entries), size(total)), THEME_BUTTON, '</div></aside>',
-        '<main><div class="search"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词" autofocus>'
-        '<kbd>/</kbd></div>',
-        '<div class="meta" id="status">显示 <span id="cnt">%d</span> 个会话</div>' % len(entries),
+        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label>'
+        '<label class="tg"><input type="checkbox" id="auto"> 有新记录时自动刷新</label>',
+        '<div class="side-foot"><span id="totals">%d 个会话 · %s</span><span class="foot-acts">' % (len(entries), size(total)),
+        ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON, '</span></div></aside>',
+        '<main><div class="top"><div class="search"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词">'
+        '<kbd>/</kbd></div>', ibutton('refresh', '刷新，读取最新记录（R）', ' data-act="refresh"'), '</div>',
+        '<div class="meta" id="status"><span id="cnt">%d</span> 个会话 · 更新于 <time id="synced">%s</time></div>'
+        % (len(entries), now.strftime('%H:%M:%S')),
         '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></main></div>', scripts(False), '</body></html>'])
 
 # ---------- Markdown 导出 ----------
