@@ -6,8 +6,10 @@
 
   var body = document.body, root = document.documentElement;
   var isIndex = body.classList.contains('index'), isSession = body.classList.contains('session');
+  var isStats = body.classList.contains('stats');
   var live = !!body.dataset.state;          // 有本地服务可以问（导出的独立文件没有）
   var SVG = 'http://www.w3.org/2000/svg';
+  var WEEK = '一二三四五六日';
 
   function $(s, r) { return (r || document).querySelector(s); }
   function $$(s, r) { return [].slice.call((r || document).querySelectorAll(s)); }
@@ -17,11 +19,14 @@
     if (text != null) e.textContent = text;
     return e;
   }
+  function svg(tag, attrs, text) {
+    var e = document.createElementNS(SVG, tag);
+    for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  }
   function icon(name) {
-    var s = document.createElementNS(SVG, 'svg'), u = document.createElementNS(SVG, 'use');
-    s.setAttribute('class', 'ic');
-    s.setAttribute('aria-hidden', 'true');
-    u.setAttribute('href', '#i-' + name);
+    var s = svg('svg', { 'class': 'ic', 'aria-hidden': 'true' }), u = svg('use', { href: '#i-' + name });
     s.appendChild(u);
     return s;
   }
@@ -37,7 +42,7 @@
     var t;
     return function () { clearTimeout(t); t = setTimeout(fn, ms); };
   }
-  function store(k, v) {                    // 长期记住的选择：主题、视图、自动刷新、读到哪了
+  function store(k, v) {                    // 长期记住的选择：主题、视图、来源、实时更新、读到哪了
     try {
       if (v === undefined) return localStorage.getItem(k);
       if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v);
@@ -51,7 +56,7 @@
   }
   function typing(e) {
     var t = e.target;
-    return t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable;
+    return t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable;
   }
   function terms(q) { return q.toLowerCase().split(/\s+/).filter(Boolean); }
   function pad(n) { return (n < 10 ? '0' : '') + n; }
@@ -69,6 +74,13 @@
     if (n >= 1e4) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1) + 'k';
     return String(n);
   }
+  function money(x) {                       // 按 API 价格估算的美元数，和服务端的写法一致
+    if (x == null) return '—';
+    if (x >= 1000) return '$' + Math.round(x).toLocaleString('en-US');
+    return '$' + (x >= 0.01 || !x ? x.toFixed(2) : x.toFixed(3));
+  }
+  function cost(u) { return u.cost ? money(u.cost) + (u.unpriced ? '+' : '') : u.unpriced ? '价格未知' : money(0); }
+  function pct(x, digits) { return x == null ? '—' : (x * 100).toFixed(digits == null ? 1 : digits) + '%'; }
   function bytes(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : (n / 1048576).toFixed(1) + ' MB'; }
   function span(a, b) {
     var ms = new Date(b) - new Date(a);
@@ -78,6 +90,13 @@
     if (h >= 1) return h + ' 小时 ' + (m % 60) + ' 分';
     return Math.max(m, 1) + ' 分钟';
   }
+  function ago(ms) {
+    var m = Math.round((Date.now() - ms) / 60000);
+    if (m < 1) return '刚刚';
+    if (m < 60) return m + ' 分钟前';
+    if (m < 60 * 24) return Math.round(m / 60) + ' 小时前';
+    return Math.round(m / 1440) + ' 天前';
+  }
   function reveal(node) {
     for (var p = node; p; p = p.parentNode) if (p.tagName === 'DETAILS') p.open = true;
   }
@@ -86,6 +105,34 @@
     body.classList.add('bulk');
     fn();
     requestAnimationFrame(function () { requestAnimationFrame(function () { body.classList.remove('bulk'); }); });
+  }
+  // 和服务端的 zlib.crc32 一致：账号、项目的颜色由名字决定，页面脚本画出来的和服务端画的一样
+  var CRC = null;
+  function hue(s) {
+    if (!CRC) {
+      CRC = [];
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        CRC[n] = c >>> 0;
+      }
+    }
+    var b = new TextEncoder().encode(s || ''), x = 0xFFFFFFFF;
+    for (var i = 0; i < b.length; i++) x = CRC[(x ^ b[i]) & 0xFF] ^ (x >>> 8);
+    return ((x ^ 0xFFFFFFFF) >>> 0) % 360;
+  }
+  function acctChip(a) {
+    var c = el('span', 'acct');
+    c.style.setProperty('--h', hue(a.email || a.key));
+    c.title = '账号：' + (a.email || a.name);
+    c.appendChild(el('i'));
+    c.appendChild(document.createTextNode(a.name));
+    return c;
+  }
+  function parse(html) {                    // 服务端渲染好的片段 → 节点（template 里的脚本不会执行）
+    var t = document.createElement('template');
+    t.innerHTML = html;
+    return [].slice.call(t.content.children);
   }
 
   /* ================= 提示条 ================= */
@@ -310,15 +357,106 @@
     });
     parent.appendChild(box);
   }
-  var PERMISSION = { 'default': '每次询问', acceptEdits: '自动接受编辑', plan: '计划模式', auto: '自动判断', bypassPermissions: '跳过权限确认' };
+  // 一张数字表：第一列是名字，其余靠右对齐；share 给出时最后加一列占比条
+  function grid(heads, rows, opt) {
+    opt = opt || {};
+    var t = el('table', 'grid'), tr = el('tr');
+    heads.forEach(function (h, i) { tr.appendChild(el('th', i ? 'n' : null, h)); });
+    if (opt.share) tr.appendChild(el('th', 'bar', '占比'));
+    var thead = el('thead');
+    thead.appendChild(tr);
+    t.appendChild(thead);
+    var tb = el('tbody');
+    rows.forEach(function (r, k) {
+      var row = el('tr');
+      r.forEach(function (v, i) {
+        var td = el('td', i ? 'n' : null);
+        if (v && v.nodeType) td.appendChild(v); else td.textContent = v;
+        row.appendChild(td);
+      });
+      if (opt.share) {
+        var td = el('td', 'bar'), track = el('span', 'track'), fill = el('i');
+        var x = opt.share[k];
+        fill.style.width = Math.max(x > 0 ? 1.5 : 0, Math.round(x * 1000) / 10) + '%';
+        if (opt.colors) fill.style.background = opt.colors[k];
+        track.appendChild(fill);
+        td.appendChild(track);
+        td.title = pct(x);
+        row.appendChild(td);
+      }
+      tb.appendChild(row);
+    });
+    t.appendChild(tb);
+    var w = el('div', 'tw');
+    w.appendChild(t);
+    return w;
+  }
+  // 名字前面一小块颜色：图上的系列在表里的对应
+  function swatch(cls, text) {
+    var s = el('span', 'sw');
+    var i = el('i', cls);
+    s.appendChild(i);
+    s.appendChild(document.createTextNode(text));
+    return s;
+  }
+  // 费用分项：一条横向的堆叠条，下面是图例
+  var PARTS = ['输入', '输出', '读缓存', '写缓存', '网页搜索'];
+  function costBar(parent, parts) {
+    var total = parts.reduce(function (a, b) { return a + b; }, 0);
+    if (!total) return;
+    var bar = el('div', 'stack'), legend = el('div', 'legend');
+    parts.forEach(function (x, i) {
+      if (!x) return;
+      var seg = el('i', 'c' + (i + 1));
+      seg.style.flexGrow = x / total;
+      seg.title = PARTS[i] + '：' + money(x) + '（' + pct(x / total) + '）';
+      bar.appendChild(seg);
+      var item = swatch('c' + (i + 1), PARTS[i] + ' ');
+      item.appendChild(el('b', null, money(x)));
+      legend.appendChild(item);
+    });
+    parent.appendChild(bar);
+    parent.appendChild(legend);
+  }
+
+  var PERMISSION = { 'default': '每次询问', acceptEdits: '自动接受编辑', plan: '计划模式', auto: '自动判断', bypassPermissions: '跳过权限确认',
+    never: '从不询问', 'on-request': '需要时询问', 'on-failure': '失败时询问', untrusted: '不受信任的命令要询问' };
   var STATUS = { completed: '已完成', review_ready: '等你过目', blocked: '受阻', in_progress: '进行中', needs_input: '等你处理', failed: '失败' };
+  var ORIGIN = { codex_exec: '命令行（codex exec）', 'codex-tui': '终端界面', codex_cli_rs: '命令行', vscode: 'VS Code 扩展', codex_vscode: 'VS Code 扩展' };
+
+  function usageSection(b, u, agents) {
+    var s = section(b, '费用与用量');
+    var hero = el('div', 'hero');
+    hero.appendChild(el('b', null, cost(u)));
+    hero.appendChild(el('span', null, '按 API 价格估算 · ' + u.n + ' 次回复' + (agents ? '（含 ' + agents + ' 个子代理的）' : '')));
+    s.appendChild(hero);
+    costBar(s, u.parts);
+    tiles(s, [['缓存命中率', pct(u.rate)], ['输出', u.output], ['未缓存的输入', u.input], ['读缓存', u.cache_read],
+      ['写缓存', u.cache_write], ['其中思考', u.thinking, 1], ['网页搜索', u.web, 1]]);
+    s.appendChild(el('small', 'hint', '订阅不按 token 计费，这是同样的用量按 API 计价的金额。缓存命中率是读缓存占全部输入的比例。'
+      + (u.unpriced ? u.unpriced + ' 次回复的模型没有价格，没有计入。' : '')));
+    if (u.models.length) {
+      s = section(b, '按模型');
+      s.appendChild(grid(['模型', '回复', '输出', '命中率', '费用'], u.models.map(function (m) {
+        return [m.name || '（未知）', m.n, compact(m.output), pct(m.rate, 0), m.priced ? money(m.cost) : '—'];
+      }), { share: u.models.map(function (m) { return u.cost ? m.cost / u.cost : 0; }) }));
+    }
+    if (u.efforts.length) {
+      s = section(b, '按推理强度');
+      s.appendChild(grid(['推理强度', '回复', '输出', '费用'], u.efforts.map(function (e) {
+        return [e.effort || '（未记录）', e.n, compact(e.output), money(e.cost)];
+      }), { share: u.efforts.map(function (e) { return u.cost ? e.cost / u.cost : 0; }) }));
+    }
+  }
 
   function fillInfo(b, d) {
+    var codex = d.src === 'codex';
     var t = el('div', 'dtitle');
     t.appendChild(el('strong', null, d.title));
     var tags = el('div', 'dtags');
-    var proj = el('span', 'badge', d.proj);
-    tags.appendChild(proj);
+    tags.appendChild(el('span', 'badge', d.proj));
+    if (d.account) tags.appendChild(acctChip(d.account));
+    if (codex) tags.appendChild(el('span', 'badge cx', 'Codex'));
     if (d.parent) tags.appendChild(el('span', 'badge', '复刻'));
     if (d.archived) tags.appendChild(el('span', 'badge', '已归档'));
     if (d.orphan) tags.appendChild(el('span', 'badge', '不在应用列表中'));
@@ -331,7 +469,7 @@
       if (d.status.needs_action) sb.appendChild(el('p', 'err', '需要处理：' + d.status.needs_action));
       b.appendChild(sb);
     }
-    if (isIndex) {
+    if (!isSession) {
       var go = el('a', 'go', '打开这个会话');
       go.href = '/s/' + d.page;
       b.appendChild(go);
@@ -339,10 +477,18 @@
 
     var s = section(b, '标识');
     if (d.id) s.appendChild(field('应用会话 ID', d.id, { hint: '在 Claude 里提到这个会话时用它' }));
-    s.appendChild(field('记录 ID', d.cli, { hint: '当前记录文件的编号，可以用来恢复会话' }));
+    s.appendChild(field(codex ? '线程 ID' : '记录 ID', d.cli, { hint: codex ? 'Codex 用它找到这个会话' : '当前记录文件的编号，可以用来恢复会话' }));
     d.files.filter(function (f) { return !f.current; }).forEach(function (f) { s.appendChild(field('更早的记录 ID', f.id)); });
     s.appendChild(field('恢复命令', d.resume, { hint: '在终端里的项目文件夹下运行' }));
     if (d.link) s.appendChild(field('应用链接', d.link));
+
+    if (d.account || d.org || d.store) {
+      s = section(b, '账号');
+      if (d.account && d.account.email) s.appendChild(field('邮箱', d.account.email));
+      if (d.account && d.account.id) s.appendChild(field('账号 ID', d.account.id));
+      if (d.org) s.appendChild(field('组织 ID', d.org));
+      pairs(s, [['multi-claude 配置', d.store], ['Codex 版本', d.version], ['从哪里开始的', ORIGIN[d.origin] || d.origin]]);
+    }
 
     s = section(b, '位置');
     s.appendChild(field('项目文件夹', d.cwd || '（未知）'));
@@ -351,9 +497,10 @@
     s = section(b, '时间');
     pairs(s, [['创建', stamp(d.created)], ['第一条消息', stamp(d.first)], ['最后活动', stamp(d.last)], ['前后跨度', span(d.first, d.last)]]);
 
+    if (d.usage && d.usage.n) usageSection(b, d.usage, d.agents);
+
     s = section(b, '模型与设置');
-    var models = (d.models || []).map(function (m) { return m[0] + '（' + m[1] + ' 次回复）'; }).join('、') || d.model;
-    pairs(s, [['模型', models], ['推理强度', d.effort], ['权限模式', PERMISSION[d.permission] || d.permission],
+    pairs(s, [['当前模型', d.model], ['推理强度', d.effort], [codex ? '审批' : '权限模式', PERMISSION[d.permission] || d.permission],
       ['完成的轮数', d.turns != null ? String(d.turns) : ''], ['写入过的分支', (d.branches || []).join('、')]]);
 
     s = section(b, '数量');
@@ -361,13 +508,6 @@
     tiles(s, [['提问', c.prompts], ['答复', c.replies], ['工具调用', c.tools], ['工具截图', c.shots, 1], ['你发的图片', c.images, 1],
       ['发给你的文件', c.sent, 1], ['修改的文件', c.changed, 1], ['上下文压缩', c.compact, 1], ['改写', c.branch, 1],
       ['记录文件', c.records], ['记录大小', bytes(d.size)]]);
-
-    var k = d.tokens || {};
-    if (k.output || k.input || k.cache_read) {
-      s = section(b, 'Token 用量');
-      tiles(s, [['输出', k.output], ['输入', k.input], ['读取缓存', k.cache_read], ['写入缓存', k.cache_write]]);
-      s.appendChild(el('small', 'hint', '按回复去重后的合计。复刻的会话包含复刻点之前的部分。'));
-    }
 
     if (d.tools && d.tools.length) {
       s = section(b, '用得最多的工具');
@@ -420,10 +560,13 @@
   }
 
   function openKeys() {
-    var rows = [['/', '聚焦搜索框'], ['R', '刷新，读取最新记录'], ['?', '打开这张快捷键表'], ['Esc', '关闭浮层、清空搜索']];
-    if (isIndex) rows = rows.concat([['J  K  ↓  ↑', '在会话和搜索结果之间移动'], ['Enter', '打开选中的会话'], ['I', '选中会话的详情'], ['C', '复制选中会话的 ID']]);
-    if (isSession) rows = rows.concat([['J  K', '下一条 / 上一条你的提问'], ['1  2  3', '完整 / 对话 / 结果视图'], ['E', '折起或展开当前这一轮的过程'],
-      ['I', '会话详情'], ['Enter  Shift+Enter', '搜索时跳到下一处 / 上一处'], ['←  →', '放大图片时切换上一张 / 下一张']]);
+    var rows = [['/', '聚焦搜索框'], ['R', '立刻重读磁盘'], ['L', '暂停或继续实时更新'], ['?', '打开这张快捷键表'], ['Esc', '关闭浮层、清空搜索']];
+    if (isIndex) rows = rows.concat([['J  K  ↓  ↑', '在会话和搜索结果之间移动'], ['Enter', '打开选中的会话'], ['I', '选中会话的详情'],
+      ['C', '复制选中会话的 ID'], ['S', '切换 Claude / Codex / 全部']]);
+    if (isSession) rows = rows.concat([['J  K', '下一条 / 上一条你的提问'], ['1  2  3  4', '完整 / 思考 / 对话 / 结果视图'],
+      ['E', '折起或展开当前这一轮的过程'], ['I', '会话详情'], ['Enter  Shift+Enter', '搜索时跳到下一处 / 上一处'],
+      ['←  →', '放大图片时切换上一张 / 下一张']]);
+    if (isStats) rows = rows.concat([['S', '切换 Claude / Codex / 全部']]);
     var b = openLayer('modal', '键盘快捷键'), list = el('div', 'keys');
     rows.forEach(function (r) {
       var d = el('div');
@@ -458,6 +601,7 @@
       if (inp && typeof inp === 'object' && !Array.isArray(inp)) {
         Object.keys(inp).forEach(function (k) {
           var v = inp[k], s = typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+          if (v == null) return;
           if (s.length < 90 && s.indexOf('\n') < 0) {
             var row = el('div', 'kv');
             row.appendChild(el('span', 'k', k));
@@ -551,7 +695,7 @@
       }
     });
   }
-  // near：优先停在这个元素里的第一处；quiet：只更新标记，不滚动页面（刷新后用）
+  // near：优先停在这个元素里的第一处；quiet：只更新标记，不滚动页面（更新内容后用）
   function highlight(q, near, quiet) {
     var keep = quiet ? cur : -1;
     clearMarks();
@@ -580,65 +724,114 @@
     go(1, quiet);
   }
 
-  /* ================= 刷新：只换有变化的部分 ================= */
+  /* ================= 实时更新：服务推送变化，页面只换有变化的部分 ================= */
 
-  var refreshing = false, pendingSig = null, hint = null;
-  var auto = store('auto') === '1';
-  var swap = null;                          // 各页面自己的替换逻辑，下面分别赋值
+  // 各页面自己的“取最新内容”：pull(fresh) → Promise<{changed, text, action}>。fresh 让服务跳过节流立刻重读磁盘
+  var pull = null, pulling = false, again = false, lastPull = 0, hint = null;
+  var liveOn = store('live') !== '0', es = null, failures = 0;
+  var GAP = isStats ? 4000 : isIndex ? 1500 : 800;      // 两次自动更新至少隔这么久：会话正在跑时变化每秒都有
 
-  function refresh(silent) {
-    if (refreshing || !live || !swap) return;
-    refreshing = true;
-    var btn = $('[data-act="refresh"]'), t0 = Date.now();
+  function refresh(manual) {
+    if (!live || !pull) return;
+    if (pulling) { again = again || !manual; return; }
+    pulling = true;
+    lastPull = Date.now();
+    var btn = manual && $('[data-act="refresh"]'), t0 = Date.now();
     if (btn) btn.classList.add('spin');
-    fetch(location.pathname + '?fresh=1').then(function (r) {
-      if (!r.ok) throw new Error(r.status);
-      return r.text();
-    }).then(function (text) {
-      var res = swap(new DOMParser().parseFromString(text, 'text/html'));
-      pendingSig = null;
-      if (hint) { hint.close(); hint = null; }
-      if (!silent) toast(res.changed ? res.text : '已是最新 · ' + clock(new Date()), res.changed && res.action ? res.action : null);
+    if (hint) { hint.close(); hint = null; }
+    pull(manual).then(function (res) {
+      if (manual) toast(res && res.changed ? res.text : '已是最新 · ' + clock(new Date()), res && res.changed && res.action ? res.action : null);
     }).catch(function () {
-      if (!silent) toast('刷新失败：本地服务没有响应，请确认 Sessiontool 的窗口还开着。', { ms: 5000 });
+      if (manual) toast('刷新失败：本地服务没有响应，请确认 Sessiontool 的窗口还开着。', { ms: 5000 });
     }).then(function () {
       // 转圈至少转半秒，太快的话看不出按下去有没有反应
-      setTimeout(function () { refreshing = false; if (btn) btn.classList.remove('spin'); }, Math.max(0, 500 - (Date.now() - t0)));
+      setTimeout(function () {
+        pulling = false;
+        if (btn) btn.classList.remove('spin');
+        if (again) { again = false; later(); }
+      }, btn ? Math.max(0, 500 - (Date.now() - t0)) : 0);
     });
   }
-
-  function setAuto(on) {
-    auto = on;
-    store('auto', on ? '1' : '0');
-    $$('[data-act="auto"]').forEach(function (b) { b.classList.toggle('on', on); b.setAttribute('aria-checked', on); });
-    var box = $('#auto');
-    if (box) box.checked = on;
-    if (on && pendingSig) refresh(true);
+  var timer = null;
+  function later() {                        // 离上次更新太近就等一等再取，期间的变化合成一次
+    if (timer) return;
+    timer = setTimeout(function () { timer = null; refresh(false); }, Math.max(0, GAP - (Date.now() - lastPull)));
   }
 
-  // 每隔几秒问一下服务有没有新记录：开了自动刷新就直接更新，否则提示一下
+  function paintLive(state) {
+    $$('[data-act="live"]').forEach(function (b) {
+      b.classList.toggle('on', state === 'on');
+      b.classList.toggle('off', state === 'off');
+      b.classList.toggle('err', state === 'err');
+      b.setAttribute('aria-pressed', state !== 'off');
+      $('span', b).textContent = state === 'off' ? '已暂停' : state === 'err' ? '未连接' : '实时';
+    });
+  }
+  function changed(e) {
+    var j = JSON.parse(e.data);
+    failures = 0;
+    paintLive(liveOn ? 'on' : 'off');
+    if (j.sig === body.dataset.sig) return;
+    if (isStats) body.dataset.sig = j.sig;
+    if (liveOn) { later(); return; }
+    if (!hint) hint = toast('有新的记录', { action: '更新', run: function () { hint = null; refresh(true); }, sticky: true });
+  }
+  // 只有看得见的页面才连着：浏览器对同一个地址最多开六条连接，开很多标签页时不能让后台的页面占满
+  function connect() {
+    if (!live || es || document.hidden || !window.EventSource) return;
+    es = new EventSource('/api/live' + (isSession ? '?page=' + encodeURIComponent(body.dataset.page) : ''));
+    es.addEventListener('hello', changed);
+    es.addEventListener('change', changed);
+    es.onerror = function () {
+      paintLive('err');
+      if (++failures > 20) disconnect();    // 服务关掉了：重试一阵就不再连
+    };
+  }
+  function disconnect() {
+    if (es) { es.close(); es = null; }
+  }
+  function setLive(on) {
+    liveOn = on;
+    store('live', on ? '1' : '0');
+    paintLive(on ? 'on' : 'off');
+    if (on && es && hint) refresh(false);
+  }
   if (live) {
-    var misses = 0;
-    var poll = setInterval(function () {
-      if (document.hidden || refreshing) return;
-      fetch(body.dataset.state).then(function (r) { return r.json(); }).then(function (j) {
-        misses = 0;
-        if (j.sig === body.dataset.sig) return;
-        if (auto) { refresh(true); return; }
-        if (j.sig === pendingSig) return;
-        pendingSig = j.sig;
-        if (hint) hint.close();
-        hint = toast('有新的记录', { action: '刷新', run: function () { refresh(false); }, sticky: true });
-      }).catch(function () { if (++misses >= 3) clearInterval(poll); });       // 服务关掉了就不再问
-    }, 5000);
+    paintLive(liveOn ? 'on' : 'off');
+    document.addEventListener('visibilitychange', function () { if (document.hidden) disconnect(); else connect(); });
+    window.addEventListener('pagehide', disconnect);
+    setTimeout(connect, 300);               // 等页面先画完再连
   }
+
+  /* ================= 来源：Claude / Codex / 全部 ================= */
+
+  var srcSeg = $('#src'), source = 'all', onSource = null;
+  // user：是你点的（记住选择，并让页面重新筛选）；打开页面时恢复上次的选择不算
+  function pickSource(v, user) {
+    if (!srcSeg) return;
+    if (['claude', 'codex', 'all'].indexOf(v) < 0) v = 'claude';
+    source = v;
+    body.dataset.src = v;
+    $$('button', srcSeg).forEach(function (b) { b.classList.toggle('on', b.dataset.s === v); });
+    if (user) {
+      store('src', v);
+      if (onSource) onSource(v);
+    }
+  }
+  if (srcSeg) {
+    srcSeg.addEventListener('click', function (e) {
+      var b = e.target.closest('button');
+      if (b) pickSource(b.dataset.s, true);
+    });
+  }
+  function srcParam() { return source === 'all' ? '' : source; }
 
   /* ================= 点击与按键的统一入口 ================= */
 
   var ACTIONS = {
-    refresh: function () { refresh(false); },
+    refresh: function () { refresh(true); },
     keys: openKeys,
-    auto: function (b) { setAuto(!auto); toast(auto ? '已开启：有新记录时自动刷新' : '已关闭自动刷新'); var m = b.closest('details'); if (m) m.open = false; }
+    live: function () { setLive(!liveOn); toast(liveOn ? '已开启实时更新：有新记录时自动显示' : '已暂停实时更新'); }
   };
 
   document.addEventListener('click', function (e) {
@@ -676,7 +869,13 @@
     if (typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.key === '?') { e.preventDefault(); openKeys(); }
     else if (layer) return;                 // 浮层开着时别的快捷键不起作用
-    else if (e.key === 'r' && live) { e.preventDefault(); refresh(false); }
+    else if (e.key === 'r' && live) { e.preventDefault(); refresh(true); }
+    else if (e.key === 'l' && live) { e.preventDefault(); ACTIONS.live(); }
+    else if (e.key === 's' && srcSeg) {
+      e.preventDefault();
+      var order = ['claude', 'codex', 'all'];
+      pickSource(order[(order.indexOf(source) + 1) % order.length], true);
+    }
   }, true);
 
   /* ================= 会话页 ================= */
@@ -684,21 +883,26 @@
   if (isSession) {
     var flow = $('#flow'), page = body.dataset.page || '';
 
-    // 三种视图：完整 / 对话（隐藏工具调用）/ 结果（折起每轮的中间过程，只留最终答复）
+    // 四种视图：完整 / 思考（再展开每段思考）/ 对话（隐藏工具调用）/ 结果（折起每轮的中间过程，只留最终答复）
+    var VIEWS = ['full', 'think', 'chat', 'result'];
     var views = $$('#view button'), view = 'full';
+    function applyView(scope) {
+      $$('details.steps', scope).forEach(function (d) { d.open = view !== 'result'; });
+      $$('details.think', scope).forEach(function (d) { d.open = view === 'think'; });
+    }
     function setView(v, keep) {
-      if (['full', 'chat', 'result'].indexOf(v) < 0) v = 'full';
+      if (VIEWS.indexOf(v) < 0) v = 'full';
       view = v;
       views.forEach(function (b) { b.classList.toggle('on', b.dataset.v === v); });
       bulk(function () {
         body.classList.toggle('chat', v === 'chat');
-        $$('details.steps').forEach(function (d) { d.open = v !== 'result'; });
+        applyView(flow);
       });
       if (keep) store('view', v);
     }
     views.forEach(function (b) { b.onclick = function () { keepPlace(function () { setView(b.dataset.v, true); }); }; });
 
-    // 改变页面高度的操作（切视图、折起过程）前后，让眼前这条消息留在原位
+    // 改变页面高度的操作（切视图、折起过程、换上新内容）前后，让眼前这条消息留在原位
     function keepPlace(fn) {
       var blocks = [].slice.call(flow.children), ref = null, at = 0, top = 0;
       for (var i = 0; i < blocks.length; i++) {
@@ -744,9 +948,11 @@
       }
       return best;
     }
+    function atEnd() { return window.innerHeight + window.scrollY >= root.scrollHeight - 200; }
     // moved：是你滚动页面引起的。只有这时才更新“读到哪了”，刚打开页面时不能把上次的位置冲掉
     function spy(moved) {
       if (totop) totop.classList.toggle('on', window.scrollY > window.innerHeight * 1.5);
+      if (pill && atEnd()) pill.classList.remove('on');
       var best = current(), a = best && links[best.id];
       if (a === active) return;
       if (active) active.classList.remove('on');
@@ -783,7 +989,21 @@
       return t;
     }
 
-    // 刷新：标题区整个换；对话按块比较内容指纹，只换有变化的块和新增的块
+    // 不在最底下时来了新内容：底部浮出一个入口，不擅自滚动
+    var pill = null;
+    function showPill() {
+      if (!pill) {
+        pill = el('button', 'newpill');
+        pill.type = 'button';
+        pill.appendChild(el('span', null, '有新内容'));
+        pill.appendChild(icon('down'));
+        pill.onclick = function () { pill.classList.remove('on'); ACTIONS.end(); };
+        body.appendChild(pill);
+      }
+      requestAnimationFrame(function () { pill.classList.add('on'); });
+    }
+
+    // 更新：标题区整个换；对话按块比较内容指纹，服务只发回从第一个不同的块起的部分
     function keepOpen(o, n) {
       var os = $('details.steps', o), ns = $('details.steps', n);
       if (os && ns) ns.open = os.open;
@@ -794,44 +1014,48 @@
         m.parentNode.open = true;
         if (t.open) m.open = true;
       });
+      var thinks = $$('details.think', o), nthinks = $$('details.think', n);
+      thinks.forEach(function (t, i) { if (nthinks[i]) nthinks[i].open = t.open; });
     }
-    swap = function (doc) {
-      var nb = doc.body, nflow = $('#flow', doc);
-      if (!nflow || nb.dataset.sig === body.dataset.sig) return { changed: false };
-      var olds = [].slice.call(flow.children), news = [].slice.call(nflow.children), i = 0;
-      while (i < olds.length && i < news.length && olds[i].dataset.k === news[i].dataset.k) i++;
-      var atEnd = window.innerHeight + window.scrollY >= root.scrollHeight - 200;
-      var turnsBefore = $$('#flow > .turn').length;
+    function apply(j, manual) {
+      var olds = [].slice.call(flow.children);
+      if (j.sig === body.dataset.sig && j.start === olds.length && !j.blocks.length) return { changed: false };
+      var news = parse(j.blocks.join('\n')), end = atEnd(), turnsBefore = $$('#flow > .turn').length;
       keepPlace(function () {
-        var head = $('main > .head'), nhead = document.adoptNode($('main > .head', doc)), filesOpen = !!$('.files[open]', head);
+        var head = $('main > .head'), filesOpen = !!$('.files[open]', head), nhead = parse(j.head)[0];
         head.replaceWith(nhead);
         if (filesOpen && $('.files', nhead)) $('.files', nhead).open = true;
-        var fresh = [];
-        for (var j = i; j < news.length; j++) {
-          var n = document.adoptNode(news[j]);
-          if (olds[j]) keepOpen(olds[j], n);
-          else {
-            n.classList.add('new');
-            if (view === 'result') $$('details.steps', n).forEach(function (d) { d.open = false; });
-          }
-          fresh.push(n);
-        }
+        news.forEach(function (n, k) {
+          applyView(n);
+          var o = olds[j.start + k];
+          if (o) keepOpen(o, n); else n.classList.add('new');
+        });
         bulk(function () {
-          olds.slice(i).forEach(function (o) { o.remove(); });
-          fresh.forEach(function (n) { flow.appendChild(n); awaitImages(n); });
+          olds.slice(j.start).forEach(function (o) { o.remove(); });
+          news.forEach(function (n) { flow.appendChild(n); awaitImages(n); });
         });
       });
-      $('nav .toc').innerHTML = $('nav .toc', doc).innerHTML;
-      if ($('#info') && $('#info', doc)) $('#info').textContent = $('#info', doc).textContent;
-      body.dataset.sig = nb.dataset.sig;
-      document.title = doc.title;
+      $('nav .toc').innerHTML = j.toc;
+      if ($('#info') && j.info) $('#info').textContent = JSON.stringify(j.info);
+      body.dataset.sig = j.sig;
+      document.title = j.title;
       collect();
       spy();
       if (activeQ) highlight(activeQ, null, true);
-      if (atEnd) window.scrollTo(0, root.scrollHeight);           // 本来就在看最新的，就继续跟着
+      if (end) window.scrollTo(0, root.scrollHeight);           // 本来就在看最新的，就继续跟着
+      else if (!manual && news.length) showPill();
       var more = $$('#flow > .turn').length - turnsBefore;
       return { changed: true, text: more > 0 ? '已更新 · 新增 ' + more + ' 轮对话' : '已更新到最新内容',
-        action: atEnd ? null : { action: '跳到最新', run: ACTIONS.end } };
+        action: end ? null : { action: '跳到最新', run: ACTIONS.end } };
+    }
+    pull = function (fresh) {
+      return fetch('/api/blocks' + (fresh ? '?fresh=1' : ''), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: page, keys: [].map.call(flow.children, function (n) { return n.dataset.k || ''; }) })
+      }).then(function (r) {
+        if (!r.ok) throw new Error(r.status);
+        return r.json();
+      }).then(function (j) { return apply(j, fresh); });
     };
 
     // 初始化
@@ -841,7 +1065,6 @@
     totop.className += ' totop';
     totop.dataset.act = 'top';
     body.appendChild(totop);
-    setAuto(auto);
     window.addEventListener('scroll', debounce(function () { spy(true); }, 60), { passive: true });
 
     var fq = $('#fq'), target = jump(), q0 = '';
@@ -873,7 +1096,7 @@
       else if (k === 'k') step(-1);
       else if (k === '/' && fq) { e.preventDefault(); fq.focus(); fq.select(); }
       else if (k === 'i' && $('#info')) openInfo(page);
-      else if (k === '1' || k === '2' || k === '3') keepPlace(function () { setView(['full', 'chat', 'result'][k - 1], true); });
+      else if (k >= '1' && k <= '4') keepPlace(function () { setView(VIEWS[k - 1], true); });
       else if (k === 'e') {
         var t = turnInView(), d = t && $('details.steps', t);
         if (d) keepPlace(function () { bulk(function () { d.open = !d.open; }); });
@@ -885,23 +1108,47 @@
 
   if (isIndex) {
     var q = $('#q'), ar = $('#ar'), tl = $('#tl'), hits = $('#hits'), cnt = $('#cnt'), list = $('#list');
-    var project = '', seq = 0;
+    var project = '', account = '', seq = 0;
     var WHO = { user: ['你', 'who-you'], asst: ['Claude', 'who-claude'], tool: ['工具', ''] };
     function rows() { return $$('#list .row'); }
+    function remember() { tab('idx', { p: project, a: account, ar: ar.checked, tl: tl.checked, q: q.value }); }
 
-    function remember() { tab('idx', { p: project, ar: ar.checked, tl: tl.checked, q: q.value }); }
+    // 项目、账号两组标签各自计数：只数当前来源的会话，没有的就不显示
+    function count(t) {
+      var c = +t.dataset.c || 0, x = +t.dataset.x || 0;
+      return source === 'claude' ? c : source === 'codex' ? x : c + x;
+    }
+    function paintTabs() {
+      $$('#pj .tab, #ac .tab').forEach(function (t) {
+        var n = count(t), small = $('small', t), all = t.dataset.p === '' || t.dataset.acct === '';
+        if (small) small.textContent = n;
+        t.hidden = !all && !n;
+      });
+      pick(project);
+      pickAcct(account);
+    }
     function pick(p) {
       var tabs = $$('#pj .tab');
-      if (!tabs.some(function (x) { return x.dataset.p === p; })) p = '';
+      if (!tabs.some(function (x) { return x.dataset.p === p && !x.hidden; })) p = '';
       project = p;
       tabs.forEach(function (x) { x.classList.toggle('on', x.dataset.p === p); });
     }
+    function pickAcct(a) {
+      var tabs = $$('#ac .tab');
+      if (!tabs.some(function (x) { return x.dataset.acct === a && !x.hidden; })) a = '';
+      account = a;
+      tabs.forEach(function (x) { x.classList.toggle('on', x.dataset.acct === a); });
+    }
 
+    function shown(r) {
+      return (source === 'all' || r.dataset.src === source) && (!project || r.dataset.p === project)
+        && (!account || r.dataset.acct === account) && (ar.checked || !r.dataset.a);
+    }
     // 有搜索词时列表只留标题命中的会话：内容命中的已经在上面的结果里
     function filter() {
       var words = terms(q.value), n = 0;
       rows().forEach(function (r) {
-        var ok = (!project || r.dataset.p === project) && (ar.checked || !r.dataset.a);
+        var ok = shown(r);
         if (ok && words.length) ok = words.every(function (w) { return r.dataset.t.indexOf(w) >= 0; });
         r.hidden = !ok;
         if (ok) n++;
@@ -911,15 +1158,15 @@
     }
     function allowed(pg) {
       var row = $('#list .row[data-page="' + pg + '"]');
-      return !row || ((!project || row.dataset.p === project) && (ar.checked || !row.dataset.a));
+      return !row || shown(row);
     }
     function show(j) {
       hits.textContent = '';
-      var shown = j.sessions.filter(function (s) { return allowed(s.page); });
-      var total = shown.reduce(function (n, s) { return n + s.n; }, 0);
-      hits.appendChild(el('div', 'meta', shown.length ? '对话内容：' + total + ' 处，分布在 ' + shown.length + ' 个会话'
+      var found = j.sessions.filter(function (s) { return allowed(s.page); });
+      var total = found.reduce(function (n, s) { return n + s.n; }, 0);
+      hits.appendChild(el('div', 'meta', found.length ? '对话内容：' + total + ' 处，分布在 ' + found.length + ' 个会话'
         : '对话内容里没有找到“' + j.q + '”。'));
-      shown.forEach(function (s) {
+      found.forEach(function (s) {
         var box = el('div', 'hs'), base = '/s/' + s.page + '?q=' + encodeURIComponent(j.q);
         var a = el('a', null, s.title);
         a.href = base;
@@ -927,10 +1174,10 @@
         box.appendChild(el('small', null, '　' + s.n + ' 处'));
         var ul = el('ul');
         s.hits.forEach(function (h) {
-          var li = el('li'), link = el('a');
+          var li = el('li'), link = el('a'), who = WHO[h.who];
           link.href = base + '#' + h.anchor;
           link.appendChild(el('small', null, h.time + '　'));
-          link.appendChild(el('small', WHO[h.who][1], WHO[h.who][0] + '　'));
+          link.appendChild(el('small', who[1], (h.who === 'asst' && s.src === 'codex' ? 'Codex' : who[0]) + '　'));
           link.appendChild(document.createTextNode('…' + h.pre));
           link.appendChild(el('mark', null, h.hit));
           link.appendChild(document.createTextNode(h.post + '…'));
@@ -953,7 +1200,7 @@
       var v = q.value.trim(), mine = ++seq;
       remember();
       if (!v) { hits.textContent = ''; filter(); return; }
-      fetch('/api/search?q=' + encodeURIComponent(v) + '&tools=' + (tl.checked ? 1 : 0))
+      fetch('/api/search?q=' + encodeURIComponent(v) + '&tools=' + (tl.checked ? 1 : 0) + '&src=' + srcParam())
         .then(function (r) { return r.json(); })
         .then(function (j) { if (mine === seq) show(j); })
         .catch(function () { if (mine === seq) hits.textContent = '搜索失败：本地服务没有响应，请确认 Sessiontool 的窗口还开着。'; });
@@ -975,23 +1222,36 @@
 
     ACTIONS.info = function (b) { openInfo(b.closest('.row').dataset.page); };
 
-    swap = function (doc) {
+    function swap(doc) {
       var nb = doc.body;
       $('#synced').textContent = $('#synced', doc).textContent;
       if (nb.dataset.sig === body.dataset.sig) return { changed: false };
+      var f = focusedRow(), fp = f && f.dataset.page;
       list.classList.add('still');          // 换进来的行不再播放入场动画
       list.innerHTML = $('#list', doc).innerHTML;
       $('#pj').innerHTML = $('#pj', doc).innerHTML;
+      if ($('#ac') && $('#ac', doc)) $('#ac').innerHTML = $('#ac', doc).innerHTML;
+      if (srcSeg && $('#src', doc)) $$('small', srcSeg).forEach(function (s, i) { s.textContent = $$('#src small', doc)[i].textContent; });
       $('#totals').textContent = $('#totals', doc).textContent;
       body.dataset.sig = nb.dataset.sig;
-      pick(project);
+      paintTabs();
       run();
+      var back = fp && $('#list .row[data-page="' + fp + '"] .cover');
+      if (back) back.focus({ preventScroll: true });
       return { changed: true, text: '会话列表已更新' };
+    }
+    pull = function (fresh) {
+      return fetch('/' + (fresh ? '?fresh=1' : '')).then(function (r) {
+        if (!r.ok) throw new Error(r.status);
+        return r.text();
+      }).then(function (text) { return swap(new DOMParser().parseFromString(text, 'text/html')); });
     };
 
     document.addEventListener('click', function (e) {
-      var t = e.target.closest('.tab');
+      var t = e.target.closest('#pj .tab');
       if (t) { pick(t.dataset.p); window.scrollTo(0, 0); run(); return; }
+      t = e.target.closest('#ac .tab');
+      if (t) { pickAcct(t.dataset.acct); window.scrollTo(0, 0); run(); return; }
       // 点进会话时给标题起个过渡名字，新页面的大标题会从这里“长”出来
       var cover = e.target.closest('.cover');
       if (cover) {
@@ -1001,8 +1261,7 @@
     });
     q.oninput = debounce(run, 200);
     ar.onchange = tl.onchange = run;
-    $('#auto').onchange = function () { setAuto(this.checked); };
-    setAuto(auto);
+    onSource = function () { paintTabs(); run(); };
 
     document.addEventListener('keydown', function (e) {
       if (box || layer || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1025,7 +1284,10 @@
     if (saved.ar === false) ar.checked = false;
     if (saved.tl) tl.checked = true;
     if (saved.q && !q.value) q.value = saved.q;
-    pick(saved.p || '');
+    project = saved.p || '';
+    account = saved.a || '';
+    pickSource(store('src') || 'claude');
+    paintTabs();
     var from = /\/s\/([0-9a-f]+)/.exec(document.referrer || '');
     if (from) {
       var back = $('#list .row[data-page="' + from[1] + '"] .title');
@@ -1036,5 +1298,427 @@
     if (from) window.scrollTo(0, tab('idx-y') || 0);
     else q.focus({ preventScroll: true });      // 新打开时光标直接在搜索框里，可以马上输入
     window.addEventListener('pagehide', function () { tab('idx-y', window.scrollY); });
+  }
+
+  /* ================= 统计页 ================= */
+
+  if (isStats) {
+    var st = $('#st'), rangeSeg = $('#range'), acctSel = $('#acct'), spanEl = $('#span');
+    var range = +(store('st-range') || 30), acct = store('st-acct') || '', data = null, ask = 0;
+    var metric = store('st-metric') || 'cost';
+    var tip = el('div', 'tip');
+    tip.setAttribute('role', 'tooltip');
+    body.appendChild(tip);
+
+    function paintRange() {
+      $$('button', rangeSeg).forEach(function (b) { b.classList.toggle('on', +b.dataset.d === range); });
+    }
+    rangeSeg.addEventListener('click', function (e) {
+      var b = e.target.closest('button');
+      if (!b) return;
+      range = +b.dataset.d;
+      store('st-range', range);
+      paintRange();
+      load();
+    });
+    acctSel.onchange = function () { acct = acctSel.value; store('st-acct', acct); load(); };
+
+    // quiet：实时更新时悄悄换上新数字；换筛选条件时旧图半透明地留着，等新数据到了再换，不闪白
+    function load(fresh, quiet) {
+      var mine = ++ask;
+      if (!quiet) st.classList.add('loading');
+      return fetch('/api/stats?days=' + range + '&account=' + encodeURIComponent(acct) + '&src=' + srcParam() + (fresh ? '&fresh=1' : ''))
+        .then(function (r) {
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        }).then(function (j) {
+          if (mine !== ask) return { changed: false };
+          data = j;
+          draw();
+          return { changed: true, text: '统计已更新' };
+        }).finally(function () { if (mine === ask) st.classList.remove('loading'); });
+    }
+    pull = function (manual) { return load(manual, !manual); };
+    onSource = function () { load(); };
+
+    // ----- 提示框：数值在前、名字在后；内容一律用 textContent -----
+    function showTip(e, rows, head) {
+      tip.textContent = '';
+      if (head) tip.appendChild(el('div', 'th', head));
+      rows.forEach(function (r) {
+        var line = el('div', 'tr');
+        if (r[2]) { var k = el('i', 'key ' + r[2]); line.appendChild(k); }
+        line.appendChild(el('b', null, r[0]));
+        line.appendChild(el('span', null, r[1]));
+        tip.appendChild(line);
+      });
+      tip.classList.add('on');
+      var w = tip.offsetWidth, h = tip.offsetHeight, x = e.clientX + 14, y = e.clientY + 14;
+      if (x + w > window.innerWidth - 8) x = e.clientX - w - 14;
+      if (y + h > window.innerHeight - 8) y = e.clientY - h - 14;
+      tip.style.transform = 'translate(' + Math.max(8, x) + 'px,' + Math.max(8, y) + 'px)';
+    }
+    function hideTip() { tip.classList.remove('on'); }
+    function hover(node, fn) {
+      node.addEventListener('pointermove', function (e) { fn(e); node.classList.add('hot'); });
+      node.addEventListener('pointerleave', function () { hideTip(); node.classList.remove('hot'); });
+    }
+
+    // ----- 卡片：标题、右上角的切换，以及“表格”视图 -----
+    function card(title, sub, cls) {
+      var c = el('section', 'card' + (cls ? ' ' + cls : '')), h = el('header');
+      var t = el('div', 'ct');
+      t.appendChild(el('h2', null, title));
+      if (sub) t.appendChild(el('small', null, sub));
+      h.appendChild(t);
+      c.appendChild(h);
+      st.appendChild(c);
+      return { box: c, head: h, body: c.appendChild(el('div', 'cb')) };
+    }
+    function toggle(head, options, value, fn) {
+      var seg = el('div', 'seg sm');
+      options.forEach(function (o) {
+        var b = el('button', o[0] === value ? 'on' : null, o[1]);
+        b.type = 'button';
+        b.onclick = function () {
+          $$('button', seg).forEach(function (x) { x.classList.toggle('on', x === b); });
+          fn(o[0]);
+        };
+        seg.appendChild(b);
+      });
+      head.appendChild(seg);
+    }
+    // 每张图都能换成同样数据的表格；返回“重画”，别的切换（比如费用 / Tokens）用它。
+    // 选了表格的，实时更新重画时还是表格
+    var asTable = {};
+    function tableToggle(c, name, drawChart, drawTable) {
+      var b = ibtn('table', '切换图表 / 表格', 'sm tt');
+      function redraw() {
+        b.classList.toggle('on', !!asTable[name]);
+        b.setAttribute('aria-pressed', !!asTable[name]);
+        c.body.textContent = '';
+        (asTable[name] ? drawTable : drawChart)(c.body);
+      }
+      b.onclick = function () {
+        asTable[name] = !asTable[name];
+        redraw();
+      };
+      c.head.appendChild(b);
+      redraw();
+      return redraw;
+    }
+
+    // 刻度：取 1、2、5 乘 10 的幂
+    function ticks(max, n) {
+      if (!(max > 0)) return [0, 1];
+      var raw = max / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), r = raw / mag;
+      var stepv = (r >= 5 ? 10 : r >= 2 ? 5 : r >= 1 ? 2 : 1) * mag;
+      if (r <= 1) stepv = mag;
+      var out = [];
+      for (var v = 0; v < max + stepv * 0.999; v += stepv) out.push(+v.toPrecision(12));
+      if (out.length < 2) out.push(stepv);
+      return out;
+    }
+    function fmtMetric(v, m) { return m === 'cost' ? money(v) : m === 'n' ? compact(v) + ' 次' : compact(v); }
+    function shortDate(d) { var p = d.split('-'); return (+p[1]) + '/' + (+p[2]); }
+    function dayName(d) { var t = new Date(d + 'T00:00:00'); return d + ' 周' + WEEK[(t.getDay() + 6) % 7]; }
+    function slotClass(i) { return i < 6 ? 's' + (i + 1) : 's0'; }
+    function slotName(i) { return i < data.slots.length ? data.slots[i] : '其他'; }
+
+    // ----- 每天：按模型堆起来的柱子 -----
+    function drawDaily(host) {
+      var days = data.days, idx = metric === 'cost' ? 1 : 2;
+      var W = Math.max(300, host.clientWidth), H = 236, L = 52, R = 8, T = 10, B = 26;
+      var pw = W - L - R, ph = H - T - B;
+      var totals = days.map(function (d) { return d.models.reduce(function (a, m) { return a + m[idx]; }, 0); });
+      var tk = ticks(Math.max.apply(null, totals.concat([0])), 4), top = tk[tk.length - 1];
+      var band = pw / days.length, bw = Math.max(1.5, Math.min(24, band * 0.7));
+      var s = svg('svg', { 'class': 'chart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img',
+        'aria-label': '每天的' + (metric === 'cost' ? '费用' : 'token 用量') + '，按模型分开' });
+      tk.forEach(function (v) {
+        var y = T + ph - v / top * ph;
+        s.appendChild(svg('line', { x1: L, x2: W - R, y1: y, y2: y, 'class': v ? 'grid' : 'axis' }));
+        s.appendChild(svg('text', { x: L - 8, y: y + 4, 'class': 'tick', 'text-anchor': 'end' }, fmtMetric(v, metric)));
+      });
+      var every = Math.max(1, Math.ceil(days.length / Math.max(2, Math.floor(pw / 56))));
+      days.forEach(function (d, i) {
+        var x = L + i * band + (band - bw) / 2, base = T + ph, segs = d.models.filter(function (m) { return m[idx] > 0; });
+        var g = svg('g', { 'class': 'col' });
+        segs.forEach(function (m, j) {
+          var h = m[idx] / top * ph, y = base - h, gap = j ? 2 : 0;
+          if (h - gap > 0.5) {
+            var r = j === segs.length - 1 ? Math.min(4, bw / 2, h - gap) : 0;
+            var hh = h - gap;
+            g.appendChild(svg('path', { 'class': 'seg ' + slotClass(m[0]),
+              d: 'M' + x + ',' + (y + hh) + 'V' + (y + r) + (r ? 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y : '') + 'H' + (x + bw - r)
+                + (r ? 'Q' + (x + bw) + ',' + y + ' ' + (x + bw) + ',' + (y + r) : '') + 'V' + (y + hh) + 'Z' }));
+          }
+          base = y;
+        });
+        var hit = svg('rect', { x: L + i * band, y: T, width: band, height: ph, 'class': 'hit' });
+        g.appendChild(hit);
+        hover(g, function (e) {
+          var rows = segs.slice().reverse().map(function (m) { return [fmtMetric(m[idx], metric), slotName(m[0]), slotClass(m[0])]; });
+          rows.push([fmtMetric(totals[i], metric), '合计']);
+          if (d.n) rows.push([d.n + ' 次', '回复']);
+          showTip(e, rows, dayName(d.d));
+        });
+        s.appendChild(g);
+        if (i % every === 0 || i === days.length - 1) {
+          s.appendChild(svg('text', { x: L + i * band + band / 2, y: H - 8, 'class': 'tick', 'text-anchor': 'middle' }, shortDate(d.d)));
+        }
+      });
+      host.appendChild(s);
+      var used = {};
+      days.forEach(function (d) { d.models.forEach(function (m) { if (m[idx] > 0) used[m[0]] = 1; }); });
+      var legend = el('div', 'legend');
+      Object.keys(used).map(Number).sort().forEach(function (i) { legend.appendChild(swatch(slotClass(i), slotName(i))); });
+      host.appendChild(legend);
+    }
+    function dailyTable(host) {
+      var used = {};
+      data.days.forEach(function (d) { d.models.forEach(function (m) { if (m[1] || m[2]) used[m[0]] = 1; }); });
+      var slots = Object.keys(used).map(Number).sort();
+      var rows = data.days.slice().reverse().filter(function (d) { return d.n || d.prompts; }).map(function (d) {
+        var by = {};
+        d.models.forEach(function (m) { by[m[0]] = m; });
+        return [dayName(d.d), d.prompts, d.n, compact(d.tokens), pct(d.rate, 0), money(d.cost)].concat(slots.map(function (i) {
+          return by[i] ? money(by[i][1]) : '';
+        }));
+      });
+      host.appendChild(grid(['日期', '提问', '回复', 'Tokens', '命中率', '费用'].concat(slots.map(slotName)), rows));
+    }
+
+    // ----- 日历：一格一天，颜色是当天回复的次数，和旁边的时段图量的是同一样东西 -----
+    function levels(values) {
+      var nz = values.filter(function (v) { return v > 0; }).sort(function (a, b) { return a - b; });
+      var q = function (p) { return nz.length ? nz[Math.min(nz.length - 1, Math.floor(p * nz.length))] : 0; };
+      var cut = [q(0.25), q(0.5), q(0.75)];
+      return function (v) { return !(v > 0) ? 0 : v <= cut[0] ? 1 : v <= cut[1] ? 2 : v <= cut[2] ? 3 : 4; };
+    }
+    function drawHeat(host) {
+      var by = {};
+      data.days.forEach(function (d) { by[d.d] = d; });
+      var end = new Date(data.range.to + 'T00:00:00'), from = new Date(data.range.from + 'T00:00:00');
+      // 至少画半年，日历的形状才看得出来；范围以外的格子留空
+      var start = new Date(Math.min(from, new Date(end.getFullYear(), end.getMonth(), end.getDate() - 181)));
+      start.setDate(start.getDate() - (start.getDay() + 6) % 7);           // 从周一开始
+      var weeks = Math.ceil((Math.round((end - start) / 864e5) + 1) / 7);
+      var W = Math.max(300, host.clientWidth), L = 26, T = 18;
+      var stepc = Math.max(9, Math.min(17, Math.floor((W - L) / weeks))), cell = stepc - 3;
+      var level = levels(data.days.map(function (d) { return d.n; }));
+      var s = svg('svg', { 'class': 'chart heat', width: L + weeks * stepc, height: T + 7 * stepc, role: 'img',
+        'aria-label': '每天的回复次数' });
+      [0, 2, 4].forEach(function (w) {
+        s.appendChild(svg('text', { x: 0, y: T + w * stepc + cell - 1, 'class': 'tick' }, '周' + WEEK[w]));
+      });
+      var lastMonth = -1, lastLabel = -9;
+      for (var w = 0; w < weeks; w++) {
+        for (var dw = 0; dw < 7; dw++) {
+          var t = new Date(start.getFullYear(), start.getMonth(), start.getDate() + w * 7 + dw);
+          if (t > end) continue;
+          var iso = t.getFullYear() + '-' + pad(t.getMonth() + 1) + '-' + pad(t.getDate()), d = by[iso];
+          if (dw === 0 && t.getMonth() !== lastMonth) {
+            lastMonth = t.getMonth();
+            if (w < weeks - 2 && w - lastLabel >= 3) {          // 挨得太近的月份名不写，免得叠在一起
+              s.appendChild(svg('text', { x: L + w * stepc, y: 11, 'class': 'tick' }, (t.getMonth() + 1) + '月'));
+              lastLabel = w;
+            }
+          }
+          var rect = svg('rect', { x: L + w * stepc, y: T + dw * stepc, width: cell, height: cell, rx: 2.5,
+            'class': 'cell ' + (d ? 'h' + level(d.n) : 'out') });
+          if (d) {
+            (function (d) {
+              hover(rect, function (e) {
+                showTip(e, [[d.n + ' 次', '回复'], [d.prompts + ' 次', '提问'], [money(d.cost), '费用'], [compact(d.tokens), 'tokens']],
+                  dayName(d.d));
+              });
+            })(d);
+          }
+          s.appendChild(rect);
+        }
+      }
+      var wrap = el('div', 'heatwrap');
+      wrap.appendChild(s);
+      host.appendChild(wrap);
+      var legend = el('div', 'legend scale');
+      legend.appendChild(el('span', null, '少'));
+      for (var i = 0; i <= 4; i++) legend.appendChild(el('i', 'cell h' + i));
+      legend.appendChild(el('span', null, '多'));
+      host.appendChild(legend);
+    }
+
+    // ----- 时段：一周七天 × 二十四小时，颜色是回复的次数 -----
+    function drawHours(host) {
+      var hrs = data.hours, flat = [].concat.apply([], hrs), level = levels(flat);
+      var W = Math.max(300, host.clientWidth), L = 30, T = 4, B = 18;
+      var stepc = Math.max(10, Math.min(30, Math.floor((W - L) / 24))), cell = stepc - 3;
+      var s = svg('svg', { 'class': 'chart', width: L + 24 * stepc, height: T + 7 * stepc + B, role: 'img', 'aria-label': '一周里各个时段的回复次数' });
+      for (var d = 0; d < 7; d++) {
+        s.appendChild(svg('text', { x: 0, y: T + d * stepc + cell - 1, 'class': 'tick' }, '周' + WEEK[d]));
+        for (var h = 0; h < 24; h++) {
+          var rect = svg('rect', { x: L + h * stepc, y: T + d * stepc, width: cell, height: cell, rx: 2.5, 'class': 'cell h' + level(hrs[d][h]) });
+          (function (d, h) {
+            hover(rect, function (e) { showTip(e, [[hrs[d][h] + ' 次', '回复']], '周' + WEEK[d] + ' ' + pad(h) + ':00–' + pad((h + 1) % 24) + ':00'); });
+          })(d, h);
+          s.appendChild(rect);
+        }
+      }
+      for (h = 0; h < 24; h += 3) s.appendChild(svg('text', { x: L + h * stepc, y: T + 7 * stepc + 12, 'class': 'tick' }, pad(h)));
+      host.appendChild(s);
+    }
+
+    // ----- 额度：应用隔一会儿记一次的 5 小时、7 天窗口用量 -----
+    function meter(label, v) {
+      var m = el('div', 'meter'), track = el('span', 'track'), fill = el('i');
+      var x = typeof v === 'number' ? v : null;
+      fill.style.width = Math.max(0, Math.min(100, x || 0)) + '%';
+      if (x >= 95) m.classList.add('crit'); else if (x >= 80) m.classList.add('warn');
+      track.appendChild(fill);
+      m.appendChild(el('span', 'ml', label));
+      m.appendChild(track);
+      m.appendChild(el('b', null, x == null ? '—' : x + '%' + (x >= 95 ? ' · 将满' : x >= 80 ? ' · 偏高' : '')));
+      return m;
+    }
+    function spark(points) {
+      var W = 160, H = 34;
+      var s = svg('svg', { 'class': 'spark', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' });
+      if (points.length < 2) return s;
+      var t0 = points[0][0], t1 = points[points.length - 1][0] || t0 + 1;
+      var path = points.map(function (p, i) {
+        return (i ? 'L' : 'M') + ((p[0] - t0) / Math.max(1, t1 - t0) * (W - 4) + 2).toFixed(1) + ',' + (H - 3 - p[1] / 100 * (H - 6)).toFixed(1);
+      }).join('');
+      s.appendChild(svg('line', { x1: 0, x2: W, y1: H - 3, y2: H - 3, 'class': 'axis' }));
+      s.appendChild(svg('path', { d: path, 'class': 'line' }));
+      return s;
+    }
+
+    function fillAccounts(list) {
+      var keep = acctSel.value || acct;
+      acctSel.length = 1;
+      list.filter(function (a) { return source === 'all' || a.src === source; }).forEach(function (a) {
+        var o = el('option', null, a.name + (a.email && a.email !== a.name ? '（' + a.email + '）' : ''));
+        o.value = a.key;
+        acctSel.appendChild(o);
+      });
+      acctSel.value = keep;
+      if (acctSel.value !== keep) { acct = ''; acctSel.value = ''; }
+    }
+
+    function draw() {
+      // 重画期间页面先撑着原来的高度：画图时要量宽度，量的那一刻内容还没画完，页面变矮会把滚动位置挤回去
+      st.style.minHeight = st.offsetHeight + 'px';
+      paint();
+      st.style.minHeight = '';
+    }
+    function paint() {
+      var d = data, t = d.total;
+      hideTip();                            // 指着的那一格马上要被换掉，它的提示框也收起
+      fillAccounts(d.accounts);
+      spanEl.textContent = d.range.from + ' → ' + d.range.to;
+      st.textContent = '';
+      if (!t.n && !d.prompts) { st.appendChild(el('p', 'empty', '这段时间里没有用量记录。')); return; }
+
+      // 开头：一个最主要的数字，再加一排小卡片
+      var top = el('section', 'st-hero'), big = el('div', 'big');
+      big.appendChild(el('b', null, cost(t)));
+      big.appendChild(el('span', null, '按 API 价格估算 · ' + (d.range.days ? '最近 ' + d.range.days + ' 天' : '全部时间')
+        + (t.unpriced ? ' · ' + t.unpriced + ' 次回复没有价格' : '')));
+      top.appendChild(big);
+      var kpis = el('div', 'kpis');
+      [['Tokens', compact(t.tokens), '其中输出 ' + compact(t.output)],
+        ['缓存命中率', pct(t.rate), '读缓存 ' + compact(t.cache_read)],
+        ['回复', compact(t.n), d.tools + ' 次工具调用'],
+        ['会话', d.sessions, d.prompts + ' 次提问'],
+        ['活跃天数', d.active_days, '最长连续 ' + d.best_streak + ' 天 · 当前 ' + d.streak + ' 天'],
+        ['最常用的模型', d.favorite ? d.favorite.name : '—', d.favorite ? pct(d.favorite.share, 0) + ' 的回复' : ''],
+        ['最忙的时段', d.peak ? '周' + WEEK[d.peak.weekday] + ' ' + pad(d.peak.hour) + ':00' : '—', d.peak ? d.peak.n + ' 次回复' : '']
+      ].forEach(function (k) {
+        var tile = el('div', 'kpi');
+        tile.appendChild(el('span', null, k[0]));
+        tile.appendChild(el('b', null, String(k[1])));
+        tile.appendChild(el('small', null, k[2]));
+        kpis.appendChild(tile);
+      });
+      top.appendChild(kpis);
+      st.appendChild(top);
+
+      var c = card('每天', '按模型分开'), redraw = null;
+      toggle(c.head, [['cost', '费用'], ['tokens', 'Tokens']], metric, function (v) {
+        metric = v;
+        store('st-metric', v);
+        redraw();
+      });
+      redraw = tableToggle(c, 'daily', drawDaily, dailyTable);
+
+      var two = el('div', 'two');
+      st.appendChild(two);
+      c = card('日历', '每天回复的次数');
+      two.appendChild(c.box);
+      drawHeat(c.body);
+      c = card('时段', '一周里什么时候在用');
+      two.appendChild(c.box);
+      drawHours(c.body);
+
+      c = card('模型', '颜色和上面每天的图一致');
+      c.body.appendChild(grid(['模型', '回复', '未缓存的输入', '输出', '其中思考', '读缓存', '写缓存', '命中率', '费用'], d.models.map(function (m) {
+        return [swatch(slotClass(m.slot), m.name), compact(m.n), compact(m.input), compact(m.output), compact(m.thinking),
+          compact(m.cache_read), compact(m.cache_write), pct(m.rate, 0), m.priced ? money(m.cost) : '—'];
+      }), { share: d.models.map(function (m) { return t.cost ? m.cost / t.cost : 0; }) }));
+
+      if (d.by_account.length || d.quota.length) {
+        c = card('账号', d.quota.length ? '额度是应用自己记下的最近一次：5 小时窗口和 7 天窗口用了多少' : '');
+        c.body.appendChild(grid(['账号', '会话', '回复', 'Tokens', '命中率', '费用'], d.by_account.map(function (a) {
+          return [a.key ? acctChip(a) : '（未知账号）', a.sessions, compact(a.n), compact(a.tokens), pct(a.rate, 0), cost(a)];
+        }), { share: d.by_account.map(function (a) { return t.cost ? a.cost / t.cost : 0; }) }));
+        if (d.quota.length) {
+          var qs = el('div', 'quota');
+          d.quota.forEach(function (q) {
+            var b = el('div', 'qcard'), h = el('div', 'qh');
+            h.appendChild(acctChip({ key: q.org, name: q.account, email: q.email }));
+            h.appendChild(el('small', null, '记于 ' + ago(q.t)));
+            b.appendChild(h);
+            b.appendChild(meter('5 小时', q.five_hour));
+            b.appendChild(meter('7 天', q.seven_day));
+            var sp = el('div', 'qs');
+            sp.appendChild(spark(q.trend));
+            sp.appendChild(el('small', null, '最近 7 天里 7 天窗口的变化'));
+            b.appendChild(sp);
+            qs.appendChild(b);
+          });
+          c.body.appendChild(qs);
+        }
+      }
+
+      two = el('div', 'two');
+      st.appendChild(two);
+      c = card('推理强度', '');
+      two.appendChild(c.box);
+      c.body.appendChild(grid(['推理强度', '回复', '输出', '其中思考', '费用'], d.efforts.map(function (e) {
+        return [e.effort || '（未记录）', compact(e.n), compact(e.output), compact(e.thinking), money(e.cost)];
+      }), { share: d.efforts.map(function (e) { return t.cost ? e.cost / t.cost : 0; }) }));
+      c = card('项目', '前 20 个');
+      two.appendChild(c.box);
+      c.body.appendChild(grid(['项目', '会话', '回复', 'Tokens', '费用'], d.projects.map(function (p) {
+        return [p.proj + (source === 'all' && p.src === 'codex' ? '（Codex）' : ''), p.sessions, compact(p.n), compact(p.tokens), cost(p)];
+      }), { share: d.projects.map(function (p) { return t.cost ? p.cost / t.cost : 0; }) }));
+      c = card('花得最多的会话', '');
+      var ol = el('ol', 'toplist');
+      d.top.forEach(function (x) {
+        var li = el('li'), a = el('a', null, x.title);
+        a.href = '/s/' + x.page;
+        li.appendChild(a);
+        var meta = el('small', null, x.proj + (x.account ? ' · ' + x.account : '') + ' · ' + compact(x.n) + ' 次回复');
+        li.appendChild(meta);
+        li.appendChild(el('b', null, cost(x)));
+        ol.appendChild(li);
+      });
+      c.body.appendChild(ol);
+    }
+
+    window.addEventListener('resize', debounce(function () { if (data) draw(); }, 200));
+    paintRange();
+    pickSource(store('src') || 'claude');
+    load();
   }
 })();

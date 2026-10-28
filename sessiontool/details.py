@@ -1,12 +1,13 @@
 """按需从原始记录里取大块内容：工具的完整输入输出、图片。
 
 引用格式是 "文件编号.行偏移.块下标"（工具结果里的图片再加一级下标），都来自索引，
-所以只能取到会话记录里已有的内容。
+所以只能取到会话记录里已有的内容。Codex 的记录先换成 Claude 的形状再取。
 """
 import base64
 import os
 import re
 
+from . import codex
 from .index import LOCAL_IMAGE, flatten_result, is_base64_image
 
 PERSISTED = re.compile(r'Full output saved to: ([^\r\n]+)')
@@ -26,9 +27,13 @@ def block(index, ref, parts=(3,)):
     nums = parse_ref(ref, parts)
     if not nums:
         return None, None
-    d = index.raw(nums[0], nums[1]) or {}
-    # 普通消息的内容在 message.content；回复进行中追加的消息在 attachment.prompt
-    content = (d.get('message') or {}).get('content') or (d.get('attachment') or {}).get('prompt')
+    d, src = index.raw(nums[0], nums[1])
+    d = d if isinstance(d, dict) else {}
+    if src == 'codex':
+        content = codex.content(d)
+    else:
+        # 普通消息的内容在 message.content；回复进行中追加的消息在 attachment.prompt
+        content = (d.get('message') or {}).get('content') or (d.get('attachment') or {}).get('prompt')
     if not isinstance(content, list) or nums[2] >= len(content) or not isinstance(content[nums[2]], dict):
         return None, nums
     return content[nums[2]], nums

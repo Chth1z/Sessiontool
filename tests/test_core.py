@@ -67,7 +67,8 @@ class Case(unittest.TestCase):
     def open(self):
         if self.app:
             self.app.index.close()
-        self.app = App(Sources(root=self.root, stores=[self.store], home=os.path.join(self.tmp.name, 'home')))
+        self.app = App(Sources(root=self.root, stores=[self.store], home=os.path.join(self.tmp.name, 'home'),
+                               codex=os.path.join(self.tmp.name, 'codex'), profile=os.path.join(self.tmp.name, 'claude.json')))
         self.app.catalog.refresh(force=True)
         return self.app.catalog
 
@@ -78,7 +79,7 @@ class Case(unittest.TestCase):
     def serve(self):
         """启动一个只在测试里用的服务，返回 get(path) → (状态码, 正文, 响应)。"""
         httpd = make_server(self.app, 0)
-        port = httpd.server_address[1]
+        port = self.port = httpd.server_address[1]
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
@@ -317,8 +318,10 @@ class ExtrasTest(Case):
         info = json.loads(json.dumps(cat.info(s)))          # 必须能原样转成 JSON
         self.assertEqual((info['id'], info['cli'], info['resume']), ('local_s1', 'bbbb2222', 'claude --resume bbbb2222'))
         self.assertEqual([(f['id'], f['current']) for f in info['files']], [('aaaa1111', False), ('bbbb2222', True)])
-        self.assertEqual(info['tokens'], {'input': 30, 'output': 157, 'cache_read': 3000, 'cache_write': 15})
-        self.assertEqual(info['models'], [['claude-test-1', 3]])
+        u = info['usage']
+        self.assertEqual((u['n'], u['input'], u['output'], u['cache_read'], u['cache_write']), (3, 30, 157, 3000, 15))
+        self.assertEqual([(m['model'], m['n'], m['priced']) for m in u['models']], [('claude-test-1', 3, False)])
+        self.assertEqual((u['cost'], u['unpriced']), (0, 3))           # 没有价格的模型不计费，单独记数
         counts = info['counts']
         self.assertEqual((counts['prompts'], counts['tools'], counts['changed'], counts['records']), (2, 1, 1, 2))
         self.assertEqual((info['effort'], info['turns'], info['branches'], info['status']['status_detail']), ('high', 2, ['feature-x'], 'done'))

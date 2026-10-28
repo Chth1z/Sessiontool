@@ -2,6 +2,7 @@
 
 记录文件只会追加，所以索引记住每个文件读到的位置，下次只读新增的部分。
 索引里只存文字和位置；图片、工具的完整输入输出留在原文件里，用到时按偏移量取。
+每次回复的 token 用量另存一张表，统计时不必再读消息。
 """
 import hashlib
 import json
@@ -10,19 +11,26 @@ import re
 import sqlite3
 import threading
 
-SCHEMA = 7
+from . import codex
+
+SCHEMA = 8
 LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
+EMAIL = re.compile(r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)')
 
 DDL = """
-CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, cli TEXT, size INT, mtime INT,
-                   off INT, guard TEXT, title TEXT, cwd TEXT);
+CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, src TEXT, cli TEXT, size INT, mtime INT, off INT, guard TEXT,
+                   title TEXT, cwd TEXT, email TEXT, org TEXT, ctx TEXT);
 CREATE TABLE rec(id INTEGER PRIMARY KEY, file INT, off INT, uuid TEXT, parent TEXT, ts TEXT, sid TEXT,
                  kind TEXT, data TEXT, text TEXT, tool TEXT);
 CREATE INDEX rec_file ON rec(file, off);
+CREATE TABLE usage(file INT, off INT, mid TEXT, ts TEXT, sid TEXT, model TEXT, effort TEXT, speed TEXT,
+                   inp INT, out INT, cr INT, cw5 INT, cw1h INT, web INT, think INT);
+CREATE INDEX usage_file ON usage(file);
 CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
 """
+USAGE_COLS = ('mid', 'ts', 'sid', 'model', 'effort', 'speed', 'inp', 'out', 'cr', 'cw5', 'cw1h', 'web', 'think')
 
-HINT_KEYS = ('description', 'file_path', 'command', 'pattern', 'query', 'url', 'skill', 'prompt', 'path')
+HINT_KEYS = ('description', 'file_path', 'command', 'cmd', 'pattern', 'query', 'url', 'skill', 'prompt', 'path')
 
 
 def tool_hint(inp):
@@ -138,12 +146,8 @@ def parse_record(d, sidechain=False):
         if msg.get('model') == '<synthetic>' or d.get('isApiErrorMessage'):
             data['synthetic'] = 1
         elif t == 'assistant' and msg.get('id'):
-            # 一次回复按内容块拆成多行，每行都带同一份用量；统计时按消息编号只算一次
-            u = msg.get('usage') or {}
             data['mid'] = msg['id']
             data['model'] = msg.get('model') or ''
-            data['usage'] = [int(u.get(k) or 0) for k in ('input_tokens', 'output_tokens', 'cache_read_input_tokens',
-                                                           'cache_creation_input_tokens')]
         origin = (d.get('origin') or {}).get('kind')
         if origin:
             data['origin'] = origin
@@ -169,6 +173,22 @@ def parse_record(d, sidechain=False):
     return link
 
 
+def claude_usage(d):
+    """助手消息那一行上的用量。一次回复拆成多行时每行都带同一份，统计时按消息编号去重。"""
+    msg = d.get('message') or {}
+    if d.get('type') != 'assistant' or not msg.get('id') or msg.get('model') == '<synthetic>' or d.get('isApiErrorMessage'):
+        return None
+    u = msg.get('usage') or {}
+    n = lambda x: int(x or 0) if isinstance(x, (int, float)) else 0
+    cw = n(u.get('cache_creation_input_tokens'))
+    cw1h = min(cw, n((u.get('cache_creation') or {}).get('ephemeral_1h_input_tokens')))
+    return {'mid': msg['id'], 'model': msg.get('model') or '', 'effort': d.get('effort') or d.get('perTurnEffort') or '',
+            'speed': u.get('speed') or '', 'inp': n(u.get('input_tokens')), 'out': n(u.get('output_tokens')),
+            'cr': n(u.get('cache_read_input_tokens')), 'cw5': cw - cw1h, 'cw1h': cw1h,
+            'web': n((u.get('server_tool_use') or {}).get('web_search_requests')),
+            'think': n((u.get('output_tokens_details') or {}).get('thinking_tokens'))}
+
+
 class Index:
     def __init__(self, sources):
         self.sources = sources
@@ -182,7 +202,8 @@ class Index:
         except sqlite3.OperationalError:
             row = None
         if not row or row[0] != str(SCHEMA):
-            con.executescript('DROP TABLE IF EXISTS rec; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS meta;' + DDL)
+            con.executescript('DROP TABLE IF EXISTS rec; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS usage;'
+                              'DROP TABLE IF EXISTS meta;' + DDL)
             con.execute("INSERT INTO meta VALUES('schema', ?)", (str(SCHEMA),))
             con.commit()
 
@@ -219,41 +240,59 @@ class Index:
             con = self.con()
             known = {r['path']: r for r in con.execute('SELECT * FROM files')}
             todo = []
-            for p in self.sources.transcripts():
+            for p, src in self.sources.transcripts():
                 try:
                     st = os.stat(p)
                 except OSError:
                     continue
                 k = known.pop(p, None)
                 if not k or k['size'] != st.st_size or k['mtime'] != st.st_mtime_ns:
-                    todo.append((p, st, k))
-            for i, (p, st, k) in enumerate(todo, 1):
+                    todo.append((p, src, st, k))
+            for i, (p, src, st, k) in enumerate(todo, 1):
                 if progress:
                     progress(i, len(todo), p, st.st_size - (k['off'] if k else 0))
-                self._parse(con, p, st, k)
+                self._parse(con, p, src, st, k)
                 con.commit()
             for k in known.values():
-                con.execute('DELETE FROM rec WHERE file=?', (k['id'],))
+                for table in ('rec', 'usage'):
+                    con.execute('DELETE FROM %s WHERE file=?' % table, (k['id'],))
                 con.execute('DELETE FROM files WHERE id=?', (k['id'],))
             con.commit()
             return len(todo) + len(known)
 
-    def _parse(self, con, path, st, known):
-        start, title, cwd, last_ts = 0, None, None, ''
+    def _parse(self, con, path, src, st, known):
+        start, title, cwd, email, org, ctx = 0, None, None, None, None, {}
         if known:
             fid = known['id']
             if st.st_size >= known['off'] and self._guard(path, known['off']) == known['guard']:
-                start, title, cwd = known['off'], known['title'], known['cwd']
-                row = con.execute('SELECT ts FROM rec WHERE file=? ORDER BY off DESC LIMIT 1', (fid,)).fetchone()
-                last_ts = row[0] if row else ''
+                start, title, cwd, email, org = known['off'], known['title'], known['cwd'], known['email'], known['org']
+                ctx = json.loads(known['ctx'] or '{}')
             else:
-                con.execute('DELETE FROM rec WHERE file=?', (fid,))
+                for table in ('rec', 'usage'):
+                    con.execute('DELETE FROM %s WHERE file=?' % table, (fid,))
         else:
             cli = os.path.splitext(os.path.basename(path))[0]
-            fid = con.execute('INSERT INTO files(path, cli, size, mtime, off, guard) VALUES(?,?,0,0,0,?)',
-                              (path, cli, '')).lastrowid
-        rows, off = [], start
+            if src == 'codex':          # rollout-<时间>-<线程 ID>
+                cli = cli[-36:]
+            fid = con.execute('INSERT INTO files(path, src, cli, size, mtime, off, guard) VALUES(?,?,?,0,0,0,?)',
+                              (path, src, cli, '')).lastrowid
+        rows, uses, off = [], [], start
+        last_ts = ctx.get('ts', '')
+        if src == 'claude' and known and start:
+            row = con.execute('SELECT ts FROM rec WHERE file=? ORDER BY off DESC LIMIT 1', (fid,)).fetchone()
+            last_ts = row[0] if row else ''
         sidechain = is_agent_file(path)
+
+        def flush():
+            con.executemany('INSERT INTO rec(file,off,uuid,parent,ts,sid,kind,data,text,tool) VALUES(?,?,?,?,?,?,?,?,?,?)', rows)
+            con.executemany('INSERT INTO usage(file,off,%s) VALUES(?,?%s)' % (','.join(USAGE_COLS), ',?' * len(USAGE_COLS)), uses)
+            del rows[:], uses[:]
+
+        def used(use, sid):
+            use.setdefault('ts', last_ts)
+            use.setdefault('sid', sid or '')
+            uses.append((fid, off) + tuple(use[k] for k in USAGE_COLS))
+
         with open(path, 'rb') as f:
             f.seek(start)
             while True:
@@ -267,45 +306,78 @@ class Index:
                         break           # 正在写入的半行，下次再读
                     off += len(line)
                     continue
-                if isinstance(d, dict):
-                    if d.get('type') == 'custom-title' and d.get('customTitle'):
+                if isinstance(d, dict) and src == 'codex':
+                    last_ts = d.get('timestamp') or last_ts
+                    recs, use = codex.parse_line(d, ctx)
+                    for i, (kind, data, text, tool) in enumerate(recs):
+                        # Codex 的行没有编号：用位置和线程 ID 拼一个，前 8 位是位置，当页面里的锚点
+                        uuid = '%08x%s-%s' % (off & 0xffffffff, '' if i == 0 else '.%d' % i, ctx.get('sid') or fid)
+                        rows.append((fid, off, uuid, ctx.get('last'), last_ts, ctx.get('sid'), kind,
+                                     json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
+                        ctx['last'] = uuid
+                    if use:
+                        used(use, ctx.get('sid'))
+                elif isinstance(d, dict):
+                    t = d.get('type')
+                    if t == 'custom-title' and d.get('customTitle'):
                         title = d['customTitle']
+                    elif t == 'attachment':
+                        a = d.get('attachment') or {}
+                        if a.get('type') == 'session_context':
+                            m = EMAIL.search(str((a.get('context') or {}).get('userEmail') or ''))
+                            email = m.group(1) if m else email
+                        elif a.get('type') == 'credential_org' and a.get('organizationUuid'):
+                            org = a['organizationUuid']
                     cwd = cwd or d.get('cwd')
                     if d.get('uuid'):
                         last_ts = d.get('timestamp') or last_ts
                         kind, data, text, tool = parse_record(d, sidechain)
                         rows.append((fid, off, d['uuid'], d.get('parentUuid'), last_ts, d.get('sessionId'), kind,
                                      json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
+                        use = claude_usage(d)
+                        if use:
+                            used(use, d.get('sessionId'))
                 off += len(line)
-                if len(rows) >= 2000:
-                    con.executemany('INSERT INTO rec(file,off,uuid,parent,ts,sid,kind,data,text,tool) '
-                                    'VALUES(?,?,?,?,?,?,?,?,?,?)', rows)
-                    rows = []
-        con.executemany('INSERT INTO rec(file,off,uuid,parent,ts,sid,kind,data,text,tool) VALUES(?,?,?,?,?,?,?,?,?,?)', rows)
-        con.execute('UPDATE files SET size=?, mtime=?, off=?, guard=?, title=?, cwd=? WHERE id=?',
-                    (st.st_size, st.st_mtime_ns, off, self._guard(path, off), title, cwd, fid))
+                if len(rows) + len(uses) >= 2000:
+                    flush()
+        flush()
+        if src == 'codex':
+            ctx['ts'] = last_ts
+            cwd = ctx.get('cwd') or cwd
+        con.execute('UPDATE files SET size=?, mtime=?, off=?, guard=?, title=?, cwd=?, email=?, org=?, ctx=? WHERE id=?',
+                    (st.st_size, st.st_mtime_ns, off, self._guard(path, off), title, cwd, email, org,
+                     json.dumps(ctx, ensure_ascii=False) if ctx else None, fid))
 
     # ---------- 读取 ----------
 
     def files(self):
         return [dict(r) for r in self.con().execute('SELECT * FROM files ORDER BY path')]
 
-    def rows(self, file_id):
-        return self.con().execute('SELECT id,file,off,uuid,parent,ts,sid,kind,data FROM rec WHERE file=? ORDER BY off',
-                                  (file_id,)).fetchall()
+    def rows(self, file_id, start=0):
+        """一份记录里的各行（start：只要从这个位置起的），按位置排。"""
+        return self.con().execute('SELECT id,file,off,uuid,parent,ts,sid,kind,data FROM rec WHERE file=? AND off>=? ORDER BY off',
+                                  (file_id, start)).fetchall()
 
     def raw(self, file_id, off):
-        """按索引里登记过的位置，从原文件读回完整的一行。"""
+        """按索引里登记过的位置，从原文件读回完整的一行。返回 (这一行, 来源)。"""
         con = self.con()
         if not con.execute('SELECT 1 FROM rec WHERE file=? AND off=?', (file_id, off)).fetchone():
-            return None
-        row = con.execute('SELECT path FROM files WHERE id=?', (file_id,)).fetchone()
+            return None, None
+        row = con.execute('SELECT path, src FROM files WHERE id=?', (file_id,)).fetchone()
         try:
             with open(row['path'], 'rb') as f:
                 f.seek(off)
-                return json.loads(f.readline())
+                return json.loads(f.readline()), row['src']
         except (OSError, ValueError):
-            return None
+            return None, None
+
+    def usage(self, files=None):
+        """每次回复的用量，同一次回复（消息编号相同）只取最早的一份。files 限定在这些文件里。"""
+        where = ' WHERE file IN (%s)' % ','.join('%d' % int(f) for f in files) if files is not None else ''
+        if files is not None and not files:
+            return []
+        return self.con().execute('SELECT file, %s, MIN(ts) AS ts FROM usage%s GROUP BY mid ORDER BY ts'
+                                  % (','.join(c for c in USAGE_COLS if c != 'ts'), where)).fetchall()
 
     def search(self, terms, tools=False, limit=3000):
         """每个词都要出现在同一条消息里（文字；tools=True 时工具调用与输出也算）。"""

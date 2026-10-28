@@ -2,6 +2,7 @@
 
 两种页面：服务模式（工具详情和图片按需向本地服务要），以及独立文件模式（导出用，所有内容内嵌）。
 """
+import bisect
 import collections
 import html
 import json
@@ -10,6 +11,8 @@ import re
 import zlib
 from datetime import datetime
 from urllib.parse import quote
+
+from .pricing import model_name
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 WEEK = '一二三四五六日'
@@ -195,6 +198,31 @@ def tokens(n):
     return '%.0fk' % (n / 1000.0) if isinstance(n, (int, float)) else '?'
 
 
+def num(n):
+    """1234 → 1.2k，12345678 → 12.3M。"""
+    for div, unit in ((1e9, 'B'), (1e6, 'M'), (1e3, 'k')):
+        if n >= div:
+            return ('%.1f' % (n / div)).rstrip('0').rstrip('.') + unit
+    return str(n)
+
+
+def money(x):
+    """按 API 价格估算的美元数：$0.004、$1.23、$1,234。"""
+    if x is None:
+        return '—'
+    if x >= 1000:
+        return '$' + format(round(x), ',')
+    return '$%.2f' % x if x >= 0.01 or not x else '$%.3f' % x
+
+
+def acct_chip(a, cls='acct'):
+    """账号的小标签：邮箱 @ 前面那段，悬停看完整邮箱。颜色由邮箱决定，同一个账号到处一个颜色。"""
+    if not a:
+        return ''
+    tip = '账号：' + (a['email'] or a['name']) + ('\nmulti-claude 配置：' + a['profile'] if a.get('profile') else '')
+    return '<span class="%s" style="--h:%d" title="%s"><i></i>%s</span>' % (cls, hue(a['email'] or a['key']), esc(tip), esc(a['name']))
+
+
 def looks_like_path(s):
     return bool(re.match(r'([A-Za-z]:[\\/]|/|~[\\/])', s)) and '\n' not in s
 
@@ -257,6 +285,9 @@ ICONS = {
     'right': '<path d="M9 5l7 7-7 7"/>',
     'search': '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
     'keys': '<rect x="3" y="6" width="18" height="12" rx="2.5"/><path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8" stroke-width="2.2"/>',
+    'list': '<path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01" stroke-width="2"/>',
+    'chart': '<path d="M4 20h16"/><path d="M7 16v-5M12 16V6M17 16v-8"/>',
+    'table': '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 10h17M3.5 15h17M10 10v9.5"/>',
 }
 SPRITE = ('<svg xmlns="http://www.w3.org/2000/svg" style="display:none">'
           + ''.join('<symbol id="i-%s" viewBox="0 0 24 24">%s</symbol>' % kv for kv in ICONS.items()) + '</svg>')
@@ -277,8 +308,9 @@ MINOR = ('stop', 'auto', 'notice', 'note', 'compact', 'cmd', 'summary', 'think')
 
 
 def keyed(block):
-    """给顶层的块打上内容指纹。页面刷新时只替换指纹变了的块，其余块的展开状态和已加载的内容都不动。"""
-    return block.replace('>', ' data-k="%08x">' % (zlib.crc32(block.encode('utf-8')) & 0xffffffff), 1)
+    """给顶层的块打上内容指纹 → (块, 指纹)。页面更新时只替换指纹变了的块，其余块的展开状态和已加载的内容都不动。"""
+    k = '%08x' % (zlib.crc32(block.encode('utf-8')) & 0xffffffff)
+    return block.replace('>', ' data-k="%s">' % k, 1), k
 
 
 def duration(a, b):
@@ -368,12 +400,24 @@ class ServerMode:
 
 
 class Renderer:
-    def __init__(self, mode, cwd=''):
+    def __init__(self, mode, cwd='', codex=False, spend=None):
         self.mode = mode
         self.cwd = cwd
+        self.who = ('Codex', 'X', ' cx') if codex else ('Claude', 'C', '')     # 答复的署名、头像上的字、样式
+        self.spend = spend or []            # [(时间, 费用, 输出 token)]，按时间排好
+        self.stamps = [x[0] for x in self.spend]
         self.ids = set()
         self.toc = []
+        self.keys = []                      # 顶层各块的内容指纹，和块一一对应
         self.day = None
+
+    def cost(self, start, end):
+        """[start, end) 之间各次回复的费用合计；这段时间没有这个会话自己的用量时为 None。"""
+        if not self.stamps or not start:
+            return None
+        i = bisect.bisect_left(self.stamps, start)
+        j = bisect.bisect_left(self.stamps, end) if end else len(self.stamps)
+        return sum(x[1] for x in self.spend[i:j]) if j > i else None
 
     def anchor(self, prefix, u):
         key = prefix + u
@@ -414,10 +458,11 @@ class Renderer:
                 '<button type="button" class="copy">复制</button></header>%s%s</div></section>'
                 % (anchor, self.stamp(it['ts']), num, tag, body, self.pics(self.mode.image(r) for r in it['imgs'])))
 
-    def final(self, it):
-        return ('<section class="msg asst"%s><div class="av">C</div><div class="mc"><header><b>Claude</b>%s'
+    def final(self, it, cost=None):
+        spent = '<span class="spent" title="这一轮的用量按 API 价格估算">%s</span>' % money(cost) if cost else ''
+        return ('<section class="msg asst%s"%s><div class="av">%s</div><div class="mc"><header><b>%s</b>%s%s'
                 '<button type="button" class="copy">复制</button></header><div class="body">%s</div></div></section>'
-                % (self.anchor('m-', it['u']), self.stamp(it['ts']), md(it['text'])))
+                % (self.who[2], self.anchor('m-', it['u']), self.who[1], self.who[0], self.stamp(it['ts']), spent, md(it['text'])))
 
     def step(self, it):
         return '<div class="step"%s>%s<div class="body">%s</div></div>' % (self.anchor('m-', it['u']), self.stamp(it['ts']), md(it['text']))
@@ -473,7 +518,8 @@ class Renderer:
                     % (self.anchor('m-', it['u']), fmt(it['ts'], '%H:%M'), md(it['text'])))
         if k == 'compact':
             how = {'auto': '自动', 'manual': '手动'}.get(it['trigger'], '')
-            return self.line('上下文已%s压缩（%s → %s tokens）' % (how, tokens(it['pre']), tokens(it['post'])), it['ts'])
+            size = '（%s → %s tokens）' % (tokens(it['pre']), tokens(it['post'])) if it.get('pre') else ''
+            return self.line('上下文已%s压缩%s' % (how, size), it['ts'])
         if k == 'note':
             return '<details class="fold sys"><summary>系统通知 · %s</summary><pre>%s</pre></details>' % (fmt(it['ts'], '%H:%M'), esc(it['text'][:5000]))
         if k == 'cmd':
@@ -497,8 +543,8 @@ class Renderer:
             out.append(self.step(it) if k == 'asst' else self.tools(it) if k == 'tools' else self.sent(it) if k == 'sent' else self.minor(it))
         return out
 
-    def steps(self, t, main):
-        """中间过程：可以整块折起来，只留最终答复。"""
+    def steps(self, t, main, cost=None):
+        """中间过程：可以整块折起来，只留最终答复。cost 是这一轮的费用估算。"""
         says = sum(1 for it in t['steps'] if it['kind'] == 'asst')
         calls = sum(len(it['tools']) for it in t['steps'] if it['kind'] == 'tools')
         shots = sum(x['nimg'] for it in t['steps'] if it['kind'] == 'tools' for x in it['tools'])
@@ -509,6 +555,8 @@ class Renderer:
         took = duration(start, end)
         if took:
             parts.append('用时 ' + took)
+        if cost:
+            parts.append(money(cost))
         if not t['finals']:
             parts.append('这一轮没有最终答复')
         # 过程长的时候，读到底部也给一个折起的入口，不用滚回去找开头那一行
@@ -517,14 +565,20 @@ class Renderer:
                 '<div class="rail">%s%s</div></details>' % (' · '.join(parts), ''.join(self.flow(t['steps'], main)), fold))
 
     def conversation(self, items, main=True):
-        """→ 顶层块的列表：日期分隔、一轮对话、复刻点、旧分支。主对话里的块带内容指纹。"""
+        """→ 顶层块的列表：日期分隔、一轮对话、复刻点、旧分支。主对话里的块带内容指纹（记在 self.keys）。"""
         out = []
 
         def emit(block):
             if block:
-                out.append(keyed(block) if main else block)
+                if main:
+                    block, k = keyed(block)
+                    self.keys.append(k)
+                out.append(block)
 
-        for t in split_turns(items):
+        turns = split_turns(items)
+        # 每一轮从你的提问开始，到下一轮的提问为止；这段时间里的回复用量算这一轮的
+        starts = [None if t.get('mark') else (t['prompt'] or (t['steps'] + t['finals'] + t['tail'])[0]).get('ts') for t in turns]
+        for i, t in enumerate(turns):
             mark = t.get('mark')
             if mark and mark['kind'] == 'fork':
                 emit('<div class="forkline"><span>以上来自原会话 · 从这里开始是复刻后的内容</span></div>')
@@ -534,11 +588,13 @@ class Renderer:
                 emit('<details class="fold branch"><summary>改写前的旧分支（%d 条消息，应用里已不显示）· %s</summary>%s</details>'
                      % (n, fmt(mark['ts'], '%H:%M'), ''.join(self.conversation(mark['items'], main=False))))
             else:
+                cost = self.cost(starts[i], next((x for x in starts[i + 1:] if x), None)) if main else None
                 emit(self.daymark(t['prompt'] or (t['steps'] + t['finals'] + t['tail'])[0], main))
                 parts = [self.user(t['prompt'], main)] if t['prompt'] else []
-                parts += self.flow(t['steps'], main) if t['plain'] else [self.steps(t, main)]
-                for f in t['finals']:
-                    parts += [self.daymark(f, main), self.final(f)]
+                parts += self.flow(t['steps'], main) if t['plain'] else [self.steps(t, main, cost)]
+                for k, f in enumerate(t['finals']):
+                    last = t['plain'] and k == len(t['finals']) - 1     # 没有过程可折的一轮，费用写在答复上
+                    parts += [self.daymark(f, main), self.final(f, cost if last else None)]
                 parts += self.flow(t['tail'], main)
                 emit('<article class="turn">%s</article>' % ''.join(parts))
         return out
@@ -558,9 +614,12 @@ def changed_files(c, cwd):
     return '<details class="files"><summary>修改过 %d 个文件</summary><ul>%s</ul></details>' % (len(c['changed']), ''.join(rows))
 
 
-VIEW = ('<div class="seg" id="view" title="完整：全部内容；对话：隐藏工具调用；结果：折起中间过程，只留每轮的最终答复（按 1 / 2 / 3 切换）">'
-        '<button type="button" data-v="full">完整</button><button type="button" data-v="chat">对话</button>'
-        '<button type="button" data-v="result">结果</button></div>')
+VIEW = ('<div class="seg" id="view" title="完整：全部内容；思考：完整内容，并展开每一段思考；对话：隐藏工具调用；'
+        '结果：折起中间过程，只留每轮的最终答复（按 1 / 2 / 3 / 4 切换）">'
+        '<button type="button" data-v="full">完整</button><button type="button" data-v="think">思考</button>'
+        '<button type="button" data-v="chat">对话</button><button type="button" data-v="result">结果</button></div>')
+LIVE = ('<button type="button" class="live" data-act="live" title="实时更新：有新记录时自动显示，不用刷新页面（点击暂停或继续）">'
+        '<i></i><span>实时</span></button>')
 
 
 def embed(name, data):
@@ -568,13 +627,30 @@ def embed(name, data):
     return '<script type="application/json" id="%s">%s</script>' % (name, json.dumps(data, ensure_ascii=False).replace('</', '<\\/'))
 
 
-def session_page(s, c, mode, parent=None, state='', back=None, info=None):
-    """parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此发现新记录。
+def cost_text(u):
+    """会话或分组的费用：价格未知的模型不计入，有这种情况时金额后面加个 +。"""
+    if u['cost']:
+        return money(u['cost']) + ('+' if u['unpriced'] else '')
+    return '价格未知' if u['unpriced'] else money(0)
+
+
+def usage_tip(u):
+    rate = '，缓存命中 %.1f%%' % (u['rate'] * 100) if u.get('rate') is not None else ''
+    return '按 API 价格估算：%d 次回复，%s tokens%s。订阅不按 token 计费，这是同样的用量按 API 计价的金额。' % (
+        u['n'], num(u['tokens']), rate)
+
+
+def session_view(s, c, mode, parent=None, state='', back=None, info=None):
+    """会话页的各部分，整页由 session_html 拼起来。服务把变了的块单独发给已经打开的页面，所以分开存放。
+
+    parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此实时更新。
     back: (地址, 文字)，子代理页用它回到调用它的会话。info: 详情面板的数据。"""
-    r = Renderer(mode, s.cwd)
-    body = r.conversation(c['items'])
+    codex = getattr(s, 'src', '') == 'codex'
+    r = Renderer(mode, s.cwd, codex, None if back else c.get('spend'))
+    blocks = r.conversation(c['items'])
     live = not mode.standalone and not back         # 有本地服务可问、并且是一个真正的会话
-    ident = (info or {}).get('id') or (info or {}).get('cli')
+    info = info or {}
+    ident = info.get('id') or info.get('cli')
     facts = []
     if ident:
         facts.append('<button type="button" class="idchip" data-copy="%s" data-copied="会话 ID" title="点击复制完整的会话 ID：%s">'
@@ -585,9 +661,17 @@ def session_page(s, c, mode, parent=None, state='', back=None, info=None):
         facts.append('<span>由 %d 份记录合并</span>' % c['nfiles'])
     if c.get('n_branch'):
         facts.append('<span>%d 处改写</span>' % c['n_branch'])
+    if getattr(s, 'model', ''):
+        facts.append('<span>%s%s</span>' % (esc(model_name(s.model)), ' · ' + esc(s.effort) if s.effort else ''))
+    u = c.get('usage')
+    if u and u['n'] and not back:
+        facts.append('<span class="spent" title="%s">%s</span>' % (esc(usage_tip(u)), cost_text(u)))
     if info:
         facts.append('<button type="button" class="linkish" data-act="info">详情</button>')
     crumbs = '<span class="proj" title="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span>' % (esc(s.cwd), hue(s.proj), esc(s.proj))
+    crumbs += acct_chip(info.get('account'))
+    if codex:
+        crumbs += '<span class="badge cx">Codex</span>'
     if parent:
         crumbs += '<span class="badge">复刻自 %s</span>' % (
             esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1])))
@@ -599,12 +683,11 @@ def session_page(s, c, mode, parent=None, state='', back=None, info=None):
     if info:
         tools += ibutton('info', '会话详情（I）', ' data-act="info"')
     if live:
-        tools = ibutton('refresh', '刷新，读取最新记录（R）', ' data-act="refresh"') + tools
-        if not s.orphan:
-            tools += ('<a class="ib" href="claude://claude.ai/epitaxy/%s" title="在 Claude 应用中打开这个会话" aria-label="在 Claude 应用中打开">%s</a>'
-                      % (esc(s.id), icon('open')))
-        more += ('<button type="button" data-act="auto" role="menuitemcheckbox">有新记录时自动刷新</button>'
-                 '<a href="/export/%s.html">导出 HTML<small>单个文件，可离线打开</small></a>'
+        tools = LIVE + ibutton('refresh', '立刻重读磁盘（R）', ' data-act="refresh"') + tools
+        if info.get('link'):
+            tools += ('<a class="ib" href="%s" title="在 Claude 应用中打开这个会话（有多个 Claude 时由系统默认的那个打开）" '
+                      'aria-label="在 Claude 应用中打开">%s</a>' % (esc(info['link']), icon('open')))
+        more += ('<a href="/export/%s.html">导出 HTML<small>单个文件，可离线打开</small></a>'
                  '<a href="/export/%s.html?images=1">导出 HTML（含截图）<small>文件可能很大</small></a>'
                  '<a href="/export/%s.md">导出 Markdown<small>只有对话文字</small></a>' % (s.page, s.page, s.page))
     more += '<button type="button" data-act="keys">键盘快捷键<small>按 ? 也可以打开</small></button>'
@@ -619,22 +702,52 @@ def session_page(s, c, mode, parent=None, state='', back=None, info=None):
         home = '<a class="back" href="%s">%s%s</a>' % (back[0], icon('left'), esc(back[1]))
     else:
         home = '' if mode.standalone else '<a class="back" href="/">%s全部会话</a>' % icon('left')
+    toc = ''.join(r.toc)
     nav = (home + '<div class="jump"><button type="button" data-act="top">%s开头</button>'
            '<button type="button" data-act="end">%s最新</button></div>'
-           '<div class="navhead">提问目录</div><div class="toc">' % (icon('up'), icon('down')) + ''.join(r.toc) + '</div>')
+           '<div class="navhead">提问目录</div><div class="toc">' % (icon('up'), icon('down')) + toc + '</div>')
     attrs = ' data-page="%s" data-state="/api/state?page=%s" data-sig="%s"' % (s.page, s.page, state) if live else ''
+    if codex:
+        attrs += ' data-src="codex"'
+    head_html = ''.join(['<header class="head"><div class="crumbs">', crumbs, '</div><h1>', esc(c['title']), '</h1><div class="facts">',
+                         ''.join(facts), '</div>', changed_files(c, s.cwd), '</header>'])
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号
-    return ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '>', SPRITE,
-                    '<div class="progress"></div><div class="layout"><nav>', nav, '</nav><main>', bar,
-                    '<header class="head"><div class="crumbs">', crumbs, '</div><h1>', esc(c['title']), '</h1><div class="facts">',
-                    ''.join(facts), '</div>', changed_files(c, s.cwd), '</header><div id="flow">', '\n'.join(body),
-                    '</div></main></div>', embed('info', info) if info else '', scripts(mode.standalone), '</body></html>'])
-
-# ---------- 索引页 ----------
+    top = ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '>', SPRITE,
+                   '<div class="progress"></div><div class="layout"><nav>', nav, '</nav><main>', bar])
+    return {'title': c['title'], 'sig': state, 'top': top, 'head': head_html, 'toc': toc, 'blocks': blocks, 'keys': r.keys,
+            'info': info or None, 'standalone': mode.standalone}
 
 
-def index_row(s, c, depth, now, i):
+def session_html(v):
+    return ''.join([v['top'], v['head'], '<div id="flow">', '\n'.join(v['blocks']), '</div></main></div>',
+                    embed('info', v['info']) if v['info'] else '', scripts(v['standalone']), '</body></html>'])
+
+
+def session_page(s, c, mode, parent=None, state='', back=None, info=None):
+    return session_html(session_view(s, c, mode, parent, state, back, info))
+
+# ---------- 索引页、统计页 ----------
+
+
+def sidebar(counts, page):
+    """左边栏的上半截：标识；来源（Claude / Codex / 全部，有 Codex 的会话才显示）；会话列表和统计两个页面。"""
+    srcs = ''
+    if counts.get('codex'):
+        srcs = ('<div class="seg srcs" id="src" title="只看 Claude、只看 Codex，或者两个一起">'
+                '<button type="button" data-s="claude">Claude<small>%d</small></button>'
+                '<button type="button" data-s="codex">Codex<small>%d</small></button>'
+                '<button type="button" data-s="all">全部</button></div>' % (counts.get('claude', 0), counts['codex']))
+    on = lambda p: ' class="on" aria-current="page"' if p == page else ''
+    return ('<a class="brand" href="/"><img src="/static/icon.svg" width="28" height="28" alt="">'
+            '<span>Sessiontool<small>会话记录与用量</small></span></a>' + srcs
+            + '<nav class="pages"><a href="/"%s>%s会话</a><a href="/stats"%s>%s统计</a></nav>' % (on('list'), icon('list'),
+                                                                                              on('stats'), icon('chart')))
+
+
+def index_row(s, c, depth, now, i, accounts):
     tags = ''
+    if s.src == 'codex':
+        tags += '<span class="badge cx srcb">Codex</span>'
     if s.parent:
         tags += '<span class="badge">复刻</span>'
     if s.archived:
@@ -646,24 +759,28 @@ def index_row(s, c, depth, now, i):
         sub = '<span class="lbl">最近</span>' + esc(recent)
     else:
         sub = esc(first) or '（没有文字提问）'
-    ident = s.cli_ids[-1] if s.orphan else s.id
+    ident = s.cli_ids[-1] if s.orphan or s.src == 'codex' else s.id
     acts = ('<button type="button" class="ib sm" data-copy="%s" data-copied="会话 ID" title="复制会话 ID" aria-label="复制会话 ID">%s</button>'
             '<button type="button" class="ib sm" data-act="info" title="详情" aria-label="详情">%s</button>'
             % (esc(ident), icon('copy'), icon('info')))
-    return ('<div class="row%s" data-page="%s" data-p="%s" data-t="%s" data-a="%s" style="--d:%d;--i:%d;--c:hsl(%d 55%% 55%%)">'
+    u = c.get('usage') or {}
+    spent = '<span class="spent" title="%s">%s</span>' % (esc(usage_tip(u)), cost_text(u)) if u.get('n') else ''
+    return ('<div class="row%s" data-page="%s" data-p="%s" data-t="%s" data-a="%s" data-src="%s" data-acct="%s" '
+            'style="--d:%d;--i:%d;--c:hsl(%d 55%% 55%%)">'
             '<a class="cover" href="/s/%s" aria-label="%s"></a>'
-            '<div class="r1"><span class="title">%s</span>%s<time title="%s">%s</time></div>'
+            '<div class="r1"><span class="title">%s</span>%s%s<time title="%s">%s</time></div>'
             '<div class="r2">%s</div>'
-            '<div class="r3"><span class="proj"><i></i>%s</span><span>%d 问</span><span>%d 答</span><span>%s</span>'
+            '<div class="r3"><span class="proj"><i></i>%s</span><span>%d 问</span><span>%d 答</span>%s<span>%s</span>'
             '<span class="acts">%s</span></div></div>'
-            % (' child' if depth else '', s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', min(depth, 3),
-               min(i, 16), hue(s.proj), s.page, esc(c['title']),
-               esc(c['title']), tags, fmt(c['last']), when(c['last'], now), sub,
-               esc(s.proj), c['n_user'], c['n_asst'], size(s.size), acts))
+            % (' child' if depth else '', s.page, esc(s.proj), esc(c['title'].lower()), '1' if s.archived else '', s.src,
+               esc(s.account), min(depth, 3), min(i, 16), hue(s.proj), s.page, esc(c['title']),
+               esc(c['title']), acct_chip(accounts.get(s.account)), tags, fmt(c['last']), when(c['last'], now), sub,
+               esc(s.proj), c['n_user'], c['n_asst'], spent, size(s.size), acts))
 
 
-def index_page(entries, state=''):
+def index_page(entries, state='', accounts=None):
     """entries: [(session, content, 层级, 所在家族的最后活动时间)]，复刻的会话紧跟在原会话后面。"""
+    accounts = accounts or {}
     now = datetime.now().astimezone()
     out, last_bucket = [], None
     for i, (s, c, depth, family_last) in enumerate(entries):
@@ -673,40 +790,72 @@ def index_page(entries, state=''):
                 out.append('</section>')
             out.append('<section class="bucket"><h2>%s</h2>' % b)
             last_bucket = b
-        out.append(index_row(s, c, depth, now, i))
+        out.append(index_row(s, c, depth, now, i, accounts))
     if last_bucket is not None:
         out.append('</section>')
-    counts = collections.OrderedDict()          # 项目按最近活动排序，和列表一致
+    # 项目按最近活动排序，和列表一致；各来源分别计数，切换来源时页面脚本据此显示
+    projects, people = collections.OrderedDict(), collections.OrderedDict()
     for s, _, _, _ in entries:
-        counts[s.proj] = counts.get(s.proj, 0) + 1
-    tabs = '<button type="button" class="tab on" data-p=""><span>全部会话</span><small>%d</small></button>' % len(entries) + ''.join(
-        '<button type="button" class="tab" data-p="%s"><i style="background:hsl(%d 55%% 55%%)"></i><span>%s</span><small>%d</small></button>'
-        % (esc(p), hue(p), esc(p), n) for p, n in counts.items())
+        projects.setdefault(s.proj, collections.Counter())[s.src] += 1
+        if s.account:
+            people.setdefault(s.account, collections.Counter())[s.src] += 1
+    tabs = ('<button type="button" class="tab on" data-p="" data-c="%d" data-x="%d"><span>全部会话</span><small></small></button>'
+            % (sum(n['claude'] for n in projects.values()), sum(n['codex'] for n in projects.values()))) + ''.join(
+        '<button type="button" class="tab" data-p="%s" data-c="%d" data-x="%d"><i style="background:hsl(%d 55%% 55%%)"></i>'
+        '<span>%s</span><small></small></button>' % (esc(p), n['claude'], n['codex'], hue(p), esc(p)) for p, n in projects.items())
+    acct_tabs = ''
+    if people:
+        acct_tabs = ('<div class="side-h">账号</div><div class="tabs" id="ac">'
+                     '<button type="button" class="tab on" data-acct=""><span>全部账号</span></button>' + ''.join(
+                         '<button type="button" class="tab" data-acct="%s" data-c="%d" data-x="%d" title="%s">'
+                         '<i style="background:hsl(%d 55%% 55%%)"></i><span>%s</span><small></small></button>'
+                         % (esc(k), n['claude'], n['codex'], esc((accounts.get(k) or {}).get('email') or k),
+                            hue((accounts.get(k) or {}).get('email') or k), esc((accounts.get(k) or {}).get('name') or k[:8]))
+                         for k, n in people.items()) + '</div>')
+    counts = collections.Counter(s.src for s, _, _, _ in entries)
     total = sum(s.size for s, _, _, _ in entries)
     empty = '' if entries else '<p class="empty">还没有找到任何会话记录。</p>'
     return ''.join([
-        head('Claude 会话记录', False), '<body class="index" data-state="/api/state" data-sig="', state, '">', SPRITE,
-        '<div class="shell"><aside><a class="brand" href="/"><img src="/static/icon.svg" width="28" height="28" alt="">'
-        '<span>Sessiontool<small>Claude 会话记录</small></span></a>',
-        '<div class="side-h">项目</div><div class="tabs" id="pj">', tabs, '</div>',
+        head('会话记录 · Sessiontool', False), '<body class="index" data-state="/api/state" data-sig="', state, '">', SPRITE,
+        '<div class="shell"><aside>', sidebar(counts, 'list'),
+        '<div class="side-h">项目</div><div class="tabs" id="pj">', tabs, '</div>', acct_tabs,
         '<div class="side-h">选项</div>'
         '<label class="tg"><input type="checkbox" id="ar" checked> 显示已归档的会话</label>'
-        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label>'
-        '<label class="tg"><input type="checkbox" id="auto"> 有新记录时自动刷新</label>',
+        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label>',
         '<div class="side-foot"><span id="totals">%d 个会话 · %s</span><span class="foot-acts">' % (len(entries), size(total)),
         ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON, '</span></div></aside>',
         '<main><div class="top"><div class="search"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词">'
-        '<kbd>/</kbd></div>', ibutton('refresh', '刷新，读取最新记录（R）', ' data-act="refresh"'), '</div>',
-        '<div class="meta" id="status"><span id="cnt">%d</span> 个会话 · 更新于 <time id="synced">%s</time></div>'
-        % (len(entries), now.strftime('%H:%M:%S')),
+        '<kbd>/</kbd></div>', ibutton('refresh', '立刻重读磁盘（R）', ' data-act="refresh"'), '</div>',
+        '<div class="meta" id="status"><span id="cnt">%d</span> 个会话 · 更新于 <time id="synced">%s</time>%s</div>'
+        % (len(entries), now.strftime('%H:%M:%S'), LIVE),
         '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></main></div>', scripts(False), '</body></html>'])
+
+
+def stats_page(sessions, state=''):
+    """统计页的骨架：筛选条件在服务端只给出选项，数字和图都由页面脚本向 /api/stats 要来再画。"""
+    counts = collections.Counter(s.src for s in sessions)
+    ranges = ''.join('<button type="button" data-d="%d">%s</button>' % (d, label)
+                     for d, label in ((7, '7 天'), (30, '30 天'), (90, '90 天'), (0, '全部')))
+    return ''.join([
+        head('统计 · Sessiontool', False), '<body class="stats" data-state="/api/state" data-sig="', state, '">', SPRITE,
+        '<div class="shell"><aside>', sidebar(counts, 'stats'),
+        '<div class="side-note">费用都是按 API 价格估算的：同样的用量如果按 token 计价要多少钱。订阅用户实际不按 token 付费。'
+        '<br><br>没有价格的模型（多见于 Codex）不计入费用；可以在索引目录的 prices.json 里补上。</div>',
+        '<div class="side-foot"><span>Sessiontool</span><span class="foot-acts">',
+        ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON, '</span></div></aside>',
+        '<main><div class="st-top"><h1>统计</h1>', LIVE, '</div>'
+        '<div class="filters"><div class="seg" id="range" title="时间范围">', ranges, '</div>'
+        '<label class="pick">账号<select id="acct"><option value="">全部账号</option></select></label>'
+        '<span class="sp"></span><span class="meta" id="span"></span></div>'
+        '<div id="st" class="st"><div class="shimmer"></div></div></main></div>', scripts(False), '</body></html>'])
 
 # ---------- Markdown 导出 ----------
 
 
 def session_markdown(s, c):
+    who = 'Codex' if getattr(s, 'src', '') == 'codex' else 'Claude'
     out = ['# %s\n' % c['title'],
-           '%s　·　%s → %s　·　你 %d 条 / Claude %d 段\n' % (s.cwd, fmt(c['first']), fmt(c['last']), c['n_user'], c['n_asst'])]
+           '%s　·　%s → %s　·　你 %d 条 / %s %d 段\n' % (s.cwd, fmt(c['first']), fmt(c['last']), c['n_user'], who, c['n_asst'])]
 
     def walk(items):
         for it in items:
@@ -716,7 +865,7 @@ def session_markdown(s, c):
                 if it['imgs']:
                     out.append('（附图 %d 张，未收录）\n' % len(it['imgs']))
             elif k == 'asst':
-                out.append('\n### Claude　%s\n\n%s\n' % (fmt(it['ts']), it['text']))
+                out.append('\n### %s　%s\n\n%s\n' % (who, fmt(it['ts']), it['text']))
             elif k == 'tools':
                 out.append('\n> 工具调用：' + '、'.join('%s（%s）' % (t['name'], t['hint']) if t['hint'] else t['name'] for t in it['tools']) + '\n')
             elif k == 'sent':

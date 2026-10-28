@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sessiontool"
 dynamic = ["version"]
-description = "在本机完整查看 Claude 桌面应用 / Claude Code 的会话记录"
+description = "在本机完整查看 Claude 桌面应用、Claude Code 和 Codex 的会话记录，统计用量和费用"
 readme = "README.md"
 requires-python = ">=3.10"
 

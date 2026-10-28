@@ -3,12 +3,13 @@ import argparse
 import json
 import os
 import sys
+import threading
 import urllib.request
 import webbrowser
 
 from . import __version__
 from .export import export_to
-from .render import fmt
+from .render import fmt, money
 from .server import App, make_server
 from .sources import Sources
 
@@ -20,7 +21,7 @@ def progress(i, n, path, size):
 
 
 def open_app(args):
-    app = App(Sources(root=args.root, home=args.home))
+    app = App(Sources(root=args.root, home=args.home, codex=args.codex))
     if not os.path.isdir(app.sources.root):
         sys.exit('找不到会话记录目录：%s' % app.sources.root)
     if not app.index.files():
@@ -54,6 +55,7 @@ def cmd_serve(args):
     if httpd is None:
         sys.exit('端口 %d 起的 20 个端口都被占用，请用 --port 指定别的端口。' % args.port)
     httpd.app = open_app(args)
+    threading.Thread(target=httpd.app.watch, daemon=True).start()     # 每秒看一眼磁盘，开着的页面实时更新
     print('Sessiontool %s：%s 个会话 → %s' % (__version__, len(httpd.app.catalog.sessions), url))
     print('保持此窗口打开；按 Ctrl+C 或直接关闭窗口即停止。')
     if not args.no_browser:
@@ -68,8 +70,10 @@ def cmd_list(args):
     app = open_app(args)
     for s, c, depth, _ in app.entries():
         flags = ''.join(t for t, on in (('[复刻]', s.parent), ('[归档]', s.archived)) if on)
-        print('%-10s %s  %3d 问  %6.1f MB  %-14s %s%s %s' % (s.page, fmt(c['last']), c['n_user'], s.size / 1048576, s.proj[:14],
-                                                         '  ' * depth, c['title'], flags))
+        who = (app.catalog.account(s) or {}).get('name', '')
+        print('%-10s %-6s %s  %3d 问  %6.1f MB  %9s  %-14s %-14s %s%s %s' % (
+            s.page, s.src, fmt(c['last']), c['n_user'], s.size / 1048576, money(c['usage']['cost']), who[:14], s.proj[:14],
+            '  ' * depth, c['title'], flags))
 
 
 def cmd_export(args):
@@ -93,7 +97,7 @@ def cmd_export(args):
 
 
 def cmd_reindex(args):
-    sources = Sources(root=args.root, home=args.home)
+    sources = Sources(root=args.root, home=args.home, codex=args.codex)
     for name in ('index.db', 'index.db-wal', 'index.db-shm'):
         path = os.path.join(sources.home, name)
         if os.path.exists(path):
@@ -106,9 +110,10 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(errors='replace')
-    ap = argparse.ArgumentParser(prog='sessiontool', description='在本机完整查看 Claude 桌面应用 / Claude Code 的会话记录')
+    ap = argparse.ArgumentParser(prog='sessiontool', description='在本机完整查看 Claude 桌面应用、Claude Code 和 Codex 的会话记录，统计用量和费用')
     ap.add_argument('--version', action='version', version=__version__)
     ap.add_argument('--root', help='会话记录目录（默认 ~/.claude/projects）')
+    ap.add_argument('--codex', help='Codex 的数据目录（默认 ~/.codex，或环境变量 CODEX_HOME）')
     ap.add_argument('--home', help='索引存放的文件夹（默认 ~/.sessiontool）')
     sub = ap.add_subparsers(dest='cmd')
     p = sub.add_parser('serve', help='启动本地网页并打开浏览器（默认）')
