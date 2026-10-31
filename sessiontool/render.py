@@ -288,6 +288,8 @@ ICONS = {
     'list': '<path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01" stroke-width="2"/>',
     'chart': '<path d="M4 20h16"/><path d="M7 16v-5M12 16V6M17 16v-8"/>',
     'table': '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 10h17M3.5 15h17M10 10v9.5"/>',
+    'sort': '<path d="M7 4v16M7 20l-3.5-3.5M7 20l3.5-3.5M17 20V4M17 4l-3.5 3.5M17 4l3.5 3.5"/>',
+    'chev': '<path d="M6 9l6 6 6-6"/>',
 }
 SPRITE = ('<svg xmlns="http://www.w3.org/2000/svg" style="display:none">'
           + ''.join('<symbol id="i-%s" viewBox="0 0 24 24">%s</symbol>' % kv for kv in ICONS.items()) + '</svg>')
@@ -512,7 +514,7 @@ class Renderer:
     def minor(self, it):
         k = it['kind']
         if k == 'think':
-            return '<details class="fold think"><summary>思考过程</summary><div class="body">%s</div></details>' % md(it['text'])
+            return '<details class="fold think" open><summary>思考过程</summary><div class="body">%s</div></details>' % md(it['text'])
         if k == 'summary':
             return ('<details class="fold"%s><summary>上下文压缩摘要 · %s</summary><div class="body">%s</div></details>'
                     % (self.anchor('m-', it['u']), fmt(it['ts'], '%H:%M'), md(it['text'])))
@@ -614,9 +616,9 @@ def changed_files(c, cwd):
     return '<details class="files"><summary>修改过 %d 个文件</summary><ul>%s</ul></details>' % (len(c['changed']), ''.join(rows))
 
 
-VIEW = ('<div class="seg" id="view" title="完整：全部内容；思考：完整内容，并展开每一段思考；对话：隐藏工具调用；'
-        '结果：折起中间过程，只留每轮的最终答复（按 1 / 2 / 3 / 4 切换）">'
-        '<button type="button" data-v="full">完整</button><button type="button" data-v="think">思考</button>'
+VIEW = ('<div class="seg" id="view" title="完整：全部内容（默认展开思考）；对话：隐藏工具调用和思考过程；'
+        '结果：隐藏中间过程，只看提问与最终答复（按 1 / 2 / 3 切换）">'
+        '<button type="button" data-v="full">完整</button>'
         '<button type="button" data-v="chat">对话</button><button type="button" data-v="result">结果</button></div>')
 LIVE = ('<button type="button" class="live" data-act="live" title="实时更新：有新记录时自动显示，不用刷新页面（点击暂停或继续）">'
         '<i></i><span>实时</span></button>')
@@ -703,9 +705,9 @@ def session_view(s, c, mode, parent=None, state='', back=None, info=None):
     else:
         home = '' if mode.standalone else '<a class="back" href="/">%s全部会话</a>' % icon('left')
     toc = ''.join(r.toc)
-    nav = (home + '<div class="jump"><button type="button" data-act="top">%s开头</button>'
-           '<button type="button" data-act="end">%s最新</button></div>'
-           '<div class="navhead">提问目录</div><div class="toc">' % (icon('up'), icon('down')) + toc + '</div>')
+    nav = ('<div class="nav-top">' + home + '<div class="navhead"><span>提问目录</span>'
+           '<button type="button" class="toc-sort" data-act="tocsort" title="切换提问目录顺序">'
+           '%s<span>正序</span></button></div></div><div class="toc">' % icon('sort') + toc + '</div>')
     attrs = ' data-page="%s" data-state="/api/state?page=%s" data-sig="%s"' % (s.page, s.page, state) if live else ''
     if codex:
         attrs += ' data-src="codex"'
@@ -713,13 +715,13 @@ def session_view(s, c, mode, parent=None, state='', back=None, info=None):
                          ''.join(facts), '</div>', changed_files(c, s.cwd), '</header>'])
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号
     top = ''.join([head(c['title'], mode.standalone), '<body class="session"', attrs, '>', SPRITE,
-                   '<div class="progress"></div><div class="layout"><nav>', nav, '</nav><main>', bar])
+                   '<div class="progress"></div><div class="layout"><nav>', nav, '</nav><main><div class="page">', bar])
     return {'title': c['title'], 'sig': state, 'top': top, 'head': head_html, 'toc': toc, 'blocks': blocks, 'keys': r.keys,
             'info': info or None, 'standalone': mode.standalone}
 
 
 def session_html(v):
-    return ''.join([v['top'], v['head'], '<div id="flow">', '\n'.join(v['blocks']), '</div></main></div>',
+    return ''.join([v['top'], v['head'], '<div id="flow">', '\n'.join(v['blocks']), '</div></div></main></div>',
                     embed('info', v['info']) if v['info'] else '', scripts(v['standalone']), '</body></html>'])
 
 
@@ -730,18 +732,20 @@ def session_page(s, c, mode, parent=None, state='', back=None, info=None):
 
 
 def sidebar(counts, page):
-    """左边栏的上半截：标识；来源（Claude / Codex / 全部，有 Codex 的会话才显示）；会话列表和统计两个页面。"""
+    """左边栏顶部：标识与右上角 会话/统计 滑块；来源切换（Claude / Codex 并列 + 独立的小“全部”按钮）。"""
     srcs = ''
     if counts.get('codex'):
-        srcs = ('<div class="seg srcs" id="src" title="只看 Claude、只看 Codex，或者两个一起">'
+        srcs = ('<div class="src-row" id="src">'
+                '<div class="seg srcs" title="在 Claude 与 Codex 之间切换（按 S 循环切换）">'
                 '<button type="button" data-s="claude">Claude<small>%d</small></button>'
-                '<button type="button" data-s="codex">Codex<small>%d</small></button>'
-                '<button type="button" data-s="all">全部</button></div>' % (counts.get('claude', 0), counts['codex']))
+                '<button type="button" data-s="codex">Codex<small>%d</small></button></div>'
+                '<button type="button" class="src-all" data-s="all" title="同时显示 Claude 和 Codex">全部</button></div>'
+                % (counts.get('claude', 0), counts['codex']))
     on = lambda p: ' class="on" aria-current="page"' if p == page else ''
-    return ('<a class="brand" href="/"><img src="/static/icon.svg" width="28" height="28" alt="">'
-            '<span>Sessiontool<small>会话记录与用量</small></span></a>' + srcs
-            + '<nav class="pages"><a href="/"%s>%s会话</a><a href="/stats"%s>%s统计</a></nav>' % (on('list'), icon('list'),
-                                                                                              on('stats'), icon('chart')))
+    return ('<div class="side-top"><a class="brand" href="/"><img src="/static/icon.svg" width="26" height="26" alt="">'
+            '<span>Sessiontool</span></a>'
+            '<nav class="modes" data-page="%s" aria-label="页面">'
+            '<a href="/"%s>会话</a><a href="/stats"%s>统计</a></nav></div>' % (page, on('list'), on('stats')) + srcs)
 
 
 def index_row(s, c, depth, now, i, accounts):
@@ -803,32 +807,37 @@ def index_page(entries, state='', accounts=None):
             % (sum(n['claude'] for n in projects.values()), sum(n['codex'] for n in projects.values()))) + ''.join(
         '<button type="button" class="tab" data-p="%s" data-c="%d" data-x="%d"><i style="background:hsl(%d 55%% 55%%)"></i>'
         '<span>%s</span><small></small></button>' % (esc(p), n['claude'], n['codex'], hue(p), esc(p)) for p, n in projects.items())
-    acct_tabs = ''
-    if people:
-        acct_tabs = ('<div class="side-h">账号</div><div class="tabs" id="ac">'
-                     '<button type="button" class="tab on" data-acct=""><span>全部账号</span></button>' + ''.join(
-                         '<button type="button" class="tab" data-acct="%s" data-c="%d" data-x="%d" title="%s">'
-                         '<i style="background:hsl(%d 55%% 55%%)"></i><span>%s</span><small></small></button>'
-                         % (esc(k), n['claude'], n['codex'], esc((accounts.get(k) or {}).get('email') or k),
-                            hue((accounts.get(k) or {}).get('email') or k), esc((accounts.get(k) or {}).get('name') or k[:8]))
-                         for k, n in people.items()) + '</div>')
     counts = collections.Counter(s.src for s, _, _, _ in entries)
+    acct_box = ''
+    if people:
+        acct_opts = ('<button type="button" class="tab on" data-acct="" data-c="%d" data-x="%d">'
+                     '<span>全部账号</span><small></small></button>' % (counts['claude'], counts['codex'])) + ''.join(
+            '<button type="button" class="tab" data-acct="%s" data-c="%d" data-x="%d" title="%s">'
+            '<i style="background:hsl(%d 55%% 55%%)"></i><span>%s</span><small></small></button>'
+            % (esc(k), n['claude'], n['codex'], esc((accounts.get(k) or {}).get('email') or k),
+               hue((accounts.get(k) or {}).get('email') or k), esc((accounts.get(k) or {}).get('name') or k[:8]))
+            for k, n in people.items())
+        acct_box = ('<div class="side-acct"><div class="side-h">账号</div><details class="menu acct-dd" id="ac">'
+                    '<summary title="按账号筛选会话">'
+                    '<span class="ac-cur"><i id="ac-dot" hidden></i><span id="ac-name">全部账号</span></span>'
+                    '<small id="ac-cnt"></small>%s</summary>'
+                    '<div>%s</div></details></div>' % (icon('chev'), acct_opts))
     total = sum(s.size for s, _, _, _ in entries)
     empty = '' if entries else '<p class="empty">还没有找到任何会话记录。</p>'
     return ''.join([
         head('会话记录 · Sessiontool', False), '<body class="index" data-state="/api/state" data-sig="', state, '">', SPRITE,
-        '<div class="shell"><aside>', sidebar(counts, 'list'),
-        '<div class="side-h">项目</div><div class="tabs" id="pj">', tabs, '</div>', acct_tabs,
-        '<div class="side-h">选项</div>'
+        '<div class="shell"><aside><div class="side-head">', sidebar(counts, 'list'), acct_box, '</div>',
+        '<div class="side-scroll" id="side-scroll"><div class="side-h">项目</div><div class="tabs" id="pj">', tabs, '</div></div>',
+        '<div class="side-bottom"><div class="side-opts"><div class="side-h">选项</div>'
         '<label class="tg"><input type="checkbox" id="ar" checked> 显示已归档的会话</label>'
-        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label>',
+        '<label class="tg"><input type="checkbox" id="tl"> 搜索时包含工具调用与输出</label></div>',
         '<div class="side-foot"><span id="totals">%d 个会话 · %s</span><span class="foot-acts">' % (len(entries), size(total)),
-        ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON, '</span></div></aside>',
-        '<main><div class="top"><div class="search"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词">'
+        ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON, '</span></div></div></aside>',
+        '<main><div class="page"><div class="top"><div class="search"><input id="q" type="search" placeholder="搜索全部会话的对话内容，空格分隔多个词">'
         '<kbd>/</kbd></div>', ibutton('refresh', '立刻重读磁盘（R）', ' data-act="refresh"'), '</div>',
         '<div class="meta" id="status"><span id="cnt">%d</span> 个会话 · 更新于 <time id="synced">%s</time>%s</div>'
         % (len(entries), now.strftime('%H:%M:%S'), LIVE),
-        '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></main></div>', scripts(False), '</body></html>'])
+        '<div id="hits"></div><div id="list">', empty, '\n'.join(out), '</div></div></main></div>', scripts(False), '</body></html>'])
 
 
 def stats_page(sessions, state=''):
@@ -836,18 +845,22 @@ def stats_page(sessions, state=''):
     counts = collections.Counter(s.src for s in sessions)
     ranges = ''.join('<button type="button" data-d="%d">%s</button>' % (d, label)
                      for d, label in ((7, '7 天'), (30, '30 天'), (90, '90 天'), (0, '全部')))
+    acct_dd = ('<div class="pick"><span>账号</span><details class="menu acct-dd" id="acct">'
+               '<summary title="按账号筛选统计"><span class="ac-cur"><i id="acct-dot" hidden></i>'
+               '<span id="acct-name">全部账号</span></span>' + icon('chev') + '</summary>'
+               '<div></div></details></div>')
     return ''.join([
         head('统计 · Sessiontool', False), '<body class="stats" data-state="/api/state" data-sig="', state, '">', SPRITE,
-        '<div class="shell"><aside>', sidebar(counts, 'stats'),
-        '<div class="side-note">费用都是按 API 价格估算的：同样的用量如果按 token 计价要多少钱。订阅用户实际不按 token 付费。'
-        '<br><br>没有价格的模型（多见于 Codex）不计入费用；可以在索引目录的 prices.json 里补上。</div>',
-        '<div class="side-foot"><span>Sessiontool</span><span class="foot-acts">',
-        ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON, '</span></div></aside>',
-        '<main><div class="st-top"><h1>统计</h1>', LIVE, '</div>'
-        '<div class="filters"><div class="seg" id="range" title="时间范围">', ranges, '</div>'
-        '<label class="pick">账号<select id="acct"><option value="">全部账号</option></select></label>'
+        '<div class="shell"><aside><div class="side-head">', sidebar(counts, 'stats'), '</div>',
+        '<div class="side-scroll"><div class="side-digest" id="digest"><div class="shimmer"></div></div></div>',
+        '<div class="side-bottom"><div class="side-foot">'
+        '<span title="订阅用户实际不按 token 付费；无价格的模型可在 ~/.sessiontool/prices.json 补充">按 API 价格估算</span>'
+        '<span class="foot-acts">', ibutton('keys', '键盘快捷键（?）', ' data-act="keys"'), THEME_BUTTON,
+        '</span></div></div></aside>',
+        '<main><div class="page"><div class="st-top"><h1>统计</h1>', LIVE, '</div>'
+        '<div class="filters"><div class="seg" id="range" title="时间范围">', ranges, '</div>', acct_dd,
         '<span class="sp"></span><span class="meta" id="span"></span></div>'
-        '<div id="st" class="st"><div class="shimmer"></div></div></main></div>', scripts(False), '</body></html>'])
+        '<div id="st" class="st"><div class="shimmer"></div></div></div></main></div>', scripts(False), '</body></html>'])
 
 # ---------- Markdown 导出 ----------
 

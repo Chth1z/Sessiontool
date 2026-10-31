@@ -329,6 +329,24 @@ class TurnTest(Case):
         self.assertIn('这一轮没有最终答复', page)
         self.assertEqual(page.count('class="msg asst"'), 2)
         self.assertEqual(page.count('class="step"'), 1)
+        self.assertNotIn('data-v="think"', page)
+        self.assertIn('data-v="full"', page)
+        self.assertIn('data-v="chat"', page)
+        self.assertIn('data-v="result"', page)
+        self.assertIn('结果：隐藏中间过程，只看提问与最终答复', page)
+        self.assertIn('data-act="tocsort"', page)
+        self.assertNotIn('class="jump"', page)
+        css = render.static_text('app.css')
+        self.assertIn('body.result details.steps', css)
+        self.assertNotIn(':root{interpolate-size:allow-keywords}', css)
+
+    def test_thinking_blocks_expand_by_default_in_full_view(self):
+        self.write('t1111111', [
+            user('u1', None, '想想看', 1, 't1111111'),
+            asst('a1', 'u1', [{'type': 'thinking', 'thinking': '内部推理过程'}, {'type': 'text', 'text': '想好了'}], 2, 't1111111')])
+        s, c = self.content(self.open(), 'file_t1111111')
+        page = render.session_page(s, c, render.ServerMode())
+        self.assertIn('<details class="fold think" open><summary>思考过程</summary>', page)
 
 
 class ExtrasTest(Case):

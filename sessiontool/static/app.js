@@ -13,6 +13,34 @@
 
   function $(s, r) { return (r || document).querySelector(s); }
   function $$(s, r) { return [].slice.call((r || document).querySelectorAll(s)); }
+  var mainEl = $('main');
+  function mainScroller() {
+    return mainEl && getComputedStyle(mainEl).overflowY === 'auto' ? mainEl : window;
+  }
+  function scrollYOf() {
+    var s = mainScroller();
+    return s === window ? window.scrollY : s.scrollTop;
+  }
+  function viewHOf() {
+    var s = mainScroller();
+    return s === window ? window.innerHeight : s.clientHeight;
+  }
+  function scrollHOf() {
+    var s = mainScroller();
+    return s === window ? root.scrollHeight : s.scrollHeight;
+  }
+  function scrollToY(y) {
+    var s = mainScroller();
+    if (s === window) window.scrollTo(0, y); else s.scrollTop = y;
+  }
+  function scrollByY(dy) {
+    var s = mainScroller();
+    if (s === window) window.scrollBy(0, dy); else s.scrollTop += dy;
+  }
+  function onMainScroll(fn) {
+    window.addEventListener('scroll', fn, { passive: true });
+    if (mainEl) mainEl.addEventListener('scroll', fn, { passive: true });
+  }
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -100,11 +128,20 @@
   function reveal(node) {
     for (var p = node; p; p = p.parentNode) if (p.tagName === 'DETAILS') p.open = true;
   }
-  // 一次开合很多折叠块时关掉动画，否则几十个高度动画一起跑会卡
+  // 一次开合很多折叠块时关掉动画；取消上一次尚未跑完的帧回调，避免连续快速操作时提前撤掉 .bulk
+  var bulkRaf1 = 0, bulkRaf2 = 0;
   function bulk(fn) {
+    if (bulkRaf1) { cancelAnimationFrame(bulkRaf1); bulkRaf1 = 0; }
+    if (bulkRaf2) { cancelAnimationFrame(bulkRaf2); bulkRaf2 = 0; }
     body.classList.add('bulk');
     fn();
-    requestAnimationFrame(function () { requestAnimationFrame(function () { body.classList.remove('bulk'); }); });
+    bulkRaf1 = requestAnimationFrame(function () {
+      bulkRaf1 = 0;
+      bulkRaf2 = requestAnimationFrame(function () {
+        bulkRaf2 = 0;
+        body.classList.remove('bulk');
+      });
+    });
   }
   // 和服务端的 zlib.crc32 一致：账号、项目的颜色由名字决定，页面脚本画出来的和服务端画的一样
   var CRC = null;
@@ -565,7 +602,7 @@
     var rows = [['/', '聚焦搜索框'], ['R', '立刻重读磁盘'], ['L', '暂停或继续实时更新'], ['?', '打开这张快捷键表'], ['Esc', '关闭浮层、清空搜索']];
     if (isIndex) rows = rows.concat([['J  K  ↓  ↑', '在会话和搜索结果之间移动'], ['Enter', '打开选中的会话'], ['I', '选中会话的详情'],
       ['C', '复制选中会话的 ID'], ['S', '切换 Claude / Codex / 全部']]);
-    if (isSession) rows = rows.concat([['J  K', '下一条 / 上一条你的提问'], ['1  2  3  4', '完整 / 思考 / 对话 / 结果视图'],
+    if (isSession) rows = rows.concat([['J  K', '下一条 / 上一条你的提问'], ['1  2  3', '完整 / 对话 / 结果视图'],
       ['E', '折起或展开当前这一轮的过程'], ['I', '会话详情'], ['Enter  Shift+Enter', '搜索时跳到下一处 / 上一处'],
       ['←  →', '放大图片时切换上一张 / 下一张']]);
     if (isStats) rows = rows.concat([['S', '切换 Claude / Codex / 全部']]);
@@ -642,9 +679,29 @@
       tc.textContent = '加载失败，收起后再展开可重试。';
     });
   }
+  // 只有手动点击单个折叠块摘要时才临时挂上 .anim 做高度过渡，避免数千个折叠块常驻伪元素过渡拖慢切视图
+  function armDetailsAnim(e) {
+    if (e.target.closest && e.target.closest('a, button')) return;
+    var s = e.target.closest && e.target.closest('summary');
+    var d = s && s.parentNode;
+    if (!d || d.tagName !== 'DETAILS' || d.classList.contains('menu')) return;
+    d.classList.add('anim');
+    void d.offsetHeight;
+    clearTimeout(d._at);
+    d._at = setTimeout(function () { d.classList.remove('anim'); }, 1200);
+  }
+  document.addEventListener('pointerdown', armDetailsAnim, true);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ' ') armDetailsAnim(e);
+  }, true);
   document.addEventListener('toggle', function (e) {
     var d = e.target;
-    if (d.classList && d.classList.contains('tool') && d.open) fillTool(d);
+    if (!d.classList) return;
+    if (d.classList.contains('anim')) {
+      clearTimeout(d._at);
+      d._at = setTimeout(function () { d.classList.remove('anim'); }, 280);
+    }
+    if (d.classList.contains('tool') && d.open) fillTool(d);
   }, true);
 
   // 代码块右上角的“复制”：鼠标移上去时才放按钮，页面上可能有几百个代码块
@@ -658,7 +715,7 @@
 
   /* ================= 会话内搜索 ================= */
 
-  var marks = [], cur = -1, findBar = null, activeQ = '';
+  var marks = [], cur = -1, findBar = null, activeQ = '', view = 'full';
   function clearMarks() {
     marks.forEach(function (m) {
       var p = m.parentNode;
@@ -705,6 +762,9 @@
     var words = terms(q);
     if (!words.length) return;
     $$('main .msg .body, main .step > .body, main .sent, main details.fold > .body, main details.tool[open] > .tc').forEach(function (scope) {
+      if (isSession && view !== 'full' && scope.closest(view === 'result'
+        ? 'details.steps, .step, details.tools, details.think, details.sys'
+        : 'details.tools, details.think, details.sys')) return;
       words.forEach(function (w) { markAll(scope, w); });
     });
     marks.sort(function (a, b) { return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1; });
@@ -884,59 +944,238 @@
 
   if (isSession) {
     var flow = $('#flow'), page = body.dataset.page || '';
+    var posKey = 'pos:' + (page || location.pathname);
 
-    // 四种视图：完整 / 思考（再展开每段思考）/ 对话（隐藏工具调用）/ 结果（折起每轮的中间过程，只留最终答复）
-    var VIEWS = ['full', 'think', 'chat', 'result'];
-    var views = $$('#view button'), view = 'full';
-    function applyView(scope) {
-      $$('details.steps', scope).forEach(function (d) { d.open = view !== 'result'; });
-      $$('details.think', scope).forEach(function (d) { d.open = view === 'think'; });
-    }
+    // 三种视图全走纯 CSS 切换，不遍历改写任何 <details> 的 open：完整 / 对话（隐藏工具与思考）/ 结果（隐藏整个中间过程）
+    var VIEWS = ['full', 'chat', 'result'];
+    var views = $$('#view button');
     function setView(v, keep) {
       if (VIEWS.indexOf(v) < 0) v = 'full';
       view = v;
       views.forEach(function (b) { b.classList.toggle('on', b.dataset.v === v); });
-      bulk(function () {
-        body.classList.toggle('chat', v === 'chat');
-        applyView(flow);
-      });
-      if (keep) store('view', v);
+      body.classList.toggle('chat', v === 'chat');
+      body.classList.toggle('result', v === 'result');
+      if (keep) {
+        store('view', v);
+        if (activeQ) highlight(activeQ, null, true);
+      }
     }
-    views.forEach(function (b) { b.onclick = function () { keepPlace(function () { setView(b.dataset.v, true); }); }; });
+    function switchView(v) {
+      if (VIEWS.indexOf(v) < 0) v = 'full';
+      if (v === view) return;
+      keepPlace(function () { setView(v, true); });
+    }
+    views.forEach(function (b) { b.onclick = function () { switchView(b.dataset.v); }; });
+
+    // 顶部进度条、平滑滚动与右下角浮动的“回到开头 / 滑到底部”按钮
+    var progEl = $('.progress'), floats = el('div', 'floats');
+    var totop = ibtn('up', '回到开头'), toend = ibtn('down', '滑到底部');
+    totop.dataset.act = 'top';
+    toend.dataset.act = 'end';
+    floats.appendChild(totop);
+    floats.appendChild(toend);
+    body.appendChild(floats);
+
+    var scrollAnim = 0;
+    function stopSmoothScroll() {
+      if (scrollAnim) { cancelAnimationFrame(scrollAnim); scrollAnim = 0; }
+    }
+    function barClearance() {
+      var b = $('.bar');
+      return (b ? b.offsetHeight : 56) + 20;
+    }
+    function smoothScrollTo(destY, animate) {
+      stopSmoothScroll();
+      var maxY = Math.max(0, scrollHOf() - viewHOf());
+      var targetY = Math.max(0, Math.min(maxY, destY));
+      var startY = scrollYOf(), diff = targetY - startY, dist = Math.abs(diff);
+      var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!animate || reduced || dist < 4) {
+        scrollToY(targetY);
+        syncProgress();
+        return;
+      }
+      var dur = Math.min(420, Math.max(220, 180 + Math.sqrt(dist) * 2.2)), t0 = performance.now();
+      function frame(now) {
+        var p = Math.min(1, (now - t0) / dur);
+        var eased = 1 - Math.pow(1 - p, 3);
+        scrollToY(startY + diff * eased);
+        syncProgress();
+        if (p < 1) scrollAnim = requestAnimationFrame(frame);
+        else scrollAnim = 0;
+      }
+      scrollAnim = requestAnimationFrame(frame);
+    }
+    function scrollNodeIntoView(node, animate) {
+      var s = mainScroller(), baseTop = s === window ? 0 : s.getBoundingClientRect().top;
+      var destY = scrollYOf() + (node.getBoundingClientRect().top - baseTop) - barClearance();
+      smoothScrollTo(destY, animate);
+    }
+    if (mainEl) {
+      mainEl.addEventListener('wheel', stopSmoothScroll, { passive: true });
+      mainEl.addEventListener('touchstart', stopSmoothScroll, { passive: true });
+      mainEl.addEventListener('pointerdown', function (e) { if (e.target === mainEl) stopSmoothScroll(); });
+    }
+    window.addEventListener('wheel', stopSmoothScroll, { passive: true });
+    window.addEventListener('touchstart', stopSmoothScroll, { passive: true });
+
+    var progRaf = 0;
+    function syncProgress() {
+      var y = scrollYOf(), vh = viewHOf(), sh = scrollHOf(), max = Math.max(0, sh - vh);
+      if (progEl) progEl.style.transform = 'scaleX(' + (max > 0 ? Math.min(1, Math.max(0, y / max)) : 0) + ')';
+      totop.classList.toggle('on', y > 120);
+      toend.classList.toggle('on', sh - (y + vh) > 120);
+    }
+    function syncProgressSoon() {
+      if (progRaf) return;
+      progRaf = requestAnimationFrame(function () { progRaf = 0; syncProgress(); });
+    }
+
+    function firstBlockAt(clear) {
+      var ch = flow.children, lo = 0, hi = ch.length - 1, hit = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (ch[mid].getBoundingClientRect().bottom > clear) { hit = mid; hi = mid - 1; }
+        else lo = mid + 1;
+      }
+      return hit;
+    }
 
     // 改变页面高度的操作（切视图、折起过程、换上新内容）前后，让眼前这条消息留在原位
     function keepPlace(fn) {
-      var blocks = [].slice.call(flow.children), ref = null, at = 0, top = 0;
-      for (var i = 0; i < blocks.length; i++) {
-        var r = blocks[i].getBoundingClientRect();
-        if (r.bottom > 70) { ref = blocks[i]; at = i; top = r.top; break; }
+      stopSmoothScroll();
+      var clear = barClearance(), at = firstBlockAt(clear);
+      var blk = at >= 0 ? flow.children[at] : null, ref = blk, childIdx = -1, top = 0;
+      if (blk) {
+        if (blk.classList.contains('turn')) {
+          for (var i = 0; i < blk.children.length; i++) {
+            var cr = blk.children[i].getBoundingClientRect();
+            if (cr.height > 0 && cr.bottom > clear) {
+              ref = blk.children[i];
+              childIdx = i;
+              top = cr.top;
+              break;
+            }
+          }
+        }
+        if (ref === blk) top = blk.getBoundingClientRect().top;
       }
       fn();
-      if (ref && !ref.isConnected) ref = flow.children[at];       // 这一块刚被换成了新的
-      if (ref) window.scrollBy(0, ref.getBoundingClientRect().top - top);
+      if (!blk) { syncProgress(); return; }
+      if (!blk.isConnected) {
+        blk = flow.children[at];
+        ref = blk && childIdx >= 0 && blk.children[childIdx] ? blk.children[childIdx] : blk;
+      }
+      if (ref) {
+        var nr = ref.getBoundingClientRect();
+        if (nr.height > 0 || nr.width > 0) {
+          scrollByY(nr.top - top);
+        } else if (blk) {
+          // 刚在看的那段中间过程被当前视图隐藏了：就近停在同一轮的最终答复或提问上
+          var fb = null;
+          for (var j = Math.max(0, childIdx); j < blk.children.length; j++) {
+            if (blk.children[j].getBoundingClientRect().height > 0) { fb = blk.children[j]; break; }
+          }
+          if (!fb) {
+            for (var k = childIdx - 1; k >= 0; k--) {
+              if (blk.children[k].getBoundingClientRect().height > 0) { fb = blk.children[k]; break; }
+            }
+          }
+          scrollByY((fb || blk).getBoundingClientRect().top - clear);
+        }
+      }
+      syncProgress();
+    }
+
+    // 左侧提问目录：支持正序 / 倒序切换，并与右侧滚动彻底解耦
+    var navEl = $('.layout > nav'), tocEl = $('nav .toc'), sortBtn = $('.toc-sort');
+    var rawToc = tocEl ? tocEl.innerHTML : '', tocSort = store('toc-sort') === 'desc' ? 'desc' : 'asc';
+
+    function buildDescToc(html) {
+      var nodes = parse(html), groups = [], curDay = null, curGroup = null;
+      nodes.forEach(function (n) {
+        if (n.classList.contains('fk')) {
+          groups.push({ fk: n });
+          curGroup = null;
+        } else if (n.classList.contains('d')) {
+          curDay = n;
+          curGroup = { day: n, items: [] };
+          groups.push(curGroup);
+        } else {
+          if (!curGroup) {
+            curGroup = { day: curDay ? curDay.cloneNode(true) : null, items: [] };
+            groups.push(curGroup);
+          }
+          curGroup.items.push(n);
+        }
+      });
+      var frag = document.createDocumentFragment();
+      groups.reverse().forEach(function (g) {
+        if (g.fk) {
+          frag.appendChild(g.fk);
+        } else if (g.items.length) {
+          if (g.day) frag.appendChild(g.day);
+          g.items.reverse().forEach(function (a) { frag.appendChild(a); });
+        }
+      });
+      return frag;
+    }
+
+    function renderToc() {
+      if (!tocEl) return;
+      if (tocSort === 'desc') {
+        tocEl.textContent = '';
+        tocEl.appendChild(buildDescToc(rawToc));
+      } else {
+        tocEl.innerHTML = rawToc;
+      }
+      if (sortBtn) {
+        var lbl = $('span', sortBtn);
+        if (lbl) lbl.textContent = tocSort === 'desc' ? '倒序' : '正序';
+        sortBtn.classList.toggle('desc', tocSort === 'desc');
+        sortBtn.title = tocSort === 'desc' ? '当前倒序（最新提问在上），点击切为正序' : '当前正序（最早提问在上），点击切为倒序';
+      }
+    }
+
+    function scrollTocTo(a) {
+      if (!tocEl || !a) return;
+      var tr = tocEl.getBoundingClientRect(), ar = a.getBoundingClientRect();
+      if (ar.top < tr.top + 28) tocEl.scrollTop += ar.top - (tr.top + 28);
+      else if (ar.bottom > tr.bottom - 28) tocEl.scrollTop += ar.bottom - (tr.bottom - 28);
     }
 
     ACTIONS.info = function () { openInfo(page); };
-    ACTIONS.top = function () { window.scrollTo(0, 0); };
-    ACTIONS.end = function () { window.scrollTo(0, root.scrollHeight); };
+    ACTIONS.top = function () { smoothScrollTo(0, true); };
+    ACTIONS.end = function () { smoothScrollTo(scrollHOf(), true); };
+    ACTIONS.tocsort = function () {
+      tocSort = tocSort === 'desc' ? 'asc' : 'desc';
+      store('toc-sort', tocSort);
+      renderToc();
+      collect();
+      spy(false, false);
+      if (tocEl) tocEl.scrollTop = 0;
+    };
     ACTIONS.tools = function (b) {
       var all = $$('details.tools'), open = !all.some(function (x) { return x.open; });
+      if (open && view !== 'full') setView('full', true);
       bulk(function () {
         if (open) $$('details.steps').forEach(function (d) { d.open = true; });
         all.forEach(function (x) { x.open = open; });
       });
       b.firstChild.textContent = open ? '收起全部工具调用' : '展开全部工具调用';
       b.closest('details').open = false;
+      syncProgress();
     };
     // 过程很长时，读到底部也能把它折起来，并回到这一轮的开头
     ACTIONS.fold = function (b) {
       var d = b.closest('details.steps');
       bulk(function () { d.open = false; });        // 这里要立刻定位，所以不带收起动画
       d.scrollIntoView({ block: 'center' });
+      syncProgress();
     };
 
-    // 左侧目录跟随阅读位置；顺便记住读到哪一条，下次打开可以接着读
-    var prompts = [], links = {}, active = null, totop = null;
+    // 左侧目录跟随阅读位置；顺便记住精确阅读位置，下次打开直接从上次读到的地方进入
+    var prompts = [], links = {}, active = null;
     function collect() {
       prompts = $$('#flow > .turn > .msg.user[id]');
       links = {};
@@ -944,16 +1183,18 @@
       active = null;
     }
     function current() {
-      var best = null;
-      for (var i = 0; i < prompts.length; i++) {
-        if (prompts[i].getBoundingClientRect().top <= window.innerHeight * 0.4) best = prompts[i]; else break;
+      var best = null, line = viewHOf() * 0.4, lo = 0, hi = prompts.length - 1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (prompts[mid].getBoundingClientRect().top <= line) { best = prompts[mid]; lo = mid + 1; }
+        else hi = mid - 1;
       }
       return best;
     }
-    function atEnd() { return window.innerHeight + window.scrollY >= root.scrollHeight - 200; }
-    // moved：是你滚动页面引起的。只有这时才更新“读到哪了”，刚打开页面时不能把上次的位置冲掉
-    function spy(moved) {
-      if (totop) totop.classList.toggle('on', window.scrollY > window.innerHeight * 1.5);
+    function atEnd() { return viewHOf() + scrollYOf() >= scrollHOf() - 200; }
+
+    function spy(moved, syncToc) {
+      syncProgress();
       if (pill && atEnd()) pill.classList.remove('on');
       var best = current(), a = best && links[best.id];
       if (a === active) return;
@@ -961,35 +1202,121 @@
       active = a;
       if (a) {
         a.classList.add('on');
-        a.scrollIntoView({ block: 'nearest' });
+        // 仅在你主动滚动主视图（且鼠标不在左侧栏浏览目录）或恢复阅读位置时，才在目录容器内部跟随，后台刷新绝不抢滚左栏
+        if ((moved || syncToc) && (!navEl || !navEl.matches(':hover'))) scrollTocTo(a);
       }
-      if (moved && page) store('pos:' + page, best && best !== prompts[0] ? best.id : null);
-    }
-    function step(dir) {
-      var idx = -1;
-      for (var i = 0; i < prompts.length; i++) if (prompts[i].getBoundingClientRect().top <= 90) idx = i;
-      var next = prompts[Math.max(0, Math.min(prompts.length - 1, idx + dir))];
-      if (next) next.scrollIntoView({ block: 'start' });
-    }
-    function turnInView() {
-      var turns = $$('#flow > .turn'), y = window.innerHeight * 0.4, hit = null;
-      turns.forEach(function (t) { var r = t.getBoundingClientRect(); if (r.top <= y && r.bottom >= y) hit = t; });
-      return hit;
     }
 
-    function jump() {
-      var h = decodeURIComponent(location.hash.slice(1));
+    function savePos() {
+      var sy = Math.round(scrollYOf());
+      if (sy < 80) { store(posKey, null); return; }
+      var clear = barClearance(), at = firstBlockAt(clear), anchor = null, anchorTop = 0;
+      for (var idx = at; idx >= 0 && idx < flow.children.length && !anchor; idx++) {
+        var blk = flow.children[idx];
+        var candidates = blk.id ? [blk] : [];
+        candidates = candidates.concat($$('.msg[id], .step[id], .sent[id], details.fold[id], .line[id], details.tools[open] details.tool[id]', blk));
+        for (var i = 0; i < candidates.length; i++) {
+          var r = candidates[i].getBoundingClientRect();
+          if (r.height > 0 && r.bottom > clear) { anchor = candidates[i]; anchorTop = r.top; break; }
+        }
+      }
+      if (anchor) {
+        store(posKey, JSON.stringify({ id: anchor.id, y: Math.round(anchorTop), sy: sy }));
+      } else {
+        store(posKey, JSON.stringify({ id: '', y: 0, sy: sy }));
+      }
+    }
+
+    function restorePos() {
+      var raw = store(posKey);
+      if (!raw) return false;
+      var rec = null;
+      if (raw.charAt(0) === '{') {
+        try { rec = JSON.parse(raw); } catch (e) { return false; }
+      } else {
+        rec = { id: raw, y: 76, sy: 0 };            // 兼容旧版只存了锚点 ID 的格式
+      }
+      if (!rec) return false;
+      var anchor = rec.id ? document.getElementById(rec.id) : null;
+      if (anchor) {
+        if (!anchor.offsetHeight) bulk(function () { reveal(anchor); });
+        if (!anchor.offsetHeight) {
+          var host = anchor.closest('.turn');
+          anchor = (host && ($('.msg.asst', host) || $('.msg.user', host))) || null;
+          rec.y = barClearance();
+        }
+        if (anchor && anchor.offsetHeight) {
+          scrollByY(anchor.getBoundingClientRect().top - rec.y);
+          requestAnimationFrame(function () {
+            if (!userMoved && anchor.isConnected && anchor.offsetHeight) {
+              scrollByY(anchor.getBoundingClientRect().top - rec.y);
+              spy(false, true);
+            }
+          });
+          return true;
+        }
+      }
+      if (rec.sy > 0) {
+        scrollToY(rec.sy);
+        return true;
+      }
+      return false;
+    }
+
+    function step(dir) {
+      if (!prompts.length) return;
+      var clear = barClearance() + 10, idx = -1, lo = 0, hi = prompts.length - 1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (prompts[mid].getBoundingClientRect().top <= clear) { idx = mid; lo = mid + 1; }
+        else hi = mid - 1;
+      }
+      var nextIdx = dir > 0 ? idx + 1 : (idx >= 0 && prompts[idx].getBoundingClientRect().top < clear - 28 ? idx : idx - 1);
+      var next = prompts[Math.max(0, Math.min(prompts.length - 1, nextIdx))];
+      if (next) scrollNodeIntoView(next, true);
+    }
+    function turnInView() {
+      var y = viewHOf() * 0.4, at = firstBlockAt(y);
+      if (at < 0) return null;
+      var blk = flow.children[at];
+      if (blk.classList.contains('turn') && blk.getBoundingClientRect().top <= y) return blk;
+      return null;
+    }
+
+    function findAnchorTarget(h) {
       if (!h) return null;
       var t = document.getElementById(h);
       if (!t && h.slice(0, 2) === 'r-') t = $('[data-r="' + h.slice(2).replace(/[^\w]/g, '') + '"]');
+      return t;
+    }
+
+    function jump(animate) {
+      var h = decodeURIComponent(location.hash.slice(1));
+      var t = findAnchorTarget(h);
       if (!t) return null;
-      reveal(t);
-      t.scrollIntoView({ block: 'start' });
+      bulk(function () { reveal(t); });
+      if (!t.offsetHeight && view !== 'full') {
+        if (view === 'result' && t.closest('.step')) setView('chat', false);
+        else setView('full', false);
+      }
+      scrollNodeIntoView(t, !!animate);
       $$('.flash').forEach(function (x) { x.classList.remove('flash'); });
-      void t.offsetWidth;                   // 让同一个目标再次被点到时也重新闪一下
+      void t.offsetWidth;                   // 让同一个目标再次被点到时也重新亮起边缘光晕
       t.classList.add('flash');
       return t;
     }
+
+    document.addEventListener('click', function (e) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      var a = e.target.closest('a[href^="#"]');
+      if (!a) return;
+      var href = a.getAttribute('href');
+      if (!href || href === '#') return;
+      if (!findAnchorTarget(decodeURIComponent(href.slice(1)))) return;
+      e.preventDefault();
+      if (location.hash !== href) history.pushState(null, '', href);
+      jump(true);
+    });
 
     // 不在最底下时来了新内容：底部浮出一个入口，不擅自滚动
     var pill = null;
@@ -1024,11 +1351,10 @@
       if (j.sig === body.dataset.sig && j.start === olds.length && !j.blocks.length) return { changed: false };
       var news = parse(j.blocks.join('\n')), end = atEnd(), turnsBefore = $$('#flow > .turn').length;
       keepPlace(function () {
-        var head = $('main > .head'), filesOpen = !!$('.files[open]', head), nhead = parse(j.head)[0];
+        var head = $('main .head'), filesOpen = !!$('.files[open]', head), nhead = parse(j.head)[0];
         head.replaceWith(nhead);
         if (filesOpen && $('.files', nhead)) $('.files', nhead).open = true;
         news.forEach(function (n, k) {
-          applyView(n);
           var o = olds[j.start + k];
           if (o) keepOpen(o, n); else n.classList.add('new');
         });
@@ -1037,15 +1363,21 @@
           news.forEach(function (n) { flow.appendChild(n); awaitImages(n); });
         });
       });
-      $('nav .toc').innerHTML = j.toc;
+      if (tocEl && j.toc !== rawToc) {
+        var tst = tocEl.scrollTop;
+        rawToc = j.toc;
+        renderToc();
+        tocEl.scrollTop = tst;
+      }
       if ($('#info') && j.info) $('#info').textContent = JSON.stringify(j.info);
       body.dataset.sig = j.sig;
       document.title = j.title;
       collect();
-      spy();
+      spy(false, false);
       if (activeQ) highlight(activeQ, null, true);
-      if (end) window.scrollTo(0, root.scrollHeight);           // 本来就在看最新的，就继续跟着
+      if (end) scrollToY(scrollHOf());              // 本来就在看最新的，就继续跟着
       else if (!manual && news.length) showPill();
+      syncProgress();
       var more = $$('#flow > .turn').length - turnsBefore;
       return { changed: true, text: more > 0 ? '已更新 · 新增 ' + more + ' 轮对话' : '已更新到最新内容',
         action: end ? null : { action: '跳到最新', run: ACTIONS.end } };
@@ -1061,15 +1393,13 @@
     };
 
     // 初始化
+    var ready = false, userMoved = false;
+    var savePosLater = debounce(savePos, 140), spyLater = debounce(function () { spy(true); }, 50);
     setView(store('view') || 'full', false);
+    renderToc();
     collect();
-    totop = ibtn('up', '回到开头');
-    totop.className += ' totop';
-    totop.dataset.act = 'top';
-    body.appendChild(totop);
-    window.addEventListener('scroll', debounce(function () { spy(true); }, 60), { passive: true });
 
-    var fq = $('#fq'), target = jump(), q0 = '';
+    var fq = $('#fq'), target = jump(false), q0 = '';
     if (fq) {
       q0 = new URLSearchParams(location.search).get('q') || '';
       if (q0) { fq.value = q0; highlight(q0, target); }
@@ -1079,17 +1409,23 @@
         if (e.key === 'Escape') { fq.value = ''; highlight('', null); fq.blur(); }
       };
     }
-    window.addEventListener('hashchange', jump);
+    window.addEventListener('hashchange', function () { jump(true); });
 
-    // 上次读到的位置：不擅自跳过去，给一个入口
-    if (page && !target && !q0) {
-      var last = document.getElementById(store('pos:' + page) || '');
-      if (last && last.getBoundingClientRect().top > window.innerHeight * 1.2) {
-        var num = $('.num', last);
-        toast('上次读到 ' + (num ? num.textContent : '这里'), { action: '接着读', run: function () { last.scrollIntoView({ block: 'start' }); } });
-      }
-    }
-    spy();
+    // 直接恢复到上次阅读的位置（除非本次带了锚点或搜索词）
+    var restored = !target && !q0 && restorePos();
+    spy(false, restored || !!target);
+    requestAnimationFrame(function () { ready = true; syncProgress(); });
+
+    onMainScroll(function () {
+      syncProgressSoon();
+      if (!ready) return;
+      userMoved = true;
+      spyLater();
+      savePosLater();
+    });
+    window.addEventListener('resize', debounce(syncProgress, 120));
+    window.addEventListener('pagehide', function () { if (userMoved) savePos(); });
+    document.addEventListener('visibilitychange', function () { if (document.hidden && userMoved) savePos(); });
 
     document.addEventListener('keydown', function (e) {
       if (box || layer || typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1098,8 +1434,8 @@
       else if (k === 'k') step(-1);
       else if (k === '/' && fq) { e.preventDefault(); fq.focus(); fq.select(); }
       else if (k === 'i' && $('#info')) openInfo(page);
-      else if (k >= '1' && k <= '4') keepPlace(function () { setView(VIEWS[k - 1], true); });
-      else if (k === 'e') {
+      else if (k >= '1' && k <= '3') switchView(VIEWS[k - 1]);
+      else if (k === 'e' && view !== 'result') {
         var t = turnInView(), d = t && $('details.steps', t);
         if (d) keepPlace(function () { bulk(function () { d.open = !d.open; }); });
       }
@@ -1139,7 +1475,26 @@
       var tabs = $$('#ac .tab');
       if (!tabs.some(function (x) { return x.dataset.acct === a && !x.hidden; })) a = '';
       account = a;
-      tabs.forEach(function (x) { x.classList.toggle('on', x.dataset.acct === a); });
+      var chosen = null;
+      tabs.forEach(function (x) {
+        var on = x.dataset.acct === a;
+        x.classList.toggle('on', on);
+        if (on) chosen = x;
+      });
+      var nameEl = $('#ac-name'), dotEl = $('#ac-dot'), cntEl = $('#ac-cnt');
+      if (nameEl && chosen) {
+        var sp = $('span', chosen), ic = $('i', chosen), sm = $('small', chosen);
+        nameEl.textContent = sp ? sp.textContent : '全部账号';
+        if (dotEl) {
+          if (ic && a) {
+            dotEl.style.background = ic.style.background;
+            dotEl.hidden = false;
+          } else {
+            dotEl.hidden = true;
+          }
+        }
+        if (cntEl) cntEl.textContent = sm ? sm.textContent : '';
+      }
     }
 
     function shown(r) {
@@ -1229,15 +1584,28 @@
       $('#synced').textContent = $('#synced', doc).textContent;
       if (nb.dataset.sig === body.dataset.sig) return { changed: false };
       var f = focusedRow(), fp = f && f.dataset.page;
+      var sideScroll = $('#side-scroll'), sst = sideScroll ? sideScroll.scrollTop : 0, mst = scrollYOf();
       list.classList.add('still');          // 换进来的行不再播放入场动画
       list.innerHTML = $('#list', doc).innerHTML;
-      $('#pj').innerHTML = $('#pj', doc).innerHTML;
-      if ($('#ac') && $('#ac', doc)) $('#ac').innerHTML = $('#ac', doc).innerHTML;
-      if (srcSeg && $('#src', doc)) $$('small', srcSeg).forEach(function (s, i) { s.textContent = $$('#src small', doc)[i].textContent; });
+      var npj = $('#pj', doc);
+      if (npj && $('#pj').innerHTML !== npj.innerHTML) $('#pj').innerHTML = npj.innerHTML;
+      var ac = $('#ac'), nac = $('#ac', doc);
+      if (ac && nac) {
+        var odiv = $('div', ac), ndiv = $('div', nac);
+        if (odiv && ndiv && odiv.innerHTML !== ndiv.innerHTML) odiv.innerHTML = ndiv.innerHTML;
+      } else if (!ac && $('.side-acct', doc) && $('.side-head')) {
+        $('.side-head').appendChild($('.side-acct', doc));
+      }
+      if (srcSeg && $('#src', doc)) {
+        var nsmall = $$('#src small', doc);
+        $$('small', srcSeg).forEach(function (s, i) { if (nsmall[i]) s.textContent = nsmall[i].textContent; });
+      }
       $('#totals').textContent = $('#totals', doc).textContent;
       body.dataset.sig = nb.dataset.sig;
       paintTabs();
       run();
+      if (sideScroll) sideScroll.scrollTop = sst;
+      scrollToY(mst);
       var back = fp && $('#list .row[data-page="' + fp + '"] .cover');
       if (back) back.focus({ preventScroll: true });
       return { changed: true, text: '会话列表已更新' };
@@ -1251,9 +1619,15 @@
 
     document.addEventListener('click', function (e) {
       var t = e.target.closest('#pj .tab');
-      if (t) { pick(t.dataset.p); window.scrollTo(0, 0); run(); return; }
+      if (t) { pick(t.dataset.p); scrollToY(0); run(); return; }
       t = e.target.closest('#ac .tab');
-      if (t) { pickAcct(t.dataset.acct); window.scrollTo(0, 0); run(); return; }
+      if (t) {
+        pickAcct(t.dataset.acct);
+        if ($('#ac')) $('#ac').open = false;
+        scrollToY(0);
+        run();
+        return;
+      }
       // 点进会话时给标题起个过渡名字，新页面的大标题会从这里“长”出来
       var cover = e.target.closest('.cover');
       if (cover) {
@@ -1297,17 +1671,18 @@
       list.classList.add('still');
     }
     if (q.value) run(); else filter();
-    if (from) window.scrollTo(0, tab('idx-y') || 0);
+    if (from) scrollToY(tab('idx-y') || 0);
     else q.focus({ preventScroll: true });      // 新打开时光标直接在搜索框里，可以马上输入
-    window.addEventListener('pagehide', function () { tab('idx-y', window.scrollY); });
+    window.addEventListener('pagehide', function () { tab('idx-y', scrollYOf()); });
   }
 
   /* ================= 统计页 ================= */
 
   if (isStats) {
-    var st = $('#st'), rangeSeg = $('#range'), acctSel = $('#acct'), spanEl = $('#span');
+    var st = $('#st'), rangeSeg = $('#range'), spanEl = $('#span'), digestEl = $('#digest');
+    var acctMenu = $('#acct'), acctName = $('#acct-name'), acctDot = $('#acct-dot');
     var range = +(store('st-range') || 30), acct = store('st-acct') || '', data = null, ask = 0;
-    var metric = store('st-metric') || 'cost';
+    var metric = store('st-metric') || 'cost', quipStep = 0;
     var tip = el('div', 'tip');
     tip.setAttribute('role', 'tooltip');
     body.appendChild(tip);
@@ -1323,7 +1698,19 @@
       paintRange();
       load();
     });
-    acctSel.onchange = function () { acct = acctSel.value; store('st-acct', acct); load(); };
+    if (acctMenu) {
+      acctMenu.addEventListener('click', function (e) {
+        var b = e.target.closest('.tab');
+        if (!b) return;
+        var next = b.dataset.acct || '';
+        acctMenu.open = false;
+        if (next === acct) return;
+        acct = next;
+        store('st-acct', acct);
+        syncAcctMenu();
+        load();
+      });
+    }
 
     // quiet：实时更新时悄悄换上新数字；换筛选条件时旧图半透明地留着，等新数据到了再换，不闪白
     function load(fresh, quiet) {
@@ -1341,7 +1728,15 @@
         }).finally(function () { if (mine === ask) st.classList.remove('loading'); });
     }
     pull = function (manual) { return load(manual, !manual); };
-    onSource = function () { load(); };
+    onSource = function () {
+      if (acct && data && data.accounts && !data.accounts.some(function (a) {
+        return (source === 'all' || a.src === source) && a.key === acct;
+      })) {
+        acct = '';
+        store('st-acct', '');
+      }
+      load();
+    };
 
     // ----- 提示框：数值在前、名字在后；内容一律用 textContent -----
     function showTip(e, rows, head) {
@@ -1595,16 +1990,209 @@
       return s;
     }
 
-    function fillAccounts(list) {
-      var keep = acctSel.value || acct;
-      acctSel.length = 1;
-      list.filter(function (a) { return source === 'all' || a.src === source; }).forEach(function (a) {
-        var o = el('option', null, a.name + (a.email && a.email !== a.name ? '（' + a.email + '）' : ''));
-        o.value = a.key;
-        acctSel.appendChild(o);
+    function syncAcctMenu() {
+      if (!acctMenu) return;
+      var chosen = null;
+      $$('.tab', acctMenu).forEach(function (x) {
+        var on = (x.dataset.acct || '') === acct;
+        x.classList.toggle('on', on);
+        if (on) chosen = x;
       });
-      acctSel.value = keep;
-      if (acctSel.value !== keep) { acct = ''; acctSel.value = ''; }
+      if (acctName) {
+        var sp = chosen && $('span', chosen);
+        acctName.textContent = sp ? sp.textContent : '全部账号';
+      }
+      if (acctDot) {
+        var ic = chosen && $('i', chosen);
+        if (ic && acct) {
+          acctDot.style.background = ic.style.background;
+          acctDot.hidden = false;
+        } else {
+          acctDot.hidden = true;
+        }
+      }
+    }
+
+    function fillAccounts(list) {
+      if (!acctMenu) return false;
+      var visible = (list || []).filter(function (a) { return source === 'all' || a.src === source; });
+      if (acct && !visible.some(function (a) { return a.key === acct; })) {
+        acct = '';
+        store('st-acct', '');
+        load();
+        return true;
+      }
+      var box = $('div', acctMenu);
+      if (!box) return false;
+      box.textContent = '';
+      var allBtn = el('button', 'tab' + (!acct ? ' on' : ''));
+      allBtn.type = 'button';
+      allBtn.dataset.acct = '';
+      allBtn.appendChild(el('span', null, '全部账号'));
+      box.appendChild(allBtn);
+      visible.forEach(function (a) {
+        var b = el('button', 'tab' + (acct === a.key ? ' on' : ''));
+        b.type = 'button';
+        b.dataset.acct = a.key;
+        b.title = a.email || a.name;
+        var dot = el('i');
+        dot.style.background = 'hsl(' + hue(a.email || a.key) + ' 55% 55%)';
+        b.appendChild(dot);
+        b.appendChild(el('span', null, a.name));
+        if (a.email && a.email !== a.name) b.appendChild(el('small', null, a.email));
+        box.appendChild(b);
+      });
+      syncAcctMenu();
+      return false;
+    }
+
+    function fmtRatio(x) {
+      if (x >= 100) return Math.round(x).toLocaleString('en-US');
+      if (x >= 10) return x.toFixed(1).replace(/\.0$/, '');
+      return x.toFixed(2).replace(/(\.\d)0$/, '$1').replace(/\.0$/, '');
+    }
+    function quipLine(segs) {
+      var p = el('p');
+      segs.forEach(function (s) {
+        if (!s) return;
+        p.appendChild(Array.isArray(s) ? el('b', null, s[0]) : document.createTextNode(s));
+      });
+      return p;
+    }
+    function buildQuips(d) {
+      var t = d.total, tok = t.tokens || 0, out = t.output || 0, scales = [], tangibles = [], habits = [];
+      if (tok > 0) {
+        // 默认首条：《万叶集》（4,516 首和歌，连题词左注约 45 万 tokens）
+        if (tok >= 450000) {
+          var r0 = fmtRatio(tok / 450000);
+          scales.push(['Token 用量是整部', ['《万叶集》'], '的 ', [r0 + ' 倍'], '——相当于把 4,516 首和歌来回吞吐了 ', [r0 + ' 遍'], '。']);
+        } else {
+          scales.push(['Token 用量约为', ['《万叶集》'], '的 ', [pct(tok / 450000, 0)], '，折合差不多 ', [Math.max(1, Math.round(tok / 450000 * 4516)).toLocaleString() + ' 首'], ' 和歌的篇幅。']);
+        }
+        if (tok >= 1100000) scales.push(['总吞吐量相当于百二十回本', ['《红楼梦》'], '的 ', [fmtRatio(tok / 1100000) + ' 倍'], '。']);
+        else scales.push(['总吞吐量相当于', ['《红楼梦》'], '前 ', [Math.max(1, Math.round(tok / 1100000 * 120)) + ' 回'], ' 的体量。']);
+        if (tok >= 1300000) scales.push(['流经模型的上下文是', ['《三体》三部曲'], '全集的 ', [fmtRatio(tok / 1300000) + ' 倍'], '。']);
+        else scales.push(['流经模型的上下文约为', ['《三体》三部曲'], '的 ', [pct(tok / 1300000, 0)], '。']);
+        if (tok >= 750000) scales.push(['总 Token 量是托尔斯泰', ['《战争与和平》'], '的 ', [fmtRatio(tok / 750000) + ' 倍'], '。']);
+        else scales.push(['总 Token 量约为一部', ['《战争与和平》'], '的 ', [pct(tok / 750000, 0)], '。']);
+        if (tok >= 1200000) scales.push(['Token 总量是', ['《莎士比亚全集》'], '（37 部戏剧与十四行诗）的 ', [fmtRatio(tok / 1200000) + ' 倍'], '。']);
+        else scales.push(['Token 总量约合 ', [Math.max(1, Math.round(tok / 1200000 * 37)) + ' 部'], ' 莎士比亚戏剧。']);
+        if (tok >= 880000) scales.push(['这些 Token 够把', ['《西游记》'], '九九八十一难从头重走 ', [fmtRatio(tok / 880000) + ' 趟'], '。']);
+        if (tok >= 4500000) scales.push(['上下文总吞吐已是整部', ['《资治通鉴》'], '（294 卷）的 ', [fmtRatio(tok / 4500000) + ' 倍'], '。']);
+        if (tok >= 360000) scales.push(['吞吐的上下文体量是阿波罗 11 号登月计算机全部汇编源码的 ', [fmtRatio(tok / 360000) + ' 倍'], '。']);
+        if (tok >= 85000) scales.push(['总 Token 量相当于 Linux 0.01 初版内核源码的 ', [fmtRatio(tok / 85000) + ' 倍'], '。']);
+      } else {
+        scales.push(['已有 ', [d.prompts.toLocaleString() + ' 次'], ' 提问，暂时还没有计入模型的 token 用量。']);
+      }
+
+      if (out > 0) {
+        var mins = out / 240;
+        var dur = mins >= 60 ? fmtRatio(mins / 60) + ' 小时' : Math.max(1, Math.round(mins)) + ' 分钟';
+        tangibles.push(['模型净输出的文字与代码，若按每分钟 60 字不眠不休手敲，得连续敲上 ', [dur], '。']);
+        var pages = Math.max(1, Math.round(out / 500));
+        tangibles.push(['把模型生成的净输出印在 A4 纸上，能叠出约 ', [pages.toLocaleString() + ' 页'],
+          pages >= 1000 ? ' 文稿（足足 ' : ' 文稿。', pages >= 1000 ? [fmtRatio(pages / 500) + ' 包'] : '', pages >= 1000 ? ' 打印纸的厚度）。' : '']);
+      }
+      if (t.cache_read >= 450000) {
+        tangibles.push(['提示词缓存免去了 ', [compact(t.cache_read) + ' tokens'], ' 的重复预读，相当于替模型少翻了 ', [fmtRatio(t.cache_read / 450000) + ' 部《万叶集》'], '。']);
+      }
+      if (t.thinking > 0 && out > 0) {
+        tangibles.push(['模型在正式作答前悄悄推演了 ', [compact(t.thinking) + ' tokens'], ' 的思考链，占全部输出的 ', [pct(t.thinking / out, 0)], '。']);
+      }
+
+      if (d.tools > 0 && d.prompts > 0) {
+        habits.push(['平均你每提 1 个问题，Agent 就在后台自动执行 ', [(d.tools / d.prompts).toFixed(1) + ' 次'], ' 工具调用（累计 ', [d.tools.toLocaleString() + ' 次'], '）。']);
+      }
+      if (d.hours && t.n >= 5) {
+        var win = [0, 0, 0, 0];
+        for (var wd = 0; wd < 7; wd++) for (var hr = 0; hr < 24; hr++) win[Math.floor(hr / 6)] += d.hours[wd][hr];
+        var night = win[0] / t.n;
+        if (night >= 0.22) {
+          habits.push(['有 ', [pct(night, 0)], ' 的回复诞生在凌晨 0–6 点——妥妥的深夜炼丹师作息。']);
+        } else {
+          var names = ['凌晨（0–6 点）', '上午（6–12 点）', '下午（12–18 点）', '夜间（18–24 点）'], bi = 0;
+          for (var wi = 1; wi < 4; wi++) if (win[wi] > win[bi]) bi = wi;
+          habits.push(['你最常在', [names[bi]], '与模型并肩推进，贡献了 ', [pct(win[bi] / t.n, 0)], ' 的回复。']);
+        }
+      }
+      if (d.best_streak >= 2) {
+        habits.push(['最长曾连续 ', [d.best_streak + ' 天'], ' 每天都在和 Agent 切磋代码' + (d.streak >= 2 ? '，目前正连更 ' : '。'),
+          d.streak >= 2 ? [d.streak + ' 天'] : '', d.streak >= 2 ? '。' : '']);
+      }
+      if (d.top && d.top.length && d.top[0].n >= 10) {
+        var tt = d.top[0].title || '未命名会话';
+        if (tt.length > 18) tt = tt.slice(0, 17) + '…';
+        habits.push(['最重度的一场对话', ['「' + tt + '」'], '单场就往返了 ', [d.top[0].n.toLocaleString() + ' 次'], ' 回复（折合 ', [cost(d.top[0])], '）。']);
+      }
+      var insights = tangibles.concat(habits), list = [];
+      var maxLen = Math.max(scales.length, insights.length);
+      for (var qi = 0; qi < maxLen; qi++) {
+        if (qi < scales.length) list.push(scales[qi]);
+        if (qi < insights.length) list.push(insights[qi]);
+      }
+      return list;
+    }
+
+    function paintDigest(d) {
+      if (!digestEl) return;
+      digestEl.textContent = '';
+      var t = d.total;
+      var scopeLbl = d.range.days ? '最近 ' + d.range.days + ' 天' : '全部时间';
+      var headRow = el('div', 'side-h');
+      headRow.appendChild(el('span', null, '摘要'));
+      headRow.appendChild(el('small', null, scopeLbl));
+      digestEl.appendChild(headRow);
+      if (!t.n && !d.prompts) {
+        var emptyBox = el('div', 'quip-card');
+        emptyBox.appendChild(el('p', null, '当前筛选范围内还没有用量记录。'));
+        digestEl.appendChild(emptyBox);
+        return;
+      }
+      var box = el('div', 'digest-box'), rows = el('div', 'digest-rows');
+      var perDay = d.active_days ? (t.cost ? money(t.cost / d.active_days) + ' / 天' : Math.round(t.n / d.active_days) + ' 答 / 天') : '—';
+      var dayText = d.active_days + ' 天' + (d.streak >= 2 ? ' · 连更 ' + d.streak + ' 天'
+        : d.best_streak >= 2 ? ' · 最长 ' + d.best_streak + ' 天' : '');
+      var items = [
+        ['估算花费', cost(t)],
+        ['活跃日均', perDay],
+        ['活跃天数', dayText],
+        ['总吞吐量', compact(t.tokens) + ' tokens'],
+        ['模型净输出', compact(t.output) + ' tokens']
+      ];
+      if (t.thinking > 0) items.push(['思考推演', compact(t.thinking) + ' tokens']);
+      if (t.rate != null) items.push(['缓存命中', pct(t.rate) + ' · ' + compact(t.cache_read)]);
+      items.push(['对话规模', d.sessions + ' 场 · ' + d.prompts + ' 问 · ' + compact(t.n) + ' 答']);
+      if (d.tools > 0) items.push(['工具调用', d.tools.toLocaleString() + ' 次' + (d.prompts ? '（' + (d.tools / d.prompts).toFixed(1) + '/问）' : '')]);
+      items.push(['主力模型', d.favorite ? d.favorite.name + ' · ' + pct(d.favorite.share, 0) : '—']);
+      if (d.projects && d.projects.length) items.push(['头号项目', d.projects[0].proj]);
+      items.forEach(function (r) {
+        var line = el('div');
+        line.appendChild(el('span', null, r[0]));
+        var val = el('b', null, r[1]);
+        val.title = r[1];
+        line.appendChild(val);
+        rows.appendChild(line);
+      });
+      box.appendChild(rows);
+      digestEl.appendChild(box);
+
+      var quips = buildQuips(d);
+      if (!quips.length) return;
+      var qhead = el('div', 'quips-head');
+      qhead.appendChild(el('div', 'side-h', '顺便一提'));
+      var qcard = el('div', 'quip-card');
+      function fillQuips() {
+        qcard.textContent = '';
+        qcard.appendChild(quipLine(quips[quipStep % quips.length]));
+      }
+      if (quips.length > 1) {
+        var nextBtn = ibtn('refresh', '换一条说法', 'sm');
+        nextBtn.onclick = function () { quipStep++; fillQuips(); };
+        qhead.appendChild(nextBtn);
+      }
+      fillQuips();
+      digestEl.appendChild(qhead);
+      digestEl.appendChild(qcard);
     }
 
     function draw() {
@@ -1616,7 +2204,8 @@
     function paint() {
       var d = data, t = d.total;
       hideTip();                            // 指着的那一格马上要被换掉，它的提示框也收起
-      fillAccounts(d.accounts);
+      if (fillAccounts(d.accounts)) return;
+      paintDigest(d);
       spanEl.textContent = d.range.from + ' → ' + d.range.to;
       st.textContent = '';
       if (!t.n && !d.prompts) { st.appendChild(el('p', 'empty', '这段时间里没有用量记录。')); return; }
