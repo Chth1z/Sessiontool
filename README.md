@@ -112,7 +112,7 @@ python -m sessiontool reindex              # 删除索引并重建
 - **只读**：不修改、不删除任何会话记录。
 - **不联网**：服务只监听 `127.0.0.1`，拒绝非本机地址的请求，页面不加载任何外部资源。
 - **读取的位置**
-  - Claude Code 的会话记录：`~/.claude/projects/<项目>/<会话>.jsonl`（各个账号共用这一处）
+  - Claude Code 的会话记录：`~/.claude/projects/<项目>/<会话>.jsonl`（各个账号共用这一处），以及同目录下的标题旁路文件 `<会话>/custom-title.json`、后台任务状态 `~/.claude/jobs/*/state.json`
   - 应用的会话清单（标题、哪些记录属于同一会话、复刻关系、属于哪个账号）：
     `%LOCALAPPDATA%\Claude-Data\<包名>\claude-code-sessions`（2.42304 起）、`%APPDATA%\Claude\claude-code-sessions`；
     Windows 商店版在 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code-sessions`；
@@ -127,7 +127,7 @@ python -m sessiontool reindex              # 删除索引并重建
 
 ## 已知的限制
 
-- 应用清单里没有的记录（终端里直接运行的 Claude Code、或清单已被删除的会话）各自显示为一个会话，带“不在应用列表中”标记，不会互相合并。
+- 桌面应用清单里没有的记录（终端里直接运行的 Claude Code、或桌面应用清单已被删除的会话）各自显示为一个会话，不会互相合并；其中由桌面应用创建但清单缺失的会话会标出“不在应用列表中”，`claude agents` 中用 `Ctrl+X`（或 `claude rm`）移除的后台会话会标出“已归档”。
 - 复刻会话里与原会话重复的消息，搜索结果只列在原会话下。
 - “在应用中打开”依赖应用注册的 `claude://` 链接，由系统默认的那个 Claude 打开；multi-claude 的配置里的会话要在那个配置的窗口里找。不在应用列表中的会话没有这个按钮。
 - 思考过程只有在记录里保存了文字时才显示。应用多数时候只保存一段加密签名、不保存文字，那部分无法还原。

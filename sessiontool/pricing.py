@@ -37,6 +37,7 @@ CLAUDE = {
 # OpenAI（Codex 用的模型）：GPT-6 系列取自第三方整理的价目，没有和 OpenAI 官方价目页核对过；
 # GPT-5 系列是 2025 年的官方价。OpenAI 不单收写缓存的钱，按输入价计
 OPENAI = {
+    'gpt-6-astra': (10, 50, 1, 10, 10),
     'gpt-6.1-sol': (2, 10, 0.1, 2.5, 2.5),
     'gpt-6-sol': (2, 10, 0.2, 2, 2),
     'gpt-5.2': (1.75, 14, 0.175, 1.75, 1.75),
@@ -56,10 +57,12 @@ OPENAI = {
 # 一次请求的提示词（输入 + 缓存）超过这么多 token 时整次改用另一档价格
 TIERS = {
     'claude-haiku-5-5': (100000, (0.5, 2.5, 0.05, 0.625, 1)),
+    'gpt-6-astra': (272000, (20, 75, 2, 20, 20)),
     'gpt-6.1-sol': (272000, (4, 10, 0.2, 2.5, 2.5)),
 }
-FAST = {'claude-opus-5-5': 2, 'claude-opus-5': 2}         # 快速模式的倍数
+FAST = {'claude-opus-5-5': 2, 'claude-opus-5': 2, 'gpt-6-astra': 2}   # 快速模式的倍数
 WEB_SEARCH = 0.01                                         # 每次网页搜索
+ALIASES = {'gpt6astra': 'gpt-6-astra'}
 
 TABLE = dict(CLAUDE, **OPENAI)
 
@@ -81,10 +84,18 @@ def configure(home):
 
 
 def bare(model):
-    """去掉 [1m] 这类标记和云平台的前缀（anthropic.、us.anthropic. ……）。"""
+    """去掉 [1m] 这类标记和云平台的前缀（anthropic.、us.anthropic.、openai. ……），统一常见简写。"""
     m = re.sub(r'\[[^\]]*\]$', '', (model or '').strip().lower())
-    i = m.find('claude-')
-    return m[i:] if i > 0 else m
+    m = re.sub(r'^(?:[\w-]+\.)*(?:anthropic|openai)\.', '', m)
+    for p in ('claude-', 'gpt-'):
+        i = m.find(p)
+        if i > 0:
+            m = m[i:]
+            break
+    for k, v in ALIASES.items():
+        if m == k or m.startswith(k + '-') or m.startswith(k + '@'):
+            return v + m[len(k):]
+    return m
 
 
 @functools.lru_cache(maxsize=None)

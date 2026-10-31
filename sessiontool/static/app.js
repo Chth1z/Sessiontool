@@ -362,7 +362,7 @@
     opt = opt || {};
     var t = el('table', 'grid'), tr = el('tr');
     heads.forEach(function (h, i) { tr.appendChild(el('th', i ? 'n' : null, h)); });
-    if (opt.share) tr.appendChild(el('th', 'bar', '占比'));
+    if (opt.share) tr.appendChild(el('th', 'share', '占比'));
     var thead = el('thead');
     thead.appendChild(tr);
     t.appendChild(thead);
@@ -375,7 +375,7 @@
         row.appendChild(td);
       });
       if (opt.share) {
-        var td = el('td', 'bar'), track = el('span', 'track'), fill = el('i');
+        var td = el('td', 'share'), track = el('span', 'track'), fill = el('i');
         var x = opt.share[k];
         fill.style.width = Math.max(x > 0 ? 1.5 : 0, Math.round(x * 1000) / 10) + '%';
         if (opt.colors) fill.style.background = opt.colors[k];
@@ -422,7 +422,9 @@
   var PERMISSION = { 'default': '每次询问', acceptEdits: '自动接受编辑', plan: '计划模式', auto: '自动判断', bypassPermissions: '跳过权限确认',
     never: '从不询问', 'on-request': '需要时询问', 'on-failure': '失败时询问', untrusted: '不受信任的命令要询问' };
   var STATUS = { completed: '已完成', review_ready: '等你过目', blocked: '受阻', in_progress: '进行中', needs_input: '等你处理', failed: '失败' };
-  var ORIGIN = { codex_exec: '命令行（codex exec）', 'codex-tui': '终端界面', codex_cli_rs: '命令行', vscode: 'VS Code 扩展', codex_vscode: 'VS Code 扩展' };
+  var ORIGIN = { codex_exec: '命令行（codex exec）', 'codex-tui': '终端界面', codex_cli_rs: '命令行', vscode: 'VS Code 扩展', codex_vscode: 'VS Code 扩展',
+    cli: '命令行（Claude Code）', 'sdk-cli': '命令行（SDK）', 'claude-vscode': 'VS Code 扩展',
+    'claude-desktop': 'Claude 桌面应用', 'claude-desktop-3p': 'Claude 桌面应用', 'local-agent': 'Claude 桌面应用', local_agent: 'Claude 桌面应用' };
 
   function usageSection(b, u, agents) {
     var s = section(b, '费用与用量');
@@ -487,7 +489,7 @@
       if (d.account && d.account.email) s.appendChild(field('邮箱', d.account.email));
       if (d.account && d.account.id) s.appendChild(field('账号 ID', d.account.id));
       if (d.org) s.appendChild(field('组织 ID', d.org));
-      pairs(s, [['multi-claude 配置', d.store], ['Codex 版本', d.version], ['从哪里开始的', ORIGIN[d.origin] || d.origin]]);
+      pairs(s, [['multi-claude 配置', d.store], [codex ? 'Codex 版本' : 'Claude Code 版本', d.version], ['从哪里开始的', ORIGIN[d.origin] || d.origin]]);
     }
 
     s = section(b, '位置');

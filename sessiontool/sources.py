@@ -62,10 +62,11 @@ def read_json(path):
 
 
 class Sources:
-    def __init__(self, root=None, stores=None, home=None, codex=None, profile=None):
+    def __init__(self, root=None, stores=None, home=None, codex=None, profile=None, jobs=None):
         user = os.path.expanduser('~')
         config = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(user, '.claude')
         self.root = os.path.abspath(root or os.path.join(config, 'projects'))
+        self.jobs = os.path.abspath(jobs or os.path.join(os.path.dirname(self.root), 'jobs'))
         # stores：[(会话清单目录, 配置名)]；也接受只给目录
         if stores is None:
             self.apps = app_dirs()
@@ -78,6 +79,7 @@ class Sources:
         self.profile = profile or os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or user, '.claude.json')
         self.home = os.path.abspath(home or os.environ.get('SESSIONTOOL_HOME') or os.path.join(user, '.sessiontool'))
         self._manifests = {}        # 清单文件 → (文件状态, 记录)：只重读改过的
+        self._sidecars = {}         # CLI 后台任务与标题旁路文件 → (文件状态, 记录)
         self._threads = (None, {})
         self._hints = (None, ({}, {}))
 
@@ -121,6 +123,37 @@ class Sources:
         for p in [p for p in self._manifests if p not in seen]:
             del self._manifests[p]
         return out
+
+    def claude_sidecars(self):
+        """Claude Code CLI 的旁路状态：(后台任务 {sessionId: {name, state}}, 自定义标题 {sessionId: title})。
+        在 claude agents 里按 Ctrl+X（或 claude rm）删除后台会话时，jobs/<jobId>/state.json 会被删掉，但 .jsonl 原样保留。"""
+        jobs, titles, seen = {}, {}, set()
+
+        def load(p):
+            seen.add(p)
+            try:
+                st = os.stat(p)
+            except OSError:
+                return None
+            stamp = (st.st_mtime_ns, st.st_size)
+            hit = self._sidecars.get(p)
+            if hit and hit[0] == stamp:
+                return hit[1]
+            r = read_json(p)
+            self._sidecars[p] = (stamp, r)
+            return r
+
+        for p in glob.glob(os.path.join(self.jobs, '*', 'state.json')):
+            r = load(p)
+            if isinstance(r, dict) and isinstance(r.get('sessionId'), str) and r['sessionId']:
+                jobs[r['sessionId']] = {'name': str(r.get('name') or '').strip(), 'state': str(r.get('state') or '')}
+        for p in glob.glob(os.path.join(self.root, '*', '*', 'custom-title.json')):
+            r = load(p)
+            if isinstance(r, dict) and 'customTitle' in r:
+                titles[os.path.basename(os.path.dirname(p))] = str(r.get('customTitle') or '').strip()
+        for p in [p for p in self._sidecars if p not in seen]:
+            del self._sidecars[p]
+        return jobs, titles
 
     def account_hints(self):
         """能确定的账号 → 邮箱：Claude Code 在终端里登录的账号，Codex 登录的账号。
@@ -190,7 +223,8 @@ class Sources:
                     con.row_factory = sqlite3.Row
                     for r in con.execute('SELECT * FROM threads'):
                         r = dict(r)
-                        out.setdefault(r['id'], {}).update({k: v for k, v in r.items() if v is not None})
+                        cur = out.setdefault(r['id'], {})
+                        cur.update({k: v for k, v in r.items() if v is not None and (v != '' or k not in cur)})
                 finally:
                     con.close()
             except sqlite3.Error:

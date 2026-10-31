@@ -13,7 +13,7 @@ import threading
 
 from . import codex
 
-SCHEMA = 8
+SCHEMA = 9
 LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
 EMAIL = re.compile(r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)')
 
@@ -319,8 +319,23 @@ class Index:
                         used(use, ctx.get('sid'))
                 elif isinstance(d, dict):
                     t = d.get('type')
-                    if t == 'custom-title' and d.get('customTitle'):
-                        title = d['customTitle']
+                    for k in ('entrypoint', 'version'):
+                        if isinstance(d.get(k), str) and d[k]:
+                            ctx.setdefault(k, d[k])
+                    if d.get('sessionKind') in ('bg', 'daemon', 'daemon-worker'):
+                        ctx.setdefault('kind', d['sessionKind'])
+                    if t == 'agent-name' and 'agentName' in d:
+                        ctx['agent_name'] = str(d.get('agentName') or '').strip()
+                    elif t == 'custom-title' and 'customTitle' in d:
+                        ctx['custom_title'] = str(d.get('customTitle') or '').strip()
+                    elif t == 'ai-title' and 'aiTitle' in d:
+                        ctx['ai_title'] = str(d.get('aiTitle') or '').strip()
+                    elif t == 'summary' and 'summary' in d:
+                        ctx['summary'] = str(d.get('summary') or '').strip()
+                    elif t == 'history-suppression':
+                        ctx['suppressed'] = 1
+                    elif t == 'relocated' and isinstance(d.get('relocatedCwd'), str) and d['relocatedCwd']:
+                        cwd = d['relocatedCwd']
                     elif t == 'attachment':
                         a = d.get('attachment') or {}
                         if a.get('type') == 'session_context':
@@ -344,6 +359,9 @@ class Index:
         if src == 'codex':
             ctx['ts'] = last_ts
             cwd = ctx.get('cwd') or cwd
+            title = ctx.get('title') or None
+        else:
+            title = ctx.get('agent_name') or ctx.get('custom_title') or ctx.get('ai_title') or ctx.get('summary') or None
         con.execute('UPDATE files SET size=?, mtime=?, off=?, guard=?, title=?, cwd=?, email=?, org=?, ctx=? WHERE id=?',
                     (st.st_size, st.st_mtime_ns, off, self._guard(path, off), title, cwd, email, org,
                      json.dumps(ctx, ensure_ascii=False) if ctx else None, fid))

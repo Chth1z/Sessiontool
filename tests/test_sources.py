@@ -183,6 +183,51 @@ class CodexTest(StoreCase):
         self.assertEqual([(it['kind'], it.get('text')) for it in fresh.content(fresh.by_page[s.page])['items']],
                          [(it['kind'], it.get('text')) for it in c['items']])
 
+    def test_codex_titles_injected_context_and_fast_tier(self):
+        tid2 = '01a181a5-33c8-7153-aeed-e07609968ed3'
+        codex_dir = os.path.join(self.tmp.name, 'codex')
+        os.makedirs(codex_dir, exist_ok=True)
+        with open(os.path.join(codex_dir, 'session_index.jsonl'), 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'id': TID, 'thread_name': '索引里的自定义标题'}) + '\n')
+        db = os.path.join(codex_dir, 'state_5.sqlite')
+        con = sqlite3.connect(db)
+        con.execute('CREATE TABLE threads(id TEXT, title TEXT, name TEXT, archived INT)')
+        # SQLite 里的 name 是空字符串时不能盖掉 session_index.jsonl 里的非空名字；注入文本也不能拿来当标题
+        con.execute('INSERT INTO threads VALUES(?,?,?,?)',
+                    (TID, '<permissions instructions>\nallow all\n</permissions instructions>', '', 0))
+        con.execute('INSERT INTO threads VALUES(?,?,?,?)',
+                    (tid2, '<permissions instructions>\nsandbox\n</permissions instructions>', '', 0))
+        con.commit()
+        con.close()
+        self.rollout([
+            cx(0, 'session_meta', {'id': TID, 'cwd': 'C:\\work\\cxproj'}),
+            cx(1, 'response_item', {'type': 'message', 'role': 'user', 'content': [
+                {'type': 'input_text', 'text': '<permissions instructions>\nallow all\n</permissions instructions>'}]}),
+            cx(2, 'response_item', {'type': 'message', 'role': 'user', 'content': [
+                {'type': 'input_text', 'text': 'Approved command prefix saved: `git status`'}]}),
+            cx(3, 'response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': '/model'}]}),
+            cx(4, 'response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': '修复标题显示'}]}),
+            cx(5, 'turn_context', {'cwd': 'C:\\work\\cxproj', 'model': 'gpt-6-astra', 'effort': 'high', 'service_tier': 'priority'}),
+            cx(6, 'event_msg', tokens(1100, 1000, 800, 100))], name=TID)
+        self.rollout([
+            cx(0, 'session_meta', {'id': tid2, 'cwd': 'C:\\work\\cxproj'}),
+            cx(1, 'response_item', {'type': 'message', 'role': 'user', 'content': [
+                {'type': 'input_text', 'text': '<permissions instructions>\nsandbox\n</permissions instructions>'}]}),
+            cx(2, 'response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': '/status'}]}),
+            cx(3, 'response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': '真正的提问内容'}]})],
+            name=tid2)
+        cat = self.open()
+        by = {s.id: s for s in cat.sessions}
+        c1, c2 = cat.content(by['codex_' + TID]), cat.content(by['codex_' + tid2])
+        self.assertEqual((c1['title'], c1['first_prompt']), ('索引里的自定义标题', '修复标题显示'))
+        self.assertEqual(self.texts(c1['items'], 'user'), ['/model', '修复标题显示'])
+        # gpt-6-astra 在 priority (fast) 档位下按 2 倍计价：(200*10 + 800*1 + 100*50) * 2 / 1e6
+        self.assertAlmostEqual(c1['usage']['cost'], (200 * 10 + 800 * 1 + 100 * 50) * 2 / 1e6, places=8)
+        self.assertEqual((c2['title'], c2['first_prompt']), ('真正的提问内容', '真正的提问内容'))
+        self.rollout([{'timestamp': ts(4), 'type': 'thread_name', 'payload': {'thread_name': '流式改名'}}], name=tid2)
+        cat.refresh(force=True)
+        self.assertEqual(cat.content({s.id: s for s in cat.sessions}['codex_' + tid2])['title'], '流式改名')
+
 
 class UsageTest(StoreCase):
     def build(self):
@@ -245,6 +290,13 @@ class PricingTest(StoreCase):
         self.assertEqual(pricing.key('claude-fable-5-1[1m]'), 'claude-fable-5-1')
         self.assertEqual(pricing.key('us.anthropic.claude-sonnet-4-5-20250929-v1:0'), 'claude-sonnet-4-5')
         self.assertEqual(pricing.key('gpt-5-codex'), 'gpt-5-codex')
+        self.assertEqual(pricing.key('gpt-6-astra'), 'gpt-6-astra')
+        self.assertEqual(pricing.key('gpt6astra'), 'gpt-6-astra')
+        self.assertEqual(pricing.key('gpt-6-astra-2026-10-01'), 'gpt-6-astra')
+        self.assertEqual(pricing.key('global.openai.gpt-6-astra'), 'gpt-6-astra')
+        self.assertEqual(pricing.parts('gpt6astra', '', 100000, 10000, 100000, 0, 0, 0)[:3], (1.0, 0.5, 0.1))
+        self.assertEqual(pricing.parts('gpt-6-astra', '', 200000, 10000, 100000, 0, 0, 0)[:3], (4.0, 0.75, 0.2))
+        self.assertEqual(pricing.parts('gpt-6-astra', 'fast', 100000, 10000, 100000, 0, 0, 0)[:3], (2.0, 1.0, 0.2))
         self.assertIsNone(pricing.key('claude-opus-4-9'))
         self.assertEqual([pricing.model_name(m) for m in ('claude-opus-5-5', 'claude-3-5-haiku-20241022', 'claude-opus-4-20250514', 'gpt-6.1-sol')],
                          ['Opus 5.5', 'Haiku 3.5', 'Opus 4', 'gpt-6.1-sol'])

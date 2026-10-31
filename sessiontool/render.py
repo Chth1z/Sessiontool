@@ -759,7 +759,7 @@ def index_row(s, c, depth, now, i, accounts):
         sub = '<span class="lbl">最近</span>' + esc(recent)
     else:
         sub = esc(first) or '（没有文字提问）'
-    ident = s.cli_ids[-1] if s.orphan or s.src == 'codex' else s.id
+    ident = s.cli_ids[-1] if getattr(s, 'unlisted', False) or s.orphan or s.src == 'codex' else s.id
     acts = ('<button type="button" class="ib sm" data-copy="%s" data-copied="会话 ID" title="复制会话 ID" aria-label="复制会话 ID">%s</button>'
             '<button type="button" class="ib sm" data-act="info" title="详情" aria-label="详情">%s</button>'
             % (esc(ident), icon('copy'), icon('info')))

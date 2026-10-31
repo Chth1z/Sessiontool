@@ -11,9 +11,10 @@ import re
 
 CALLS = ('function_call', 'custom_tool_call', 'local_shell_call', 'web_search_call', 'tool_search_call', 'image_generation_call')
 OUTPUTS = ('function_call_output', 'custom_tool_call_output', 'tool_search_output')
-# 应用塞进用户消息的上下文：整段是一个标签（<environment_context>…</environment_context>）、AGENTS.md、图片前后的标记
-INJECTED = re.compile(r'\s*<([\w-]+)(?:\s[^>]*)?>.*</\1>\s*', re.S)
+# 应用塞进用户消息的上下文：整段是一个标签（<environment_context>…</environment_context>、<permissions instructions>…</permissions instructions>）、AGENTS.md、命令前缀提示、图片前后的标记
+INJECTED = re.compile(r'\s*<([\w-]+(?:\s+instructions)?)(?:\s[^>]*)?>.*</\1>\s*', re.S)
 AGENTS = re.compile(r'\s*# AGENTS\.md instructions for ')
+APPROVED_PREFIX = re.compile(r'\s*Approved command prefix saved:')
 IMAGE_TAG = re.compile(r'\s*</?image\b[^>]*>\s*')
 PATCH_FILE = re.compile(r'\*\*\* (?:Add|Update|Delete) File: ([^\r\n"\'`\\]+)')
 JS_CMD = re.compile(r'\bcmd\s*:\s*"((?:[^"\\\n]|\\.)*)"')
@@ -22,7 +23,7 @@ SHELL_FLAGS = ('-lc', '-c', '-Command', '-command', '/c', '/C')
 
 
 def injected(text):
-    return bool(INJECTED.fullmatch(text) or AGENTS.match(text) or IMAGE_TAG.fullmatch(text))
+    return bool(INJECTED.fullmatch(text) or AGENTS.match(text) or APPROVED_PREFIX.match(text) or IMAGE_TAG.fullmatch(text))
 
 
 def data_image(url):
@@ -148,14 +149,20 @@ def token_usage(p, ctx):
         return None
     inp, cr, cw = n(last.get('input_tokens')), n(last.get('cached_input_tokens')), n(last.get('cache_write_input_tokens'))
     return {'mid': 'codex:%s:%d' % (ctx.get('sid') or '', n(total.get('total_tokens'))), 'model': ctx.get('model') or '',
-            'effort': ctx.get('effort') or '', 'speed': '', 'inp': max(0, inp - cr - cw), 'out': n(last.get('output_tokens')),
-            'cr': cr, 'cw5': cw, 'cw1h': 0, 'web': 0, 'think': n(last.get('reasoning_output_tokens'))}
+            'effort': ctx.get('effort') or '', 'speed': ctx.get('speed') or '', 'inp': max(0, inp - cr - cw),
+            'out': n(last.get('output_tokens')), 'cr': cr, 'cw5': cw, 'cw1h': 0, 'web': 0,
+            'think': n(last.get('reasoning_output_tokens'))}
 
 
 def parse_line(d, ctx):
     """一行 → ([(kind, data, text, tool)], 用量或 None)。ctx 是这个文件的上下文（线程 ID、目录、当前的模型……），
     跨行、跨次增量读取都保留着。"""
     t, p = d.get('type'), d.get('payload')
+    if t == 'thread_name':
+        name = (p.get('thread_name') if isinstance(p, dict) else None) or d.get('thread_name')
+        if isinstance(name, str):
+            ctx['title'] = name.strip()
+        return [], None
     if not isinstance(p, dict):
         return [], None
     if t == 'session_meta':
@@ -170,6 +177,9 @@ def parse_line(d, ctx):
         mode = (p.get('collaboration_mode') or {}).get('settings') or {}
         ctx['model'] = p.get('model') or mode.get('model') or ctx.get('model') or ''
         ctx['effort'] = p.get('effort') or mode.get('reasoning_effort') or ctx.get('effort') or ''
+        tier = p.get('service_tier') if 'service_tier' in p else mode.get('service_tier')
+        if tier is not None:
+            ctx['speed'] = 'fast' if tier in ('fast', 'priority') else ''
         if isinstance(p.get('cwd'), str):
             ctx.setdefault('cwd', p['cwd'])
         return [], None

@@ -143,10 +143,75 @@ class MergeTest(Case):
         self.assertEqual((c['nfiles'], c['n_user']), (2, 2))
 
     def test_unlisted_transcript_becomes_its_own_session(self):
-        self.write('cccc3333', [user('u1', None, '终端里的会话', 1, 'cccc3333')])
+        self.write('cccc3333', [user('u1', None, '终端里的会话', 1, 'cccc3333', entrypoint='cli', version='2.1.312')])
+        self.write('dddd4444', [user('u2', None, '桌面应用删掉清单的会话', 2, 'dddd4444', entrypoint='claude-desktop')])
         cat = self.open()
-        self.assertTrue(cat.sessions[0].orphan)
-        self.assertEqual(cat.content(cat.sessions[0])['title'], '终端里的会话')
+        by = {s.id: s for s in cat.sessions}
+        cli_s, desk_s = by['file_cccc3333'], by['file_dddd4444']
+        self.assertTrue(cli_s.unlisted)
+        self.assertFalse(cli_s.orphan)
+        self.assertEqual((cli_s.origin, cli_s.version), ('cli', '2.1.312'))
+        self.assertEqual(cat.content(cli_s)['title'], '终端里的会话')
+        info = cat.info(cli_s)
+        self.assertEqual((info['id'], info['link'], info['cli'], info['orphan']), (None, None, 'cccc3333', False))
+        self.assertTrue(desk_s.orphan)
+        html = self.app.index_html()
+        self.assertEqual(html.count('不在应用列表中'), 1)
+        self.assertIn('data-copy="cccc3333"', html)
+
+    def test_cli_background_job_deletion_marks_session_archived(self):
+        job_dir = os.path.join(self.tmp.name, 'jobs', 'job-1')
+        os.makedirs(job_dir)
+        state_file = os.path.join(job_dir, 'state.json')
+        with open(state_file, 'w', encoding='utf-8') as f:
+            json.dump({'jobId': 'job-1', 'sessionId': 'b1111111', 'name': 'project overview handoff review (2)',
+                       'state': 'completed'}, f)
+        self.write('b1111111', [user('u1', None, '后台任务提问', 1, 'b1111111', entrypoint='cli', sessionKind='bg')])
+        self.write('s2222222', [user('u1', None, '隐藏历史提问', 2, 's2222222', entrypoint='cli'),
+                                {'type': 'history-suppression', 'sessionId': 's2222222'}])
+        cat = self.open()
+        by = {s.id: s for s in cat.sessions}
+        self.assertFalse(by['file_b1111111'].archived)
+        self.assertEqual(cat.content(by['file_b1111111'])['title'], 'project overview handoff review (2)')
+        self.assertTrue(by['file_s2222222'].archived)
+        sig_before = cat.state()
+        # 模拟在 claude agents 里按 Ctrl+X 删除该后台任务：state.json 被删掉，.jsonl 保留在磁盘上
+        os.remove(state_file)
+        self.assertTrue(cat.refresh(force=True))
+        self.assertNotEqual(cat.state(), sig_before)
+        by = {s.id: s for s in cat.sessions}
+        self.assertTrue(by['file_b1111111'].archived)
+        self.assertIn('已归档', self.app.index_html())
+
+    def test_claude_code_titles_and_slash_commands(self):
+        slash = '<command-message>model</command-message>\n<command-name>/model</command-name>\n<command-args></command-args>'
+        # 第一条是 /model，没有标题记录时跳过斜杠命令，取真正的第一条提问当标题
+        self.write('m1111111', [
+            user('u1', None, slash, 1, 'm1111111', entrypoint='cli'),
+            user('u2', 'u1', '<ide_opened_file>foo.py</ide_opened_file><pasted_content id="1">讲解一下提交规则</pasted_content>',
+                 2, 'm1111111', entrypoint='cli')])
+        # CC 自动生成的 ai-title、手动改名（及清空后回退到 ai-title）、旁路 custom-title.json
+        self.write('m2222222', [
+            user('u1', None, slash, 3, 'm2222222', entrypoint='cli'),
+            user('u2', 'u1', '第一条真提问', 4, 'm2222222', entrypoint='cli'),
+            {'type': 'summary', 'summary': '旧摘要'},
+            {'type': 'ai-title', 'aiTitle': 'Git 提交与合并规则解析'},
+            {'type': 'custom-title', 'customTitle': '临时名字'},
+            {'type': 'custom-title', 'customTitle': ''}])
+        self.write('m3333333', [
+            user('u1', None, '<bash-input>git status</bash-input><bash-stdout>clean</bash-stdout>', 5, 'm3333333'),
+            {'type': 'ai-title', 'aiTitle': '自动标题'}])
+        side_dir = os.path.join(self.proj, 'm3333333')
+        os.makedirs(side_dir)
+        with open(os.path.join(side_dir, 'custom-title.json'), 'w', encoding='utf-8') as f:
+            json.dump({'customTitle': '旁路改名'}, f)
+        cat = self.open()
+        _, c1 = self.content(cat, 'file_m1111111')
+        _, c2 = self.content(cat, 'file_m2222222')
+        _, c3 = self.content(cat, 'file_m3333333')
+        self.assertEqual((c1['title'], c1['first_prompt']), ('讲解一下提交规则', '讲解一下提交规则'))
+        self.assertEqual(c2['title'], 'Git 提交与合并规则解析')
+        self.assertEqual((c3['title'], c3['first_prompt']), ('旁路改名', '! git status'))
 
     def test_fork_gets_earlier_history_from_parent_and_a_marker(self):
         self.write('pppp0001', [user('p1', None, '最早的问题', 1, 'pppp0001'), asst('p2', 'p1', '最早的回答', 2, 'pppp0001'),

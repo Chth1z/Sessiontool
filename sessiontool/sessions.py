@@ -15,25 +15,57 @@ import threading
 import time
 import zlib
 
-from . import pricing
+from . import codex as codex_mod, pricing
 from .index import is_agent_file
 
 AUTO_CONTINUE = 'I hit my usage limit while you were working'
 INTERRUPT = re.compile(r'\[Request interrupted by user[^\]]*\]')
 NOTE_PREFIX = ('<task-notification', '<ci-monitor-event')
 EDIT_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch')
+DESKTOP_ENTRYPOINTS = ('claude-desktop', 'claude-desktop-3p', 'local-agent', 'local_agent')
+# 内置斜杠命令（/model、/compact 等）：哪怕后面带参数也不算真正的首问标题；用户自定义技能带参数时则保留
+BUILTIN_CMDS = frozenset((
+    'model', 'compact', 'clear', 'fast', 'effort', 'status', 'cost', 'usage', 'context', 'config', 'settings',
+    'permissions', 'allowed-tools', 'memory', 'doctor', 'help', 'init', 'login', 'logout', 'rename', 'tag', 'color',
+    'theme', 'vim', 'ide', 'mcp', 'hooks', 'plugin', 'plugins', 'reload-plugins', 'agents', 'resume', 'continue',
+    'fork', 'rewind', 'branch', 'export', 'add-dir', 'output-style', 'terminal-setup', 'keybindings',
+    'privacy-settings', 'release-notes', 'upgrade', 'rate-limit-options', 'extra-usage', 'listen', 'voice', 'diff',
+    'pr-comments', 'stats', 'tasks', 'bashes', 'files', 'copy', 'desktop', 'mobile', 'remote-control', 'teleport',
+    'bridge', 'think', 'thinking', 'plan', 'auto', 'sandbox', 'bug', 'quit', 'exit', 'new', 'stash', 'approvals',
+    'personality', 'collab', 'experimental', 'ps', 'clean', 'feedback', 'rollout', 'statusline',
+))
 
 
 def clean_prompt(s):
     """去掉应用塞进用户消息里的机器内容，只留你实际输入的文字。"""
-    s = re.sub(r'<system-reminder>.*?</system-reminder>', '', s, flags=re.S)
-    s = re.sub(r'<local-command-(stdout|stderr|caveat)>.*?</local-command-\1>', '', s, flags=re.S)
+    s = re.sub(r'<pasted_content\b[^>]*>(.*?)</pasted_content(?:\s[^>]*)?>', r'\1', s, flags=re.S)
+    s = re.sub(r'<(system-reminder|ide_opened_file|ide_selection)>.*?</\1>', '', s, flags=re.S)
+    s = re.sub(r'<(local-command|bash)-(stdout|stderr|caveat)>.*?</\1-\2>', '', s, flags=re.S)
     s = re.sub(r'\[Image: source: [^\]\n]+\]', '', s)
     m = re.search(r'<command-name>(.*?)</command-name>', s, flags=re.S)
     if m:
+        cmd = m.group(1).strip()
+        if cmd and not cmd.startswith('/'):
+            cmd = '/' + cmd
         args = re.search(r'<command-args>(.*?)</command-args>', s, flags=re.S)
-        s = (m.group(1).strip() + ' ' + (args.group(1).strip() if args else '')).strip()
+        s = (cmd + ' ' + (args.group(1).strip() if args else '')).strip()
+    else:
+        b = re.search(r'<bash-input>(.*?)</bash-input>', s, flags=re.S)
+        if b:
+            cmd = b.group(1).strip()
+            s = ('! ' + cmd) if cmd else ''
     return s.strip()
+
+
+def is_meta_cmd(text):
+    """内置斜杠命令或不带参数的斜杠命令：不拿来当会话标题或摘要。"""
+    s = (text or '').strip()
+    if not s.startswith('/'):
+        return False
+    parts = s[1:].split(None, 1)
+    if not parts or not re.fullmatch(r'[\w:.-]+', parts[0]):
+        return False
+    return len(parts) == 1 or parts[0].lower() in BUILTIN_CMDS
 
 
 def prompt_text(r):
@@ -211,8 +243,11 @@ def stats(items):
     if sent:
         names['SendUserFile'] += len(sent)
     line = lambda it: it['text'][:160].replace('\n', ' ')
-    # 列表里显示“最近在做什么”：取最后一条有内容的提问，跳过“继续”“Try again”这类
-    recent = next((it for it in reversed(prompts) if len(it['text'].strip()) >= 12), prompts[-1] if prompts else None)
+    first = next((it for it in prompts if not is_meta_cmd(it['text'])), prompts[0] if prompts else None)
+    # 列表里显示“最近在做什么”：取最后一条有内容的提问，跳过斜杠命令和“继续”“Try again”这类
+    real = [it for it in prompts if not is_meta_cmd(it['text'])]
+    pool = real or prompts
+    recent = next((it for it in reversed(pool) if len(it['text'].strip()) >= 12), pool[-1] if pool else None)
     return {'n_user': len(prompts), 'n_asst': sum(1 for it in items if it['kind'] == 'asst'),
             'changed': [(path, n, u) for path, (n, u) in changed.items()],
             'n_tools': sum(names.values()), 'tool_counts': names.most_common(),
@@ -221,7 +256,7 @@ def stats(items):
             'n_compact': sum(1 for it in items if it['kind'] == 'compact'),
             'n_branch': sum(1 for it in items if it['kind'] == 'branch'),
             'first': min(stamps) if stamps else '', 'last': max(stamps) if stamps else '',
-            'first_prompt': line(prompts[0]) if prompts else '', 'last_prompt': line(recent) if recent else ''}
+            'first_prompt': line(first) if first else '', 'last_prompt': line(recent) if recent else ''}
 
 
 def summary(rows):
@@ -241,9 +276,9 @@ def summary(rows):
 
 class Session:
     # 两种来源共有的字段：Claude 的会话不填 Codex 才有的几项，反之亦然
-    DEFAULTS = dict(src='claude', parent=None, parent_id=None, orphan=False, archived=False, created=0, record_title=None,
-                    file_title=None, model='', effort='', permission='', turns=None, branches=(), account='', org='',
-                    store='', agent_files=(), version='', origin='', status=None)
+    DEFAULTS = dict(src='claude', parent=None, parent_id=None, unlisted=False, orphan=False, archived=False, created=0,
+                    record_title=None, file_title=None, model='', effort='', permission='', turns=None, branches=(),
+                    account='', org='', store='', agent_files=(), version='', origin='', status=None)
 
     def __init__(self, **kw):
         self.__dict__.update(self.DEFAULTS)
@@ -282,8 +317,9 @@ class Catalog:
             if not force and time.time() - self.checked < 2:
                 return False
             changed = self.index.sync(progress) > 0
-            # 清单、Codex 的线程表、账号线索都没改过时，拿到的就是上次那几个对象，比较起来很快
-            inputs = (self.sources.app_sessions(), self.sources.codex_threads(), self.sources.account_hints())
+            # 清单、Codex 的线程表、账号线索、CLI 旁路文件都没改过时，比较起来很快
+            inputs = (self.sources.app_sessions(), self.sources.codex_threads(), self.sources.account_hints(),
+                      self.sources.claude_sidecars())
             if changed or inputs != self.inputs:
                 self.inputs = inputs
                 self._build(*inputs)
@@ -291,7 +327,8 @@ class Catalog:
             self.checked = time.time()
             return changed
 
-    def _build(self, apps, threads, hints):
+    def _build(self, apps, threads, hints, sidecars=({}, {})):
+        jobs, custom_titles = sidecars
         files, codex, agents_of, self.agents = {}, [], collections.defaultdict(list), {}
         for f in self.index.files():
             if f['src'] == 'codex':
@@ -309,9 +346,9 @@ class Catalog:
                     ids.append(i)
             used.update(ids)
             raw[sid] = (r, ids)
-        for cli in files:       # 应用清单里没有的记录（终端里跑的、或清单已删除的）各自成一个会话
+        for cli in files:       # 桌面应用清单里没有的记录（终端 CLI 的会话，或桌面应用里已移除清单的会话）各自成一个会话
             if cli not in used:
-                raw['file_' + cli] = ({'_orphan': True}, [cli])
+                raw['file_' + cli] = ({'_unlisted': True}, [cli])
         sessions, taken = {}, set()
 
         def page(key):
@@ -326,18 +363,34 @@ class Catalog:
             own = [files[i] for i in ids if i in files]
             if not own:
                 continue
+            fctx = {}
+            for f in own:
+                fctx.update(json.loads(f['ctx'] or '{}'))
+            unlisted = bool(r.get('_unlisted'))
+            entrypoint = fctx.get('entrypoint') or ''
+            # 只有桌面应用建的会话（entrypoint 是桌面应用）却不在桌面应用清单里，才提示“不在应用列表中”；CLI 本来就不写那份清单
+            orphan = unlisted and entrypoint in DESKTOP_ENTRYPOINTS
+            job = jobs.get(ids[-1])
+            # claude agents 的后台会话（sessionKind='bg'）按 Ctrl+X 删除后会删掉 jobs/<id>/state.json，只留 .jsonl，在 CLI 里不再列出
+            archived = bool(r.get('isArchived')) or (
+                unlisted and ((fctx.get('kind') == 'bg' and job is None) or bool(fctx.get('suppressed'))))
+            has_sidecar = next((i for i in reversed(ids) if i in custom_titles), None)
+            custom_title = custom_titles[has_sidecar] if has_sidecar is not None else (fctx.get('custom_title') or '')
+            job_title = (job.get('name') or '') if job else ''
+            file_title = (fctx.get('agent_name') or custom_title or job_title or fctx.get('ai_title')
+                          or fctx.get('summary') or own[-1]['title'] or None)
             cwd = r.get('cwd') or own[-1]['cwd'] or ''
             status = r.get('postTurnSummary') if isinstance(r.get('postTurnSummary'), dict) else {}
             sessions[sid] = Session(
                 id=sid, page=page(re.sub(r'^(local_|file_)', '', sid).replace('-', '')), record_title=r.get('title'),
-                file_title=own[-1]['title'], cwd=cwd, proj=project(cwd), archived=bool(r.get('isArchived')),
+                file_title=file_title, cwd=cwd, proj=project(cwd), archived=archived,
                 created=r.get('createdAt') or 0, parent_id=r.get('forkedFromSessionId'), cli_ids=ids, files=own,
-                orphan=bool(r.get('_orphan')), size=sum(f['size'] for f in own),
+                unlisted=unlisted, orphan=orphan, size=sum(f['size'] for f in own),
                 agent_files=[a for i in ids for a in agents_of.get(i, ())],
                 account=r.get('_account') or '', org=r.get('_org') or own[-1]['org'] or '', store=r.get('_store') or '',
-                # 以下只用于“详情”：应用自己记下的设置和最近状态
+                # 以下只用于“详情”：应用或 CLI 记下的设置、版本、入口和最近状态
                 model=r.get('model') or '', effort=r.get('effort') or '', permission=r.get('permissionMode') or '',
-                turns=r.get('completedTurns'),
+                turns=r.get('completedTurns'), version=fctx.get('version') or '', origin=entrypoint,
                 branches=[b.split('\x00')[-1] for b in r.get('writtenBranches') or [] if isinstance(b, str)],
                 status={k: str(status.get(k) or '') for k in ('status_category', 'status_detail', 'needs_action')})
         for f in codex:
@@ -346,10 +399,13 @@ class Catalog:
             t = threads.get(tid) or {}
             cwd = re.sub(r'^\\\\\?\\', '', ctx.get('cwd') or t.get('cwd') or f['cwd'] or '')     # 线程表里的带着 \\?\ 前缀
             h = tid.replace('-', '')
+            t_name = (t.get('name') or '').strip()
+            t_title = (t.get('title') or '').strip()
+            clean_t = '' if (codex_mod.injected(t_title) or is_meta_cmd(t_title)) else first_line(t_title)
             sessions['codex_' + tid] = Session(
                 # 线程 ID 的开头是时间，挨着建的几个线程开头相同；页面编号取末尾随机的那段
                 src='codex', id='codex_' + tid, page=page(h[20:] + h[:20]),
-                record_title=t.get('name') or first_line(t.get('title')), cwd=cwd, proj=project(cwd),
+                record_title=t_name or f['title'] or clean_t or None, file_title=f['title'], cwd=cwd, proj=project(cwd),
                 archived=bool(t.get('archived')) or 'archived_sessions' in f['path'], created=t.get('created_at_ms') or 0,
                 cli_ids=[tid], files=[f], size=f['size'], account=t.get('creator_account_id') or ctx.get('acct') or '',
                 model=t.get('model') or ctx.get('model') or '', effort=t.get('reasoning_effort') or ctx.get('effort') or '',
@@ -490,8 +546,9 @@ class Catalog:
         current = s.cli_ids[-1]
         link = lambda x: {'page': x.page, 'title': self.content(x)['title']}
         codex = s.src == 'codex'
+        no_app = s.unlisted or s.orphan or codex
         return {
-            'src': s.src, 'page': s.page, 'title': c['title'], 'id': None if s.orphan or codex else s.id, 'cli': current,
+            'src': s.src, 'page': s.page, 'title': c['title'], 'id': None if no_app else s.id, 'cli': current,
             'orphan': s.orphan, 'archived': s.archived, 'cwd': s.cwd, 'proj': s.proj,
             'account': self.account(s), 'org': s.org, 'store': s.store, 'version': s.version, 'origin': s.origin,
             'files': [{'id': f['cli'], 'path': f['path'], 'size': f['size'], 'current': f['cli'] == current} for f in s.files],
@@ -506,7 +563,7 @@ class Catalog:
             'first_prompt': c['first_prompt'], 'last_prompt': c['last_prompt'],
             'parent': link(s.parent) if s.parent else None,
             'children': [link(x) for x in self.sessions if x.parent is s],
-            'link': None if s.orphan or codex else 'claude://claude.ai/epitaxy/' + s.id,
+            'link': None if no_app else 'claude://claude.ai/epitaxy/' + s.id,
             'resume': ('codex resume ' if codex else 'claude --resume ') + current}
 
     def agent_content(self, agent_id):
@@ -546,8 +603,9 @@ class Catalog:
 
     def state(self, s=None):
         """内容指纹：变了就说明磁盘上有新记录。页面据此实时更新。"""
-        # 应用里改了标题、归档了，认出了账号，也算有变化
-        meta = lambda x: (x.record_title, x.archived, x.status['status_detail'], (self.account(x) or {}).get('name'))
+        # 应用或 CLI 里改了标题、归档了，认出了账号，也算有变化
+        meta = lambda x: (x.record_title, x.file_title, x.archived, x.orphan, x.status['status_detail'],
+                          (self.account(x) or {}).get('name'))
         if s:
             sig = (self.signature(s), meta(s))
         else:
