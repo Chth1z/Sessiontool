@@ -5,13 +5,14 @@
 """
 import collections
 import json
+import re
 import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from . import __version__, render, stats
+from . import __version__, providers, render, stats
 from .details import load_image, load_local_image, load_sent_image, load_tool
 from .export import export_html, export_markdown, safe_name
 from .index import Index
@@ -19,11 +20,20 @@ from .sessions import Catalog, Session
 
 CSP = ("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
        "connect-src 'self'; base-uri 'none'; form-action 'none'")
-STATIC_TYPES = {'app.css': 'text/css; charset=utf-8', 'app.js': 'text/javascript; charset=utf-8',
-                'theme.js': 'text/javascript; charset=utf-8', 'icon.svg': 'image/svg+xml'}
+STATIC_TYPES = {
+    'app.css': 'text/css; charset=utf-8',
+    'theme.js': 'text/javascript; charset=utf-8',
+    'core.js': 'text/javascript; charset=utf-8',
+    'info.js': 'text/javascript; charset=utf-8',
+    'session.js': 'text/javascript; charset=utf-8',
+    'index.js': 'text/javascript; charset=utf-8',
+    'stats.js': 'text/javascript; charset=utf-8',
+    'icon.svg': 'image/svg+xml',
+}
 LOCAL_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
 RANGES = (0, 7, 30, 90, 365)
-SOURCES = ('claude', 'codex', 'gemini')
+SOURCES = providers.PROVIDER_KEYS
+SYNCED_RE = re.compile(r'<time id="synced">[^<]*</time>')
 
 
 class App:
@@ -31,7 +41,7 @@ class App:
         self.sources = sources
         self.index = Index(sources)
         self.catalog = Catalog(self.index)
-        self.pages, self.figures = {}, {}
+        self.pages, self.figures, self._index_cache = {}, {}, None
         self.version = 0                    # 每发现一次变化加一，等着的事件流据此醒来
         self.cond = threading.Condition()
 
@@ -88,7 +98,13 @@ class App:
 
     def index_html(self):
         cat = self.catalog
-        return render.index_page(self.entries(), cat.state(), cat.accounts)
+        key = (cat.state(), time.strftime('%Y-%m-%d'))
+        hit = self._index_cache
+        if hit and hit[0] == key:
+            return SYNCED_RE.sub('<time id="synced">%s</time>' % time.strftime('%H:%M:%S'), hit[1], count=1)
+        html = render.index_page(self.entries(), key[0], cat.accounts)
+        self._index_cache = (key, html)
+        return html
 
     def view(self, s):
         """会话页的各部分（标题区、对话的各块、目录、详情），按内容指纹和详情缓存。"""

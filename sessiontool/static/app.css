@@ -70,10 +70,11 @@ input[type=checkbox]{accent-color:var(--you);margin:0}
 .sp{flex:1}
 .badge{display:inline-block;font-size:11px;line-height:1.7;padding:0 8px;border:1px solid var(--line2);border-radius:999px;color:var(--mut);white-space:nowrap;flex:none;text-decoration:none}
 .badge a{color:inherit}
-.badge.err{color:var(--err);border-color:color-mix(in srgb,var(--err) 60%,transparent)}
-.badge.go{color:var(--claude);border-color:color-mix(in srgb,var(--claude) 60%,transparent)}
-.badge.cx{color:var(--codex);border-color:color-mix(in srgb,var(--codex) 55%,transparent)}
-.badge.gm{color:var(--gemini);border-color:color-mix(in srgb,var(--gemini) 55%,transparent)}
+.badge.err{--bc:var(--err)}
+.badge.go{--bc:var(--claude)}
+.badge.cx{--bc:var(--codex)}
+.badge.gm{--bc:var(--gemini)}
+.badge.err,.badge.go,.badge.cx,.badge.gm{color:var(--bc);border-color:color-mix(in srgb,var(--bc) 58%,transparent)}
 /* 账号：邮箱 @ 前面那段；颜色由邮箱决定，同一个账号到处一个颜色 */
 .acct{display:inline-flex;align-items:center;gap:6px;flex:none;max-width:15em;font-size:11.5px;line-height:1.75;padding:0 8px 0 7px;border-radius:999px;color:hsl(var(--h) 45% 30%);background:hsl(var(--h) 60% 50% / .1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .acct i{width:6px;height:6px;border-radius:50%;background:hsl(var(--h) 55% 50%);flex:none}
@@ -134,7 +135,7 @@ details.menu [data-act=auto].on:after{content:"开";color:var(--ok);font-weight:
 .src-all{flex:none;height:31px;padding:0 10px;font-size:12px;border-radius:8px;color:var(--mut);background:transparent;border:1px dashed var(--line2)}
 .src-all:hover{border-style:solid;border-color:var(--mut);color:var(--fg);background:var(--panel)}
 .src-all.on{border-style:solid;border-color:var(--fg);background:var(--fg);color:var(--bg);font-weight:600}
-body[data-src=claude] .srcb,body[data-src=codex] .srcb,body[data-src=gemini] .srcb{display:none}
+body[data-src]:not([data-src=all]) .srcb{display:none}
 /* 左栏分区标题（账号 / 项目 / 选项 / 摘要）：字号加大、主色突出；内部选项保持克制紧凑 */
 .side-acct{margin:2px 2px 0}
 .side-h{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:15px;font-weight:650;color:var(--fg);letter-spacing:-.005em;margin:18px 6px 8px}
@@ -291,17 +292,16 @@ mark.cur{background:var(--cur)}
 .turn{margin:38px 0}
 .msg{display:flex;gap:14px;margin:14px 0;scroll-margin-top:82px}
 .av{flex:none;width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:12.5px;font-weight:700;color:var(--on-accent)}
+.asst{--sc:var(--claude)}
+.asst.cx{--sc:var(--codex)}
+.asst.gm{--sc:var(--gemini)}
 .user .av{background:var(--you)}
-.asst .av{background:var(--claude)}
-.asst.cx .av{background:var(--codex)}
-.asst.gm .av{background:var(--gemini)}
+.asst .av{background:var(--sc)}
 .mc{flex:1;min-width:0}
 .msg header{display:flex;align-items:center;gap:10px;height:30px;font-size:12px;color:var(--faint)}
 .msg header b{font-size:13.5px;font-weight:650}
 .user header b{color:var(--you)}
-.asst header b{color:var(--claude)}
-.asst.cx header b{color:var(--codex)}
-.asst.gm header b{color:var(--gemini)}
+.asst header b{color:var(--sc)}
 .msg header .spent{font-size:11.5px;color:var(--faint)}
 .facts .spent{color:var(--fg);font-weight:600;cursor:help}
 .num{color:var(--faint);text-decoration:none}
@@ -417,13 +417,13 @@ body.result details.steps,body.result .step,body.result details.tools,body.resul
 .floats .ib{width:38px;height:0;margin:0;border-width:0;border-color:var(--line2);background:var(--panel);box-shadow:none;opacity:0;overflow:hidden;pointer-events:none;transform:translateY(6px);transition:height .2s var(--ease),margin .2s var(--ease),opacity .18s,transform .2s var(--ease),border-color .14s,color .14s}
 .floats .ib.on{height:38px;margin-top:8px;border-width:1px;box-shadow:var(--lift);opacity:1;pointer-events:auto;transform:none}
 /* 跳转定位后的边缘呼吸光晕：紧贴对话气泡轮廓发光，而不是铺一整块方形底色 */
-.msg.user.flash .body,.msg.user.flash:not(:has(.body)) img.pic{animation:glow-you 2.1s var(--ease)}
-.msg.asst.flash .body:after,.step.flash:after{content:"";position:absolute;inset:-8px -12px;border-radius:14px;pointer-events:none;animation:glow-claude 2.1s var(--ease)}
-.msg.asst.cx.flash .body:after,body[data-src=codex] .step.flash:after{animation-name:glow-codex}
-.msg.asst.gm.flash .body:after,body[data-src=gemini] .step.flash:after{animation-name:glow-gemini}
-details.fold.flash,details.tool.flash,.sent.flash{border-radius:10px;animation:glow-claude 2.1s var(--ease)}
-body[data-src=codex] details.fold.flash,body[data-src=codex] details.tool.flash,body[data-src=codex] .sent.flash{animation-name:glow-codex}
-body[data-src=gemini] details.fold.flash,body[data-src=gemini] details.tool.flash,body[data-src=gemini] .sent.flash{animation-name:glow-gemini}
+body{--glow:var(--claude)}
+body[data-src=codex]{--glow:var(--codex)}
+body[data-src=gemini]{--glow:var(--gemini)}
+.msg.user.flash .body,.msg.user.flash:not(:has(.body)) img.pic{--glow:var(--you);animation:glow 2.1s var(--ease)}
+.msg.asst.flash .body:after,.step.flash:after{content:"";position:absolute;inset:-8px -12px;border-radius:14px;pointer-events:none;animation:glow 2.1s var(--ease)}
+.msg.asst.flash .body:after{--glow:var(--sc)}
+details.fold.flash,details.tool.flash,.sent.flash{border-radius:10px;animation:glow 2.1s var(--ease)}
 /* 不在最底下时来了新内容 */
 .newpill{position:fixed;left:50%;bottom:22px;z-index:7;display:inline-flex;align-items:center;gap:6px;padding:7px 13px 7px 16px;border:0;border-radius:999px;background:var(--fg);color:var(--bg);box-shadow:var(--shadow);font-size:13px;opacity:0;pointer-events:none;transform:translate(-50%,10px);transition:opacity .2s,transform .22s var(--ease)}
 .newpill.on{opacity:1;pointer-events:auto;transform:translate(-50%,0)}
@@ -594,10 +594,7 @@ ol.toplist b{grid-column:2;grid-row:1/span 2;align-self:center;font-variant-nume
 
 /* ============ 动效 ============
    只在系统没有要求“减少动态效果”时启用 */
-@keyframes glow-you{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--you),0 0 18px 3px color-mix(in srgb,var(--you) 42%,transparent),0 0 34px 8px color-mix(in srgb,var(--you) 16%,transparent)}}
-@keyframes glow-claude{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--claude),0 0 18px 3px color-mix(in srgb,var(--claude) 38%,transparent),0 0 32px 6px color-mix(in srgb,var(--claude) 14%,transparent)}}
-@keyframes glow-codex{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--codex),0 0 18px 3px color-mix(in srgb,var(--codex) 38%,transparent),0 0 32px 6px color-mix(in srgb,var(--codex) 14%,transparent)}}
-@keyframes glow-gemini{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--gemini),0 0 18px 3px color-mix(in srgb,var(--gemini) 38%,transparent),0 0 32px 6px color-mix(in srgb,var(--gemini) 14%,transparent)}}
+@keyframes glow{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--glow),0 0 18px 3px color-mix(in srgb,var(--glow) 40%,transparent),0 0 32px 6px color-mix(in srgb,var(--glow) 15%,transparent)}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}}
 @keyframes pop{from{opacity:0;transform:translateY(-4px) scale(.98)}}
