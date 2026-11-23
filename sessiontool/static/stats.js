@@ -149,10 +149,11 @@
   // ----- 每天：按模型堆起来的柱子 -----
   function drawDaily(host) {
     var days = data.days, idx = metric === 'cost' ? 1 : 2;
-    var W = Math.max(300, host.clientWidth), H = 236, L = 52, R = 8, T = 10, B = 26;
-    var pw = W - L - R, ph = H - T - B;
     var totals = days.map(function (d) { return d.models.reduce(function (a, m) { return a + m[idx]; }, 0); });
     var tk = ticks(Math.max.apply(null, totals.concat([0])), 4), top = tk[tk.length - 1];
+    var maxLbl = Math.max.apply(null, tk.map(function (v) { return fmtMetric(v, metric).length; }));
+    var W = Math.max(300, host.clientWidth), H = 236, L = Math.max(54, maxLbl * 7 + 12), R = 8, T = 10, B = 26;
+    var pw = W - L - R, ph = H - T - B;
     var band = pw / days.length, bw = Math.max(1.5, Math.min(24, band * 0.7));
     var s = svg('svg', { 'class': 'chart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img',
       'aria-label': '每天的' + (metric === 'cost' ? '费用' : 'token 用量') + '，按模型分开' });
@@ -589,11 +590,12 @@
     c.body.appendChild(ST.grid(['推理强度', '回复', '输出', '其中思考', '费用'], d.efforts.map(function (e) {
       return [e.effort || '（未记录）', ST.compact(e.n), ST.compact(e.output), ST.compact(e.thinking), ST.cost(e)];
     }), { share: d.efforts.map(function (e) { return t.cost ? e.cost / t.cost : 0; }) }));
+    var multi = !!ST.srcSeg();
     c = card('项目', '前 20 个');
     two.appendChild(c.box);
     c.body.appendChild(ST.grid(['项目', '会话', '回复', 'Tokens', '费用'], d.projects.map(function (p) {
       var meta = ST.SRC[p.src];
-      var suffix = src === 'all' && meta && meta.cls ? '（' + meta.name + '）' : '';
+      var suffix = src === 'all' && multi && meta ? '（' + meta.name + '）' : '';
       return [p.proj + suffix, p.sessions, ST.compact(p.n), ST.compact(p.tokens), ST.cost(p)];
     }), { share: d.projects.map(function (p) { return t.cost ? p.cost / t.cost : 0; }) }));
 
@@ -604,7 +606,7 @@
       a.href = '/s/' + x.page;
       head.appendChild(a);
       var meta = ST.SRC[x.src];
-      if (src === 'all' && meta && meta.cls) head.appendChild(el('span', 'badge ' + meta.cls, meta.name));
+      if (src === 'all' && multi && meta) head.appendChild(el('span', 'badge ' + meta.badge, meta.name));
       li.appendChild(head);
       li.appendChild(el('small', null, x.proj + (x.account ? ' · ' + x.account : '') + ' · ' + ST.compact(x.n) + ' 次回复'));
       li.appendChild(el('b', null, ST.cost(x)));

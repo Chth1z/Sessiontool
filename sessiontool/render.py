@@ -83,12 +83,12 @@ def num(n):
 
 
 def money(x):
-    """按 API 价格估算的美元数：$0.004、$1.23、$1,234。"""
+    """按 API 价格估算的美元数：$0.004、$1.23、$1,234.56。"""
     if x is None:
         return '—'
-    if x >= 1000:
-        return '$' + format(round(x), ',')
-    return '$%.2f' % x if x >= 0.01 or not x else '$%.3f' % x
+    if 0 < x < 0.01:
+        return '$%.3f' % x
+    return '$%s' % format(x, ',.2f')
 
 
 def acct_chip(a, cls='acct'):
@@ -147,9 +147,7 @@ def scripts(page, standalone=False):
 
 def src_badge(src, extra=''):
     p = providers.get(src)
-    if not p.cls:
-        return ''
-    cls = ('badge ' + p.cls + (' ' + extra if extra else '')).strip()
+    cls = ('badge ' + (p.cls or 'cl') + (' ' + extra if extra else '')).strip()
     return '<span class="%s">%s</span>' % (cls, esc(p.name))
 
 
@@ -609,8 +607,7 @@ def session_view(s, c, mode, parent=None, state='', back=None, info=None):
            '<button type="button" class="toc-sort" data-act="tocsort" title="切换提问目录顺序">'
            '%s<span>正序</span></button></div></div><div class="toc">' % icon('sort') + toc + '</div>')
     attrs = ' data-page="%s" data-state="/api/state?page=%s" data-sig="%s"' % (s.page, s.page, state) if live else ''
-    if src != 'claude' and src in providers.PROVIDERS:
-        attrs += ' data-src="%s"' % src
+    attrs += ' data-src="%s"' % providers.get(src).key
     head_html = ''.join(['<header class="head"><div class="crumbs">', crumbs, '</div><h1>', esc(c['title']), '</h1><div class="facts">',
                          ''.join(facts), '</div>', changed_files(c, s.cwd), '</header>'])
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号

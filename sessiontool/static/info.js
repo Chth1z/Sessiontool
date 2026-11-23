@@ -49,7 +49,7 @@
     var tags = el('div', 'dtags');
     tags.appendChild(el('span', 'badge', d.proj));
     if (d.account) tags.appendChild(ST.acctChip(d.account));
-    if (p.cls) tags.appendChild(el('span', 'badge ' + p.cls, p.name));
+    tags.appendChild(el('span', 'badge ' + p.badge, p.name));
     if (d.parent) tags.appendChild(el('span', 'badge', '复刻'));
     if (d.archived) tags.appendChild(el('span', 'badge', '已归档'));
     if (d.orphan) tags.appendChild(el('span', 'badge', '不在应用列表中'));

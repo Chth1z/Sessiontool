@@ -7,11 +7,11 @@
   var SVG = 'http://www.w3.org/2000/svg';
   var WEEK = '一二三四五六日';
   var SRC = {
-    claude: { name: 'Claude', attr: 'c', cls: '', who: 'who-claude', idLabel: '记录 ID',
+    claude: { name: 'Claude', attr: 'c', cls: '', badge: 'cl', who: 'who-claude', idLabel: '记录 ID',
       idHint: '当前记录文件的编号，可以用来恢复会话', verLabel: 'Claude Code 版本', permLabel: '权限模式' },
-    codex: { name: 'Codex', attr: 'x', cls: 'cx', who: 'who-codex', idLabel: '线程 ID',
+    codex: { name: 'Codex', attr: 'x', cls: 'cx', badge: 'cx', who: 'who-codex', idLabel: '线程 ID',
       idHint: 'Codex 用它找到这个会话', verLabel: 'Codex 版本', permLabel: '审批' },
-    gemini: { name: 'Gemini', attr: 'g', cls: 'gm', who: 'who-gemini', idLabel: '会话 ID',
+    gemini: { name: 'Gemini', attr: 'g', cls: 'gm', badge: 'gm', who: 'who-gemini', idLabel: '会话 ID',
       idHint: 'Antigravity 用它标识这个会话', verLabel: 'Antigravity 版本', permLabel: '权限模式' }
   };
 
@@ -91,8 +91,8 @@
   }
   function money(x) {                       // 按 API 价格估算的美元数，和服务端的写法一致
     if (x == null) return '—';
-    if (x >= 1000) return '$' + Math.round(x).toLocaleString('en-US');
-    return '$' + (x >= 0.01 || !x ? x.toFixed(2) : x.toFixed(3));
+    if (x > 0 && x < 0.01) return '$' + x.toFixed(3);
+    return '$' + x.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
   function cost(u) { return u.cost ? money(u.cost) + (u.unpriced ? '+' : '') : u.unpriced ? '暂缺价格' : money(0); }
   function unpricedNote(u) {

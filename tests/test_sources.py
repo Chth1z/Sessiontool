@@ -546,6 +546,50 @@ class GeminiTest(StoreCase):
         self.assertEqual(set(st['slots']), {'Opus 5.5', 'Fable 5.2', 'Haiku 5.5'})
         self.assertTrue(all(m['slot'] < len(st['slots']) for m in st['models']))
 
+    def test_gemini_login_account_and_unified_formatting(self):
+        # 1) 从 app_storage.json 读取登录邮箱，且与同邮箱 Claude 未登记会话不互相覆盖
+        gdir = os.path.join(self.tmp.name, 'gemini')
+        os.makedirs(gdir, exist_ok=True)
+        with open(os.path.join(gdir, 'app_storage.json'), 'w', encoding='utf-8') as f:
+            json.dump({'agy.onboarding.lastLoginUsername': 'shared@example.com'}, f)
+        self.gwrite(GID, [{'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE',
+                           'created_at': ts(1), 'content': '<USER_REQUEST>\n测试账号\n</USER_REQUEST>'}])
+        self.write('aaaa1111', [
+            {'type': 'attachment', 'uuid': 'att1', 'parentUuid': None, 'timestamp': ts(1), 'sessionId': 'aaaa1111',
+             'attachment': {'type': 'session_context', 'context': {'userEmail': 'shared@example.com'}}},
+            user('u1', 'att1', 'Claude 同邮箱测试', 2, 'aaaa1111'),
+            asst('a1', 'u1', '好', 3, 'aaaa1111'),
+        ])
+        cat = self.open()
+        by_src = {s.src: s for s in cat.sessions}
+        self.assertEqual(by_src['gemini'].account, 'gemini:shared@example.com')
+        self.assertEqual(cat.account(by_src['gemini'])['name'], 'shared')
+        self.assertEqual(cat.account(by_src['gemini'])['id'], '')
+        self.assertEqual(cat.account(by_src['claude'])['src'], 'claude')
+        self.assertNotEqual(by_src['claude'].account, by_src['gemini'].account)
+        idx_html = self.app.index_html()
+        self.assertIn('data-acct="gemini:shared@example.com"', idx_html)
+        self.assertIn('class="badge cl srcb">Claude</span>', idx_html)
+        self.assertIn('class="badge gm srcb">Gemini</span>', idx_html)
+        # 2) 无 app_storage.json 时回退到 antigravity-cli/cli.log
+        os.remove(os.path.join(gdir, 'app_storage.json'))
+        cli_log = os.path.join(gdir, 'antigravity-cli', 'cli.log')
+        os.makedirs(os.path.dirname(cli_log), exist_ok=True)
+        with open(cli_log, 'w', encoding='utf-8') as f:
+            f.write('I1115 22:57:22 applyAuthResult: email=cliuser@example.com, authMethod=consumer\n')
+        cat.refresh(force=True)
+        gs = [s for s in cat.sessions if s.src == 'gemini'][0]
+        self.assertEqual(gs.account, 'gemini:cliuser@example.com')
+        self.assertEqual(cat.account(gs)['email'], 'cliuser@example.com')
+        # 3) 金额小数位：>= $0.01 与 $0.00 统一千分位 + 两位小数，仅 (0, 0.01) 保留三位
+        self.assertEqual(render.money(None), '—')
+        self.assertEqual(render.money(0), '$0.00')
+        self.assertEqual(render.money(0.004), '$0.004')
+        self.assertEqual(render.money(1.5), '$1.50')
+        self.assertEqual(render.money(858.82), '$858.82')
+        self.assertEqual(render.money(1162.45), '$1,162.45')
+        self.assertEqual(render.money(12345.6), '$12,345.60')
+
 
 class UsageTest(StoreCase):
     def build(self):
