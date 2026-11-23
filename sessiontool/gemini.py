@@ -13,7 +13,8 @@ import os
 import re
 import sqlite3
 from urllib.parse import unquote, urlsplit
-from urllib.request import pathname2url
+
+from .util import readonly_sqlite, tool_hint
 
 USER_REQ = re.compile(r'<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>', re.S)
 USER_META = re.compile(r'\s*<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)\b[^>]*>.*?</\1>\s*', re.S)
@@ -29,6 +30,7 @@ EDIT_ARGS = {
     'replace_file_content': ('TargetFile', 'Path'),
     'multi_replace_file_content': ('TargetFile', 'Path'),
 }
+EDIT_TOOLS = tuple(EDIT_ARGS)
 HINT_BY_TOOL = {
     'read_file': ('Path',),
     'view_file': ('AbsolutePath', 'Path'),
@@ -53,6 +55,14 @@ def conv_id(path):
     if len(parts) >= 4 and parts[-2] == 'logs' and parts[-3] == '.system_generated':
         return parts[-4]
     return os.path.splitext(os.path.basename(p))[0]
+
+
+TS_KEY = 'created_at'
+file_cli = conv_id
+
+
+def finalize_meta(ctx, meta, last_ts):
+    ctx['ts'] = last_ts
 
 
 def uri_to_path(uri):
@@ -208,17 +218,17 @@ def conv_gen_meta(transcript_path):
         return {}
     out = {}
     try:
-        con = sqlite3.connect('file:%s?mode=ro' % pathname2url(db), uri=True, timeout=1)
-        try:
+        with readonly_sqlite(db) as con:
             for (data,) in con.execute('SELECT data FROM gen_metadata'):
                 rec = decode_gen_meta(data)
                 if rec:
                     out[rec[0]] = rec[1:]
-        finally:
-            con.close()
     except sqlite3.Error:
         return {}
     return out
+
+
+load_extra = conv_gen_meta
 
 
 def strip_timestamps(text):
@@ -256,7 +266,6 @@ def media_blocks(media):
 
 def describe(name, args):
     """工具调用 → (一行提示, 改到的文件列表)。"""
-    from .index import tool_hint
     if not isinstance(args, dict):
         return str(args or '')[:120], []
     first = lambda s, lim=120: str(s).replace('\n', ' ').strip()[:lim]

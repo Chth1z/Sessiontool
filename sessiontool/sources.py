@@ -5,7 +5,8 @@ import json
 import os
 import re
 import sqlite3
-from urllib.request import pathname2url
+
+from .util import readonly_sqlite
 
 # 清单里只留用得到的字段：完整的记录带着几十 KB 的提示词快照，缓存起来没有意义
 KEEP = ('sessionId', 'cliSessionId', 'priorCliSessionIds', 'title', 'cwd', 'createdAt', 'lastActivityAt', 'isArchived',
@@ -61,6 +62,52 @@ def read_json(path):
         return None
 
 
+def _file_stamp(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+class _FileCache:
+    """按单个文件的 (mtime_ns, size) 缓存解析结果，并自动清理已删除的文件条目。"""
+
+    def __init__(self):
+        self._items = {}
+
+    def get(self, path, loader):
+        stamp = _file_stamp(path)
+        if stamp is None:
+            return None
+        hit = self._items.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        val = loader(path)
+        self._items[path] = (stamp, val)
+        return val
+
+    def prune(self, keep):
+        for p in [p for p in self._items if p not in keep]:
+            del self._items[p]
+
+
+class _StampCache:
+    """按一组文件的状态指纹缓存聚合结果：任何文件没变动时直接返回上次值。"""
+
+    def __init__(self, initial):
+        self._stamp = None
+        self._value = initial
+
+    def load(self, paths, builder):
+        stamp = tuple((p, _file_stamp(p)) for p in paths if p)
+        if self._stamp == stamp:
+            return self._value
+        self._value = builder()
+        self._stamp = stamp
+        return self._value
+
+
 class Sources:
     def __init__(self, root=None, stores=None, home=None, codex=None, profile=None, jobs=None, gemini=None):
         user = os.path.expanduser('~')
@@ -79,12 +126,12 @@ class Sources:
         # Claude Code 自己登录的账号记在这里（设了 CLAUDE_CONFIG_DIR 时在那个目录里）
         self.profile = profile or os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or user, '.claude.json')
         self.home = os.path.abspath(home or os.environ.get('SESSIONTOOL_HOME') or os.path.join(user, '.sessiontool'))
-        self._manifests = {}        # 清单文件 → (文件状态, 记录)：只重读改过的
-        self._sidecars = {}         # CLI 后台任务与标题旁路文件 → (文件状态, 记录)
-        self._threads = (None, {})
-        self._gemini = (None, {})
-        self._gemini_projects = (None, {})
-        self._hints = (None, ({}, {}))
+        self._manifests = _FileCache()
+        self._sidecars = _FileCache()
+        self._threads = _StampCache({})
+        self._gemini = _StampCache({})
+        self._gemini_projects = _StampCache({})
+        self._hints = _StampCache(({}, {}))
 
     def gemini_dirs(self):
         """Gemini（Antigravity 应用与 CLI）的数据目录 → [(目录, 来源)]。
@@ -128,95 +175,67 @@ class Sources:
         和 _store（multi-claude 的配置名）。一个会话在多处出现时（multi-claude 的配置常从普通应用复制而来）取最近活动的那份。"""
         out, seen = {}, set()
         for d, name in self.stores:
+            def parse_manifest(p, base=d, store_name=name):
+                r = read_json(p)
+                if not isinstance(r, dict) or not r.get('sessionId') or not r.get('cliSessionId'):
+                    return None
+                rel = os.path.relpath(os.path.dirname(p), base).split(os.sep)
+                rel = (rel + ['', ''])[:2] if rel != ['.'] else ['', '']
+                return dict({k: r[k] for k in KEEP if k in r}, _account=rel[0], _org=rel[1], _store=store_name)
+
             for p in glob.glob(os.path.join(d, '**', 'local_*.json'), recursive=True):
                 seen.add(p)
-                try:
-                    st = os.stat(p)
-                except OSError:
-                    continue
-                stamp = (st.st_mtime_ns, st.st_size)
-                hit = self._manifests.get(p)
-                if hit and hit[0] == stamp:
-                    r = hit[1]
-                else:
-                    r = read_json(p)
-                    if not isinstance(r, dict) or not r.get('sessionId') or not r.get('cliSessionId'):
-                        r = None
-                    else:
-                        rel = os.path.relpath(os.path.dirname(p), d).split(os.sep)
-                        rel = (rel + ['', ''])[:2] if rel != ['.'] else ['', '']
-                        r = dict({k: r[k] for k in KEEP if k in r}, _account=rel[0], _org=rel[1], _store=name)
-                    self._manifests[p] = (stamp, r)
+                r = self._manifests.get(p, parse_manifest)
                 if not r:
                     continue
                 old = out.get(r['sessionId'])
                 if not old or (r.get('lastActivityAt') or 0) >= (old.get('lastActivityAt') or 0):
                     out[r['sessionId']] = r
-        for p in [p for p in self._manifests if p not in seen]:
-            del self._manifests[p]
+        self._manifests.prune(seen)
         return out
 
     def claude_sidecars(self):
         """Claude Code CLI 的旁路状态：(后台任务 {sessionId: {name, state}}, 自定义标题 {sessionId: title})。
         在 claude agents 里按 Ctrl+X（或 claude rm）删除后台会话时，jobs/<jobId>/state.json 会被删掉，但 .jsonl 原样保留。"""
         jobs, titles, seen = {}, {}, set()
-
-        def load(p):
-            seen.add(p)
-            try:
-                st = os.stat(p)
-            except OSError:
-                return None
-            stamp = (st.st_mtime_ns, st.st_size)
-            hit = self._sidecars.get(p)
-            if hit and hit[0] == stamp:
-                return hit[1]
-            r = read_json(p)
-            self._sidecars[p] = (stamp, r)
-            return r
-
         for p in glob.glob(os.path.join(self.jobs, '*', 'state.json')):
-            r = load(p)
+            seen.add(p)
+            r = self._sidecars.get(p, read_json)
             if isinstance(r, dict) and isinstance(r.get('sessionId'), str) and r['sessionId']:
                 jobs[r['sessionId']] = {'name': str(r.get('name') or '').strip(), 'state': str(r.get('state') or '')}
         for p in glob.glob(os.path.join(self.root, '*', '*', 'custom-title.json')):
-            r = load(p)
+            seen.add(p)
+            r = self._sidecars.get(p, read_json)
             if isinstance(r, dict) and 'customTitle' in r:
                 titles[os.path.basename(os.path.dirname(p))] = str(r.get('customTitle') or '').strip()
-        for p in [p for p in self._sidecars if p not in seen]:
-            del self._sidecars[p]
+        self._sidecars.prune(seen)
         return jobs, titles
 
     def account_hints(self):
         """能确定的账号 → 邮箱：Claude Code 在终端里登录的账号，Codex 登录的账号。
         另外给出 multi-claude 各配置最近登录的账号 → 配置名，没有邮箱时拿它当名字。文件没改过就用上次的结果。"""
-        paths = [self.profile, os.path.join(self.codex, 'auth.json')] + [os.path.join(p, 'config.json') for p, n in self.apps if n]
-        stamp = []
-        for p in paths:
-            try:
-                st = os.stat(p)
-                stamp.append((st.st_mtime_ns, st.st_size))
-            except OSError:
-                stamp.append(None)
-        if self._hints[0] == stamp:
-            return self._hints[1]
-        emails, names = {}, {}
-        d = read_json(self.profile)
-        oa = d.get('oauthAccount') if isinstance(d, dict) else None
-        if isinstance(oa, dict) and oa.get('accountUuid') and oa.get('emailAddress'):
-            emails[oa['accountUuid']] = oa['emailAddress']
-        d = read_json(os.path.join(self.codex, 'auth.json'))
-        token = ((d or {}).get('tokens') or {}).get('id_token') if isinstance(d, dict) else None
-        claims = jwt_claims(token) if token else {}
-        acct = (claims.get('https://api.openai.com/auth') or {}).get('chatgpt_account_id')
-        if acct and claims.get('email'):
-            emails[acct] = claims['email']
-        for path, name in self.apps:
-            d = read_json(os.path.join(path, 'config.json')) if name else None
-            if isinstance(d, dict) and d.get('lastKnownAccountUuid'):
-                names[d['lastKnownAccountUuid']] = name
-        self._hints = (stamp, (emails, names))
-        return emails, names
+        codex_auth = os.path.join(self.codex, 'auth.json')
+        paths = [self.profile, codex_auth] + [os.path.join(p, 'config.json') for p, n in self.apps if n]
+
+        def build():
+            emails, names = {}, {}
+            d = read_json(self.profile)
+            oa = d.get('oauthAccount') if isinstance(d, dict) else None
+            if isinstance(oa, dict) and oa.get('accountUuid') and oa.get('emailAddress'):
+                emails[oa['accountUuid']] = oa['emailAddress']
+            d = read_json(codex_auth)
+            token = ((d or {}).get('tokens') or {}).get('id_token') if isinstance(d, dict) else None
+            claims = jwt_claims(token) if token else {}
+            acct = (claims.get('https://api.openai.com/auth') or {}).get('chatgpt_account_id')
+            if acct and claims.get('email'):
+                emails[acct] = claims['email']
+            for path, name in self.apps:
+                d = read_json(os.path.join(path, 'config.json')) if name else None
+                if isinstance(d, dict) and d.get('lastKnownAccountUuid'):
+                    names[d['lastKnownAccountUuid']] = name
+            return emails, names
+
+        return self._hints.load(paths, build)
 
     def codex_threads(self):
         """Codex 的线程表 {线程 ID: 行}（标题、是否归档、模型……），在 state_<版本>.sqlite 里。
@@ -227,127 +246,95 @@ class Sources:
 
         dbs = sorted(glob.glob(os.path.join(self.codex, 'state_*.sqlite')), key=version)
         names = os.path.join(self.codex, 'session_index.jsonl')
-        stamp = []
-        for p in dbs[-1:] + [dbs[-1] + '-wal' if dbs else '', names]:
+        watch = dbs[-1:] + ([dbs[-1] + '-wal'] if dbs else []) + [names]
+
+        def build():
+            out = {}
             try:
-                st = os.stat(p)
-                stamp.append((p, st.st_mtime_ns, st.st_size))
+                with open(names, encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(r, dict) and r.get('id') and r.get('thread_name'):
+                            out.setdefault(r['id'], {})['name'] = r['thread_name']
             except OSError:
                 pass
-        if self._threads[0] == stamp:
-            return self._threads[1]
-        out = {}
-        try:
-            with open(names, encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(r, dict) and r.get('id') and r.get('thread_name'):
-                        out.setdefault(r['id'], {})['name'] = r['thread_name']
-        except OSError:
-            pass
-        if dbs:
-            try:
-                con = sqlite3.connect('file:%s?mode=ro' % pathname2url(dbs[-1]), uri=True, timeout=1)
+            if dbs:
                 try:
-                    con.row_factory = sqlite3.Row
-                    for r in con.execute('SELECT * FROM threads'):
-                        r = dict(r)
-                        cur = out.setdefault(r['id'], {})
-                        cur.update({k: v for k, v in r.items() if v is not None and (v != '' or k not in cur)})
-                finally:
-                    con.close()
-            except sqlite3.Error:
-                pass
-        self._threads = (stamp, out)
-        return out
+                    with readonly_sqlite(dbs[-1]) as con:
+                        con.row_factory = sqlite3.Row
+                        for r in con.execute('SELECT * FROM threads'):
+                            r = dict(r)
+                            cur = out.setdefault(r['id'], {})
+                            cur.update({k: v for k, v in r.items() if v is not None and (v != '' or k not in cur)})
+                except sqlite3.Error:
+                    pass
+            return out
+
+        return self._threads.load(watch, build)
 
     def gemini_summaries(self):
         """Gemini（Antigravity）的会话元数据 {会话 ID: 行}（标题、工作区、父会话、是否归档……），
         来自各数据目录的 conversation_summaries.db（只读打开）。数据库改过才重读。"""
-        dbs = []
-        for d, origin in self.gemini_dirs():
-            db = os.path.join(d, 'conversation_summaries.db')
-            if os.path.isfile(db):
-                dbs.append((db, origin))
-        stamp = []
-        for db, _ in dbs:
-            for p in (db, db + '-wal'):
-                try:
-                    st = os.stat(p)
-                    stamp.append((p, st.st_mtime_ns, st.st_size))
-                except OSError:
-                    pass
-        if self._gemini[0] == stamp:
-            return self._gemini[1]
-        out = {}
+        dbs = [os.path.join(d, 'conversation_summaries.db') for d, _ in self.gemini_dirs()]
+        dbs = [db for db in dbs if os.path.isfile(db)]
+        watch = [p for db in dbs for p in (db, db + '-wal')]
         cols = ('conversation_id', 'title', 'preview', 'workspace_uris', 'project_id', 'status', 'source',
                 'agent_name', 'parent_conversation_id', 'nesting_depth', 'killed')
-        for db, _ in dbs:
-            try:
-                con = sqlite3.connect('file:%s?mode=ro' % pathname2url(db), uri=True, timeout=1)
+
+        def build():
+            out = {}
+            for db in dbs:
                 try:
-                    con.row_factory = sqlite3.Row
-                    have = {r[1] for r in con.execute('PRAGMA table_info(conversation_summaries)')}
-                    pick = [c for c in cols if c in have]
-                    if 'conversation_id' in pick:
-                        for r in con.execute('SELECT %s FROM conversation_summaries' % ','.join(pick)):
-                            r = dict(r)
-                            cid = r.get('conversation_id')
-                            if not cid:
-                                continue
-                            cur = out.setdefault(cid, {})
-                            cur.update({k: v for k, v in r.items() if v is not None and (v != '' or k not in cur)})
-                    try:
-                        for cid, arch in con.execute('SELECT conversation_id, MAX(archived) FROM conversations_fts GROUP BY conversation_id'):
-                            if cid and arch:
-                                out.setdefault(cid, {})['archived'] = 1
-                    except sqlite3.Error:
-                        pass
-                finally:
-                    con.close()
-            except sqlite3.Error:
-                pass
-        self._gemini = (stamp, out)
-        return out
+                    with readonly_sqlite(db) as con:
+                        con.row_factory = sqlite3.Row
+                        have = {r[1] for r in con.execute('PRAGMA table_info(conversation_summaries)')}
+                        pick = [c for c in cols if c in have]
+                        if 'conversation_id' in pick:
+                            for r in con.execute('SELECT %s FROM conversation_summaries' % ','.join(pick)):
+                                r = dict(r)
+                                cid = r.get('conversation_id')
+                                if not cid:
+                                    continue
+                                cur = out.setdefault(cid, {})
+                                cur.update({k: v for k, v in r.items() if v is not None and (v != '' or k not in cur)})
+                        try:
+                            for cid, arch in con.execute('SELECT conversation_id, MAX(archived) FROM conversations_fts GROUP BY conversation_id'):
+                                if cid and arch:
+                                    out.setdefault(cid, {})['archived'] = 1
+                        except sqlite3.Error:
+                            pass
+                except sqlite3.Error:
+                    pass
+            return out
+
+        return self._gemini.load(watch, build)
 
     def gemini_projects(self):
         """Antigravity 项目配置 {project_id: {'name': 名称, 'cwd': 路径}}，位于 ~/.gemini/config/projects/*.json。"""
-        base = os.path.join(self.gemini, 'config', 'projects')
-        files = sorted(glob.glob(os.path.join(base, '*.json')))
-        stamp = []
-        for p in files:
-            try:
-                st = os.stat(p)
-                stamp.append((p, st.st_mtime_ns, st.st_size))
-            except OSError:
-                pass
-        if self._gemini_projects[0] == stamp:
-            return self._gemini_projects[1]
-        out = {}
-        for p in files:
-            d = read_json(p)
-            if not isinstance(d, dict) or not isinstance(d.get('id'), str) or not d['id']:
-                continue
-            name = str(d.get('name') or '').strip()
-            cwd = ''
-            pr = d.get('projectResources')
-            res = pr.get('resources') if isinstance(pr, dict) else pr if isinstance(pr, list) else None
-            for item in res or ():
-                if isinstance(item, dict):
-                    u = item.get('uri') or item.get('path') or item.get('workspaceUri') or ''
-                elif isinstance(item, str):
-                    u = item
-                else:
-                    u = ''
-                if isinstance(u, str) and u.strip():
-                    cwd = u.strip()
-                    break
-            out[d['id']] = {'name': name, 'cwd': cwd}
-        self._gemini_projects = (stamp, out)
-        return out
+        files = sorted(glob.glob(os.path.join(self.gemini, 'config', 'projects', '*.json')))
+
+        def build():
+            out = {}
+            for p in files:
+                d = read_json(p)
+                if not isinstance(d, dict) or not isinstance(d.get('id'), str) or not d['id']:
+                    continue
+                name = str(d.get('name') or '').strip()
+                cwd = ''
+                pr = d.get('projectResources')
+                res = pr.get('resources') if isinstance(pr, dict) else pr if isinstance(pr, list) else None
+                for item in res or ():
+                    u = (item.get('uri') or item.get('path') or item.get('workspaceUri') or '') if isinstance(item, dict) else item if isinstance(item, str) else ''
+                    if isinstance(u, str) and u.strip():
+                        cwd = u.strip()
+                        break
+                out[d['id']] = {'name': name, 'cwd': cwd}
+            return out
+
+        return self._gemini_projects.load(files, build)
 
     def plan_usage(self):
         """应用隔一会儿记一次各组织的额度用量：[(组织 ID, 毫秒时间, 5 小时窗口 %, 7 天窗口 %)]，按时间排好。"""

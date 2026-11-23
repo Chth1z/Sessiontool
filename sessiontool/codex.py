@@ -7,10 +7,14 @@
 新版本的模型写一段 JavaScript（exec 工具）去调别的工具，这时按它实际调的工具起名、取提示。
 """
 import json
+import os
 import re
+
+from .util import tool_hint
 
 CALLS = ('function_call', 'custom_tool_call', 'local_shell_call', 'web_search_call', 'tool_search_call', 'image_generation_call')
 OUTPUTS = ('function_call_output', 'custom_tool_call_output', 'tool_search_output')
+EDIT_TOOLS = ('apply_patch',)
 # 应用塞进用户消息的上下文：整段是一个标签（<environment_context>…</environment_context>、<permissions instructions>…</permissions instructions>）、AGENTS.md、命令前缀提示、图片前后的标记
 INJECTED = re.compile(r'\s*<([\w-]+(?:\s+instructions)?)(?:\s[^>]*)?>.*</\1>\s*', re.S)
 AGENTS = re.compile(r'\s*# AGENTS\.md instructions for ')
@@ -20,6 +24,11 @@ PATCH_FILE = re.compile(r'\*\*\* (?:Add|Update|Delete) File: ([^\r\n"\'`\\]+)')
 JS_CMD = re.compile(r'\bcmd\s*:\s*"((?:[^"\\\n]|\\.)*)"')
 JS_TOOL = re.compile(r'\btools\.(\w+)\s*\(')
 SHELL_FLAGS = ('-lc', '-c', '-Command', '-command', '/c', '/C')
+
+
+def file_cli(path):
+    """rollout-<时间>-<线程 ID>.jsonl → 线程 ID。"""
+    return os.path.splitext(os.path.basename(path))[0][-36:]
 
 
 def injected(text):
@@ -96,7 +105,6 @@ def shell_line(cmd):
 
 def describe(name, inp):
     """工具调用 → (显示的名字, 一行提示, 改到的文件)。"""
-    from .index import tool_hint
     code = inp.get('input') if isinstance(inp.get('input'), str) else ''
     paths = list(dict.fromkeys(p.strip() for p in PATCH_FILE.findall(code)))
     first = lambda s: s.strip().split('\n')[0][:120]
@@ -154,7 +162,7 @@ def token_usage(p, ctx):
             'think': n(last.get('reasoning_output_tokens'))}
 
 
-def parse_line(d, ctx):
+def parse_line(d, ctx, extra=None):
     """一行 → ([(kind, data, text, tool)], 用量或 None)。ctx 是这个文件的上下文（线程 ID、目录、当前的模型……），
     跨行、跨次增量读取都保留着。"""
     t, p = d.get('type'), d.get('payload')
@@ -233,3 +241,9 @@ def parse_line(d, ctx):
         return [('user', {'b': [['res', p.get('call_id'), 0, text[:300], len(text), images, error, [], None]]}, '',
                  text[:6000])], None
     return [], None
+
+
+def finalize_meta(ctx, meta, last_ts):
+    ctx['ts'] = last_ts
+    meta['cwd'] = ctx.get('cwd') or meta['cwd']
+    meta['title'] = ctx.get('title') or None

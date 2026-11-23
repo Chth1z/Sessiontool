@@ -1,21 +1,21 @@
-"""把 .jsonl 会话记录解析进 SQLite 索引。
+"""把 .jsonl 会话记录增量解析进 SQLite 索引。
 
 记录文件只会追加，所以索引记住每个文件读到的位置，下次只读新增的部分。
 索引里只存文字和位置；图片、工具的完整输入输出留在原文件里，用到时按偏移量取。
 每次回复的 token 用量另存一张表，统计时不必再读消息。
+各来源的格式解析委托给 providers（claude / codex / gemini），本模块只负责存储与增量调度。
 """
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import threading
 
-from . import codex, gemini
+from . import claude, providers
+from .claude import EMAIL, LOCAL_IMAGE, is_agent_file, parse_record, prompt_blocks, usage as claude_usage
+from .util import HINT_KEYS, flatten_result, is_base64_image, tool_hint
 
 SCHEMA = 11
-LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
-EMAIL = re.compile(r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)')
 
 DDL = """
 CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT UNIQUE, src TEXT, cli TEXT, size INT, mtime INT, off INT, guard TEXT,
@@ -26,167 +26,10 @@ CREATE INDEX rec_file ON rec(file, off);
 CREATE TABLE usage(file INT, off INT, mid TEXT, ts TEXT, sid TEXT, model TEXT, effort TEXT, speed TEXT,
                    inp INT, out INT, cr INT, cw5 INT, cw1h INT, web INT, think INT);
 CREATE INDEX usage_file ON usage(file);
+CREATE INDEX usage_mid ON usage(mid);
 CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
 """
 USAGE_COLS = ('mid', 'ts', 'sid', 'model', 'effort', 'speed', 'inp', 'out', 'cr', 'cw5', 'cw1h', 'web', 'think')
-
-HINT_KEYS = ('description', 'file_path', 'command', 'cmd', 'pattern', 'query', 'url', 'skill', 'prompt', 'path')
-
-
-def tool_hint(inp):
-    if not isinstance(inp, dict):
-        return ''
-    for k in HINT_KEYS:
-        if inp.get(k):
-            # 路径要完整保留（用来汇总改过的文件），其余只是一行提示
-            return str(inp[k]).replace('\n', ' ')[:400 if k in ('file_path', 'path') else 120]
-    return ''
-
-
-def flatten_result(content):
-    """tool_result 的 content → (文字, 图片所在的下标列表)。"""
-    if isinstance(content, str):
-        return content, []
-    texts, images = [], []
-    for j, b in enumerate(content if isinstance(content, list) else []):
-        if not isinstance(b, dict):
-            continue
-        if b.get('type') == 'text':
-            texts.append(b.get('text') or '')
-        elif b.get('type') == 'image':
-            images.append(j)
-    return '\n'.join(texts), images
-
-
-def is_agent_file(path):
-    """子代理的记录放在 <会话>/subagents/ 下，一个子代理一个文件。"""
-    return os.path.basename(os.path.dirname(path)) == 'subagents'
-
-
-def is_base64_image(block):
-    src = block.get('source') or {}
-    return src.get('type') == 'base64' and isinstance(src.get('data'), str)
-
-
-def prompt_blocks(prompt):
-    """回复进行中追加的消息（attachment.prompt）→ (块列表, 文字)。带的图片按下标登记。"""
-    if isinstance(prompt, str):
-        return ([['text', prompt]], prompt) if prompt.strip() else ([], '')
-    blocks, texts = [], []
-    for i, b in enumerate(prompt if isinstance(prompt, list) else []):
-        if not isinstance(b, dict):
-            continue
-        if b.get('type') == 'text' and (b.get('text') or '').strip():
-            texts.append(b['text'])
-        elif b.get('type') == 'image' and is_base64_image(b):
-            blocks.append(['img', i])
-    text = '\n'.join(texts)
-    return ([['text', text]] if text else []) + blocks, text
-
-
-def parse_record(d, sidechain=False):
-    """一行 JSON → (kind, data, text, tool)。只参与父子关系的行返回 ('link', None, '', '')。
-
-    sidechain=True 用于子代理自己的记录文件：那里每一行都带 isSidechain。
-    """
-    link = ('link', None, '', '')
-    t = d.get('type')
-    if t in ('user', 'assistant'):
-        if d.get('isSidechain') and not sidechain:
-            return link
-        msg = d.get('message') or {}
-        content = msg.get('content')
-        if isinstance(content, str):
-            content = [{'type': 'text', 'text': content}]
-        if not isinstance(content, list):
-            return link
-        blocks, texts, tools = [], [], []
-        for i, b in enumerate(content):
-            if not isinstance(b, dict):
-                continue
-            bt = b.get('type')
-            if bt == 'text':
-                s = b.get('text') or ''
-                if s.strip():
-                    blocks.append(['text', s])
-                    texts.append(s)
-            elif bt == 'image':
-                if is_base64_image(b):
-                    blocks.append(['img', i])
-            elif bt == 'thinking':
-                s = (b.get('thinking') or '').strip()
-                if s:
-                    blocks.append(['think', s])
-            elif bt == 'tool_use':
-                inp = b.get('input')
-                name = b.get('name') or '?'
-                hint = tool_hint(inp)
-                extra = None
-                if name == 'SendUserFile' and isinstance(inp, dict):
-                    # 发给你的文件：记下路径，页面上直接列出来，图片还能显示
-                    files = [f for f in inp.get('files') or [] if isinstance(f, str)]
-                    extra = {'files': files, 'caption': str(inp.get('caption') or '')[:500]}
-                blocks.append(['use', b.get('id'), name, hint, i, extra])
-                tools.append('%s %s %s' % (name, hint, json.dumps(inp, ensure_ascii=False)[:3000]))
-            elif bt == 'tool_result':
-                text, images = flatten_result(b.get('content'))
-                local = LOCAL_IMAGE.findall(text)[:20]
-                result = d.get('toolUseResult')
-                agent = result.get('agentId') if isinstance(result, dict) else None
-                blocks.append(['res', b.get('tool_use_id'), i, text[:300], len(text), images,
-                               bool(b.get('is_error')), local, agent if isinstance(agent, str) else None])
-                tools.append(text[:6000])
-        if not blocks:
-            return link
-        data = {'b': blocks}
-        if d.get('isMeta'):
-            data['meta'] = 1
-        if d.get('isCompactSummary'):
-            data['compact'] = 1
-        if msg.get('model') == '<synthetic>' or d.get('isApiErrorMessage'):
-            data['synthetic'] = 1
-        elif t == 'assistant' and msg.get('id'):
-            data['mid'] = msg['id']
-            data['model'] = msg.get('model') or ''
-        origin = (d.get('origin') or {}).get('kind')
-        if origin:
-            data['origin'] = origin
-        return t, data, '\n'.join(texts), '\n'.join(tools)
-    if t == 'attachment':
-        # 回复进行中你追加的消息不记成 user 行，只在这里
-        a = d.get('attachment') or {}
-        if (a.get('type') == 'queued_command' and a.get('commandMode') == 'prompt'
-                and (a.get('origin') or {}).get('kind') in (None, 'human')):
-            blocks, text = prompt_blocks(a.get('prompt'))
-            if blocks:
-                return 'queued', {'b': blocks}, text, ''
-        return link
-    if t == 'system':
-        sub = d.get('subtype')
-        if sub == 'compact_boundary':
-            m = d.get('compactMetadata') or {}
-            return 'compact', {'trigger': m.get('trigger'), 'pre': m.get('preTokens'), 'post': m.get('postTokens')}, '', ''
-        if sub == 'local_command':
-            run = d.get('commandRun') or {}
-            out = re.sub(r'</?local-command-\w+>', '', str(d.get('content') or '')).strip()
-            return 'cmd', {'cmd': run.get('command'), 'args': run.get('args'), 'out': out[:20000]}, '', ''
-    return link
-
-
-def claude_usage(d):
-    """助手消息那一行上的用量。一次回复拆成多行时每行都带同一份，统计时按消息编号去重。"""
-    msg = d.get('message') or {}
-    if d.get('type') != 'assistant' or not msg.get('id') or msg.get('model') == '<synthetic>' or d.get('isApiErrorMessage'):
-        return None
-    u = msg.get('usage') or {}
-    n = lambda x: int(x or 0) if isinstance(x, (int, float)) else 0
-    cw = n(u.get('cache_creation_input_tokens'))
-    cw1h = min(cw, n((u.get('cache_creation') or {}).get('ephemeral_1h_input_tokens')))
-    return {'mid': msg['id'], 'model': msg.get('model') or '', 'effort': d.get('effort') or d.get('perTurnEffort') or '',
-            'speed': u.get('speed') or '', 'inp': n(u.get('input_tokens')), 'out': n(u.get('output_tokens')),
-            'cr': n(u.get('cache_read_input_tokens')), 'cw5': cw - cw1h, 'cw1h': cw1h,
-            'web': n((u.get('server_tool_use') or {}).get('web_search_requests')),
-            'think': n((u.get('output_tokens_details') or {}).get('thinking_tokens'))}
 
 
 class Index:
@@ -205,6 +48,9 @@ class Index:
             con.executescript('DROP TABLE IF EXISTS rec; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS usage;'
                               'DROP TABLE IF EXISTS meta;' + DDL)
             con.execute("INSERT INTO meta VALUES('schema', ?)", (str(SCHEMA),))
+            con.commit()
+        else:
+            con.execute('CREATE INDEX IF NOT EXISTS usage_mid ON usage(mid)')
             con.commit()
 
     def con(self):
@@ -261,26 +107,25 @@ class Index:
             return len(todo) + len(known)
 
     def _parse(self, con, path, src, st, known):
-        start, title, cwd, email, org, ctx = 0, None, None, None, None, {}
+        prov = providers.get(src)
+        start, ctx = 0, {}
+        meta = {'title': None, 'cwd': None, 'email': None, 'org': None}
         if known:
-            fid = known['id']
+            fid, cli = known['id'], known['cli']
             if st.st_size >= known['off'] and self._guard(path, known['off']) == known['guard']:
-                start, title, cwd, email, org = known['off'], known['title'], known['cwd'], known['email'], known['org']
+                start = known['off']
+                meta = {k: known[k] for k in meta}
                 ctx = json.loads(known['ctx'] or '{}')
             else:
                 for table in ('rec', 'usage'):
                     con.execute('DELETE FROM %s WHERE file=?' % table, (fid,))
         else:
-            cli = os.path.splitext(os.path.basename(path))[0]
-            if src == 'codex':          # rollout-<时间>-<线程 ID>
-                cli = cli[-36:]
-            elif src == 'gemini':       # …/brain/<会话 ID>/.system_generated/logs/transcript_full.jsonl
-                cli = gemini.conv_id(path)
+            cli = prov.file_cli(path)
             fid = con.execute('INSERT INTO files(path, src, cli, size, mtime, off, guard) VALUES(?,?,?,0,0,0,?)',
                               (path, src, cli, '')).lastrowid
         if src == 'gemini':
-            ctx.setdefault('sid', known['cli'] if known else cli)
-        gen_meta = gemini.conv_gen_meta(path) if src == 'gemini' else None
+            ctx.setdefault('sid', cli)
+        extra = prov.load_extra(path)
         rows, uses, off = [], [], start
         last_ts = ctx.get('ts', '')
         if src == 'claude' and known and start:
@@ -298,6 +143,19 @@ class Index:
             use.setdefault('sid', sid or '')
             uses.append((fid, off) + tuple(use[k] for k in USAGE_COLS))
 
+        def emit_linear(recs, use):
+            sid = ctx.get('sid')
+            for i, (kind, data, text, tool) in enumerate(recs):
+                # 无内置 uuid 的来源：用字节偏移和会话 ID 拼稳定锚点（前 8 位是偏移）
+                uuid = '%08x%s-%s' % (off & 0xffffffff, '' if i == 0 else '.%d' % i, sid or fid)
+                rows.append((fid, off, uuid, ctx.get('last'), last_ts, sid, kind,
+                             json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
+                ctx['last'] = uuid
+            if use:
+                used(use, sid)
+
+        parse_line = getattr(prov.module, 'parse_line', None)
+        ts_key = getattr(prov.module, 'TS_KEY', 'timestamp')
         with open(path, 'rb') as f:
             f.seek(start)
             while True:
@@ -311,77 +169,28 @@ class Index:
                         break           # 正在写入的半行，下次再读
                     off += len(line)
                     continue
-                if isinstance(d, dict) and src == 'codex':
-                    last_ts = d.get('timestamp') or last_ts
-                    recs, use = codex.parse_line(d, ctx)
-                    for i, (kind, data, text, tool) in enumerate(recs):
-                        # Codex 的行没有编号：用位置和线程 ID 拼一个，前 8 位是位置，当页面里的锚点
-                        uuid = '%08x%s-%s' % (off & 0xffffffff, '' if i == 0 else '.%d' % i, ctx.get('sid') or fid)
-                        rows.append((fid, off, uuid, ctx.get('last'), last_ts, ctx.get('sid'), kind,
-                                     json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
-                        ctx['last'] = uuid
-                    if use:
-                        used(use, ctx.get('sid'))
-                elif isinstance(d, dict) and src == 'gemini':
-                    last_ts = d.get('created_at') or last_ts
-                    recs, use = gemini.parse_line(d, ctx, gen_meta)
-                    for i, (kind, data, text, tool) in enumerate(recs):
-                        uuid = '%08x%s-%s' % (off & 0xffffffff, '' if i == 0 else '.%d' % i, ctx.get('sid') or fid)
-                        rows.append((fid, off, uuid, ctx.get('last'), last_ts, ctx.get('sid'), kind,
-                                     json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
-                        ctx['last'] = uuid
-                    if use:
-                        used(use, ctx.get('sid'))
-                elif isinstance(d, dict):
-                    t = d.get('type')
-                    for k in ('entrypoint', 'version'):
-                        if isinstance(d.get(k), str) and d[k]:
-                            ctx.setdefault(k, d[k])
-                    if d.get('sessionKind') in ('bg', 'daemon', 'daemon-worker'):
-                        ctx.setdefault('kind', d['sessionKind'])
-                    if t == 'agent-name' and 'agentName' in d:
-                        ctx['agent_name'] = str(d.get('agentName') or '').strip()
-                    elif t == 'custom-title' and 'customTitle' in d:
-                        ctx['custom_title'] = str(d.get('customTitle') or '').strip()
-                    elif t == 'ai-title' and 'aiTitle' in d:
-                        ctx['ai_title'] = str(d.get('aiTitle') or '').strip()
-                    elif t == 'summary' and 'summary' in d:
-                        ctx['summary'] = str(d.get('summary') or '').strip()
-                    elif t == 'history-suppression':
-                        ctx['suppressed'] = 1
-                    elif t == 'relocated' and isinstance(d.get('relocatedCwd'), str) and d['relocatedCwd']:
-                        cwd = d['relocatedCwd']
-                    elif t == 'attachment':
-                        a = d.get('attachment') or {}
-                        if a.get('type') == 'session_context':
-                            m = EMAIL.search(str((a.get('context') or {}).get('userEmail') or ''))
-                            email = m.group(1) if m else email
-                        elif a.get('type') == 'credential_org' and a.get('organizationUuid'):
-                            org = a['organizationUuid']
-                    cwd = cwd or d.get('cwd')
-                    if d.get('uuid'):
-                        last_ts = d.get('timestamp') or last_ts
-                        kind, data, text, tool = parse_record(d, sidechain)
-                        rows.append((fid, off, d['uuid'], d.get('parentUuid'), last_ts, d.get('sessionId'), kind,
-                                     json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
-                        use = claude_usage(d)
-                        if use:
-                            used(use, d.get('sessionId'))
+                if isinstance(d, dict):
+                    if parse_line:
+                        last_ts = d.get(ts_key) or last_ts
+                        emit_linear(*parse_line(d, ctx, extra))
+                    else:
+                        claude.update_meta(d, ctx, meta)
+                        if d.get('uuid'):
+                            last_ts = d.get(ts_key) or last_ts
+                            kind, data, text, tool = parse_record(d, sidechain)
+                            rows.append((fid, off, d['uuid'], d.get('parentUuid'), last_ts, d.get('sessionId'), kind,
+                                         json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
+                            use = claude_usage(d)
+                            if use:
+                                used(use, d.get('sessionId'))
                 off += len(line)
                 if len(rows) + len(uses) >= 2000:
                     flush()
         flush()
-        if src == 'codex':
-            ctx['ts'] = last_ts
-            cwd = ctx.get('cwd') or cwd
-            title = ctx.get('title') or None
-        elif src == 'gemini':
-            ctx['ts'] = last_ts
-        else:
-            title = ctx.get('agent_name') or ctx.get('custom_title') or ctx.get('ai_title') or ctx.get('summary') or None
+        prov.module.finalize_meta(ctx, meta, last_ts)
         con.execute('UPDATE files SET size=?, mtime=?, off=?, guard=?, title=?, cwd=?, email=?, org=?, ctx=? WHERE id=?',
-                    (st.st_size, st.st_mtime_ns, off, self._guard(path, off), title, cwd, email, org,
-                     json.dumps(ctx, ensure_ascii=False) if ctx else None, fid))
+                    (st.st_size, st.st_mtime_ns, off, self._guard(path, off), meta['title'], meta['cwd'],
+                     meta['email'], meta['org'], json.dumps(ctx, ensure_ascii=False) if ctx else None, fid))
 
     # ---------- 读取 ----------
 
@@ -389,9 +198,10 @@ class Index:
         return [dict(r) for r in self.con().execute('SELECT * FROM files ORDER BY path')]
 
     def nonempty_files(self):
-        """至少含有一条非连接记录或用量记录的文件编号集合，用来跳过空占位文件。"""
+        """至少含有一条非连接记录或用量记录的文件编号集合（利用文件索引早停，避免扫全表）。"""
         return {r[0] for r in self.con().execute(
-            "SELECT DISTINCT file FROM rec WHERE kind!='link' UNION SELECT DISTINCT file FROM usage")}
+            "SELECT id FROM files f WHERE EXISTS (SELECT 1 FROM rec r WHERE r.file=f.id AND r.kind!='link' LIMIT 1) "
+            "OR EXISTS (SELECT 1 FROM usage u WHERE u.file=f.id LIMIT 1)")}
 
     def rows(self, file_id, start=0):
         """一份记录里的各行（start：只要从这个位置起的），按位置排。"""

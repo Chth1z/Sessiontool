@@ -4,15 +4,9 @@ import collections
 from datetime import datetime, timedelta
 
 from . import pricing
+from .util import parse_iso_local as when
 
 SLOTS = 10          # 图上单独着色的模型数，其余并成“其他”
-
-
-def when(ts):
-    try:
-        return datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone()
-    except (AttributeError, ValueError):
-        return None
 
 
 def streaks(days, today):

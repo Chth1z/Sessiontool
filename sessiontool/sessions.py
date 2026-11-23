@@ -16,14 +16,21 @@ import threading
 import time
 import zlib
 
-from . import codex as codex_mod, gemini as gemini_mod, pricing
-from .index import is_agent_file
+from . import codex as codex_mod, gemini as gemini_mod, pricing, providers
+from .claude import is_agent_file
 
 AUTO_CONTINUE = 'I hit my usage limit while you were working'
 INTERRUPT = re.compile(r'\[Request interrupted by user[^\]]*\]')
+PASTED_RE = re.compile(r'<pasted_content\b[^>]*>(.*?)</pasted_content(?:\s[^>]*)?>', re.S)
+SYS_TAG_RE = re.compile(r'<(system-reminder|ide_opened_file|ide_selection)>.*?</\1>', re.S)
+CMD_OUT_RE = re.compile(r'<(local-command|bash)-(stdout|stderr|caveat)>.*?</\1-\2>', re.S)
+IMG_SRC_RE = re.compile(r'\[Image: source: [^\]\n]+\]')
+CMD_NAME_RE = re.compile(r'<command-name>(.*?)</command-name>', re.S)
+CMD_ARGS_RE = re.compile(r'<command-args>(.*?)</command-args>', re.S)
+BASH_IN_RE = re.compile(r'<bash-input>(.*?)</bash-input>', re.S)
+META_CMD_RE = re.compile(r'[\w:.-]+')
 NOTE_PREFIX = ('<task-notification', '<ci-monitor-event')
-EDIT_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch',
-              'edit_file', 'write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content')
+EDIT_TOOLS = providers.EDIT_TOOLS
 DESKTOP_ENTRYPOINTS = ('claude-desktop', 'claude-desktop-3p', 'local-agent', 'local_agent')
 # 内置斜杠命令（/model、/compact 等）：哪怕后面带参数也不算真正的首问标题；用户自定义技能带参数时则保留
 BUILTIN_CMDS = frozenset((
@@ -40,19 +47,21 @@ BUILTIN_CMDS = frozenset((
 
 def clean_prompt(s):
     """去掉应用塞进用户消息里的机器内容，只留你实际输入的文字。"""
-    s = re.sub(r'<pasted_content\b[^>]*>(.*?)</pasted_content(?:\s[^>]*)?>', r'\1', s, flags=re.S)
-    s = re.sub(r'<(system-reminder|ide_opened_file|ide_selection)>.*?</\1>', '', s, flags=re.S)
-    s = re.sub(r'<(local-command|bash)-(stdout|stderr|caveat)>.*?</\1-\2>', '', s, flags=re.S)
-    s = re.sub(r'\[Image: source: [^\]\n]+\]', '', s)
-    m = re.search(r'<command-name>(.*?)</command-name>', s, flags=re.S)
+    if not s or ('<' not in s and '[Image: source:' not in s):
+        return s.strip() if s else ''
+    s = PASTED_RE.sub(r'\1', s)
+    s = SYS_TAG_RE.sub('', s)
+    s = CMD_OUT_RE.sub('', s)
+    s = IMG_SRC_RE.sub('', s)
+    m = CMD_NAME_RE.search(s)
     if m:
         cmd = m.group(1).strip()
         if cmd and not cmd.startswith('/'):
             cmd = '/' + cmd
-        args = re.search(r'<command-args>(.*?)</command-args>', s, flags=re.S)
+        args = CMD_ARGS_RE.search(s)
         s = (cmd + ' ' + (args.group(1).strip() if args else '')).strip()
     else:
-        b = re.search(r'<bash-input>(.*?)</bash-input>', s, flags=re.S)
+        b = BASH_IN_RE.search(s)
         if b:
             cmd = b.group(1).strip()
             s = ('! ' + cmd) if cmd else ''
@@ -65,7 +74,7 @@ def is_meta_cmd(text):
     if not s.startswith('/'):
         return False
     parts = s[1:].split(None, 1)
-    if not parts or not re.fullmatch(r'[\w:.-]+', parts[0]):
+    if not parts or not META_CMD_RE.fullmatch(parts[0]):
         return False
     return len(parts) == 1 or parts[0].lower() in BUILTIN_CMDS
 
@@ -180,7 +189,7 @@ def assemble(recs, links, own_ids, forked):
                         tu['nimg'] = len(tu['imgs']) + len(tu['local'])
             if d.get('meta'):
                 continue
-            body = clean_prompt('\n\n'.join(texts))
+            body = clean_prompt('\n\n'.join(texts)) if texts else ''
             if not body and not imgs:
                 continue
             if INTERRUPT.fullmatch(body):
@@ -335,11 +344,11 @@ class Catalog:
         jobs, custom_titles = sidecars
         gemini_meta, gemini_projs = gemini_meta or {}, gemini_projs or {}
         nonempty = self.index.nonempty_files()
-        files, codex, gemini_files, agents_of = {}, [], [], collections.defaultdict(list)
+        files, codex_files, gemini_files, agents_of = {}, [], [], collections.defaultdict(list)
         self.agents, self.agent_labels = {}, {}
         for f in self.index.files():
             if f['src'] == 'codex':
-                codex.append(f)
+                codex_files.append(f)
             elif f['src'] == 'gemini':
                 gemini_files.append(f)
             elif is_agent_file(f['path']):     # 子代理的记录不是独立会话，按编号挂到调用它的地方
@@ -347,6 +356,37 @@ class Catalog:
                 agents_of[os.path.basename(os.path.dirname(os.path.dirname(f['path'])))].append(f)
             else:
                 files[f['cli']] = f
+
+        taken = set()
+
+        def page(key):
+            n = 8
+            while key[:n] in taken and n < len(key):
+                n += 1
+            taken.add(key[:n])
+            return key[:n]
+
+        sessions = {}
+        self._build_claude(sessions, files, apps, jobs, custom_titles, agents_of, nonempty, page)
+        self._build_codex(sessions, codex_files, threads, nonempty, page)
+        self._build_gemini(sessions, gemini_files, gemini_meta, gemini_projs, agents_of, nonempty, page)
+        for s in sessions.values():
+            p = sessions.get(s.parent_id)
+            s.parent = p if p is not s else None
+        self._accounts(sessions.values(), *hints)
+        self.sessions = list(sessions.values())
+        self.by_page = {s.page: s for s in self.sessions}
+        self.owner, self.by_cli = {}, {}
+        for s in sorted(self.sessions, key=lambda s: s.created):
+            for f in s.files:
+                self.owner.setdefault(f['id'], s)
+            for i in s.cli_ids:
+                self.by_cli.setdefault(i, s)
+            for a in s.agent_files:
+                if a['src'] == 'gemini':
+                    self.by_cli.setdefault(a['cli'], s)
+
+    def _build_claude(self, sessions, files, apps, jobs, custom_titles, agents_of, nonempty, page):
         raw, used = {}, set()
         for sid, r in apps.items():
             ids = []
@@ -358,15 +398,6 @@ class Catalog:
         for cli in files:       # 桌面应用清单里没有的记录（终端 CLI 的会话，或桌面应用里已移除清单的会话）各自成一个会话
             if cli not in used:
                 raw['file_' + cli] = ({'_unlisted': True}, [cli])
-        sessions, taken = {}, set()
-
-        def page(key):
-            n = 8
-            while key[:n] in taken and n < len(key):
-                n += 1
-            taken.add(key[:n])
-            return key[:n]
-
         for sid in sorted(raw):
             r, ids = raw[sid]
             own = [files[i] for i in ids if i in files]
@@ -405,7 +436,9 @@ class Catalog:
                 turns=r.get('completedTurns'), version=fctx.get('version') or '', origin=entrypoint,
                 branches=[b.split('\x00')[-1] for b in r.get('writtenBranches') or [] if isinstance(b, str)],
                 status={k: str(status.get(k) or '') for k in ('status_category', 'status_detail', 'needs_action')})
-        for f in codex:
+
+    def _build_codex(self, sessions, codex_files, threads, nonempty, page):
+        for f in codex_files:
             if f['id'] not in nonempty:
                 continue
             ctx = json.loads(f['ctx'] or '{}')
@@ -425,6 +458,8 @@ class Catalog:
                 model=t.get('model') or ctx.get('model') or '', effort=t.get('reasoning_effort') or ctx.get('effort') or '',
                 permission=t.get('approval_mode') or '', branches=[b for b in [t.get('git_branch') or ctx.get('branch')] if b],
                 version=ctx.get('version') or t.get('cli_version') or '', origin=ctx.get('origin') or t.get('originator') or '')
+
+    def _build_gemini(self, sessions, gemini_files, gemini_meta, gemini_projs, agents_of, nonempty, page):
         gemini_by_id = {f['cli']: f for f in gemini_files}
         gemini_roots = []
         for f in gemini_files:
@@ -478,21 +513,6 @@ class Catalog:
                 record_title=g_title, cwd=cwd, proj=proj, archived=bool(m.get('archived')),
                 cli_ids=[cid], files=[f], size=f['size'], agent_files=ag_list,
                 model=ctx.get('model') or '', effort=ctx.get('effort') or '', origin=origin)
-        for s in sessions.values():
-            p = sessions.get(s.parent_id)
-            s.parent = p if p is not s else None
-        self._accounts(sessions.values(), *hints)
-        self.sessions = list(sessions.values())
-        self.by_page = {s.page: s for s in self.sessions}
-        self.owner, self.by_cli = {}, {}
-        for s in sorted(self.sessions, key=lambda s: s.created):
-            for f in s.files:
-                self.owner.setdefault(f['id'], s)
-            for i in s.cli_ids:
-                self.by_cli.setdefault(i, s)
-            for a in s.agent_files:
-                if a['src'] == 'gemini':
-                    self.by_cli.setdefault(a['cli'], s)
 
     def _accounts(self, sessions, emails, names):
         """会话属于哪个账号，账号叫什么。
@@ -615,8 +635,8 @@ class Catalog:
         c = self.content(s)
         current = s.cli_ids[-1]
         link = lambda x: {'page': x.page, 'title': self.content(x)['title']}
-        codex, gemini = s.src == 'codex', s.src == 'gemini'
-        no_app = s.unlisted or s.orphan or codex or gemini
+        prov = providers.get(s.src)
+        no_app = s.unlisted or s.orphan or s.src != 'claude'
         subagents = []
         for a in s.agent_files:
             aid = re.sub(r'^agent-', '', a['cli'])
@@ -638,7 +658,7 @@ class Catalog:
             'parent': link(s.parent) if s.parent else None,
             'children': [link(x) for x in self.sessions if x.parent is s],
             'link': None if no_app else 'claude://claude.ai/epitaxy/' + s.id,
-            'resume': ('codex resume ' if codex else 'agy --conversation ' if gemini else 'claude --resume ') + current}
+            'resume': prov.resume_prefix + current}
 
     def agent_content(self, agent_id):
         """一个子代理自己的对话，整理成和会话一样的条目。没有这份记录时返回 None。"""

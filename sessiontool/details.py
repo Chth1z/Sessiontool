@@ -1,14 +1,15 @@
 """按需从原始记录里取大块内容：工具的完整输入输出、图片。
 
 引用格式是 "文件编号.行偏移.块下标"（工具结果里的图片再加一级下标），都来自索引，
-所以只能取到会话记录里已有的内容。Codex 的记录先换成 Claude 的形状再取。
+所以只能取到会话记录里已有的内容。各来源通过 providers 适配器统一转换成相同块结构后再取。
 """
 import base64
 import os
 import re
 
-from . import codex, gemini
-from .index import LOCAL_IMAGE, flatten_result, is_base64_image
+from . import providers
+from .claude import LOCAL_IMAGE
+from .util import flatten_result, is_base64_image
 
 PERSISTED = re.compile(r'Full output saved to: ([^\r\n]+)')
 MAX_TEXT = 2_000_000
@@ -28,28 +29,36 @@ def block(index, ref, parts=(3,)):
     if not nums:
         return None, None
     d, src = index.raw(nums[0], nums[1])
-    d = d if isinstance(d, dict) else {}
-    if src == 'codex':
-        content = codex.content(d)
-    elif src == 'gemini':
-        content = gemini.content(d)
-    else:
-        # 普通消息的内容在 message.content；回复进行中追加的消息在 attachment.prompt
-        content = (d.get('message') or {}).get('content') or (d.get('attachment') or {}).get('prompt')
+    content = providers.get(src).content(d if isinstance(d, dict) else {})
     if not isinstance(content, list) or nums[2] >= len(content) or not isinstance(content[nums[2]], dict):
         return None, nums
     return content[nums[2]], nums
 
 
+def _inside(roots, path):
+    """确认 path 是存在于任一 roots 根目录之内的常规文件，防止路径穿越。"""
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        return None
+    for base in roots:
+        root = os.path.realpath(base)
+        try:
+            if os.path.commonpath([real, root]) == root:
+                return real
+        except ValueError:
+            continue
+    return None
+
+
 def inside_tool_results(sources, path):
     """只允许读会话记录目录下 tool-results 文件夹里的文件。"""
-    real = os.path.realpath(path)
-    root = os.path.realpath(sources.root)
-    try:
-        inside = os.path.commonpath([real, root]) == root
-    except ValueError:
-        inside = False
-    return real if inside and os.path.basename(os.path.dirname(real)) == 'tool-results' and os.path.isfile(real) else None
+    real = _inside((sources.root,), path)
+    return real if real and os.path.basename(os.path.dirname(real)) == 'tool-results' else None
+
+
+def inside_gemini(sources, path):
+    """只允许读 Gemini（Antigravity）数据目录里的媒体文件。"""
+    return _inside([d for d, _ in sources.gemini_dirs()], path)
 
 
 def load_tool(index, sources, use_ref, res_ref=None):
@@ -58,7 +67,7 @@ def load_tool(index, sources, use_ref, res_ref=None):
     use, _ = block(index, use_ref)
     if use and use.get('type') == 'tool_use':
         out['name'], out['input'] = use.get('name') or '', use.get('input')
-    res, nums = block(index, res_ref) if res_ref else (None, None)
+    res, _ = block(index, res_ref) if res_ref else (None, None)
     if res and res.get('type') == 'tool_result':
         text, images = flatten_result(res.get('content'))
         out['error'] = bool(res.get('is_error'))
@@ -80,21 +89,6 @@ def load_tool(index, sources, use_ref, res_ref=None):
             text = text[:MAX_TEXT] + '\n…（过长，已截断）'
         out['result'] = text
     return out
-
-
-def inside_gemini(sources, path):
-    """只允许读 Gemini（Antigravity）数据目录里的媒体文件。"""
-    real = os.path.realpath(path)
-    if not os.path.isfile(real):
-        return None
-    for d, _ in sources.gemini_dirs():
-        root = os.path.realpath(d)
-        try:
-            if os.path.commonpath([real, root]) == root:
-                return real
-        except ValueError:
-            continue
-    return None
 
 
 def load_image(index, ref):
@@ -121,7 +115,7 @@ def load_image(index, ref):
         real = inside_gemini(index.sources, src['path'])
         if not real:
             return None
-        media = src.get('media_type') or IMAGE_TYPES.get(os.path.splitext(real)[1].lower())
+        media = src.get('media_type')
         if media not in IMAGE_TYPES.values():
             media = IMAGE_TYPES.get(os.path.splitext(real)[1].lower())
         if not media:
