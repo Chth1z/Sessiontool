@@ -401,11 +401,17 @@ class ServerMode:
         return ' data-u="%s"' % url
 
 
+SRC_WHO = {'claude': ('Claude', 'C', ''), 'codex': ('Codex', 'X', ' cx'), 'gemini': ('Gemini', 'G', ' gm')}
+SRC_META = (('claude', 'Claude'), ('codex', 'Codex'), ('gemini', 'Gemini'))
+
+
 class Renderer:
-    def __init__(self, mode, cwd='', codex=False, spend=None):
+    def __init__(self, mode, cwd='', src='claude', spend=None):
         self.mode = mode
         self.cwd = cwd
-        self.who = ('Codex', 'X', ' cx') if codex else ('Claude', 'C', '')     # 答复的署名、头像上的字、样式
+        if isinstance(src, bool):
+            src = 'codex' if src else 'claude'
+        self.who = SRC_WHO.get(src, SRC_WHO['claude'])      # 答复的署名、头像上的字、样式
         self.spend = spend or []            # [(时间, 费用, 输出 token)]，按时间排好
         self.stamps = [x[0] for x in self.spend]
         self.ids = set()
@@ -630,16 +636,23 @@ def embed(name, data):
 
 
 def cost_text(u):
-    """会话或分组的费用：价格未知的模型不计入，有这种情况时金额后面加个 +。"""
+    """会话或分组的费用：暂缺价格的模型不计入，有这种情况时金额后面加个 +。"""
     if u['cost']:
         return money(u['cost']) + ('+' if u['unpriced'] else '')
-    return '价格未知' if u['unpriced'] else money(0)
+    return '暂缺价格' if u['unpriced'] else money(0)
 
 
 def usage_tip(u):
     rate = '，缓存命中 %.1f%%' % (u['rate'] * 100) if u.get('rate') is not None else ''
-    return '按 API 价格估算：%d 次回复，%s tokens%s。订阅不按 token 计费，这是同样的用量按 API 计价的金额。' % (
-        u['n'], num(u['tokens']), rate)
+    extra = ''
+    if u.get('unpriced'):
+        ms = u.get('unpriced_models') or []
+        if ms:
+            extra = ' 其中 %d 次回复暂缺价格（%s），可在 prices.json 补充。' % (u['unpriced'], '、'.join(ms))
+        else:
+            extra = ' 其中 %d 次回复未记录模型，未计入。' % u['unpriced']
+    return '按 API 价格估算：%d 次回复，%s tokens%s。订阅不按 token 计费，这是同样的用量按 API 计价的金额。%s' % (
+        u['n'], num(u['tokens']), rate, extra)
 
 
 def session_view(s, c, mode, parent=None, state='', back=None, info=None):
@@ -647,8 +660,8 @@ def session_view(s, c, mode, parent=None, state='', back=None, info=None):
 
     parent: (页面编号, 标题)，仅复刻的会话有。state: 内容指纹，页面据此实时更新。
     back: (地址, 文字)，子代理页用它回到调用它的会话。info: 详情面板的数据。"""
-    codex = getattr(s, 'src', '') == 'codex'
-    r = Renderer(mode, s.cwd, codex, None if back else c.get('spend'))
+    src = getattr(s, 'src', 'claude') or 'claude'
+    r = Renderer(mode, s.cwd, src, None if back else c.get('spend'))
     blocks = r.conversation(c['items'])
     live = not mode.standalone and not back         # 有本地服务可问、并且是一个真正的会话
     info = info or {}
@@ -672,8 +685,10 @@ def session_view(s, c, mode, parent=None, state='', back=None, info=None):
         facts.append('<button type="button" class="linkish" data-act="info">详情</button>')
     crumbs = '<span class="proj" title="%s"><i style="background:hsl(%d 55%% 55%%)"></i>%s</span>' % (esc(s.cwd), hue(s.proj), esc(s.proj))
     crumbs += acct_chip(info.get('account'))
-    if codex:
+    if src == 'codex':
         crumbs += '<span class="badge cx">Codex</span>'
+    elif src == 'gemini':
+        crumbs += '<span class="badge gm">Gemini</span>'
     if parent:
         crumbs += '<span class="badge">复刻自 %s</span>' % (
             esc(parent[1]) if mode.standalone else '<a href="/s/%s">%s</a>' % (parent[0], esc(parent[1])))
@@ -709,8 +724,8 @@ def session_view(s, c, mode, parent=None, state='', back=None, info=None):
            '<button type="button" class="toc-sort" data-act="tocsort" title="切换提问目录顺序">'
            '%s<span>正序</span></button></div></div><div class="toc">' % icon('sort') + toc + '</div>')
     attrs = ' data-page="%s" data-state="/api/state?page=%s" data-sig="%s"' % (s.page, s.page, state) if live else ''
-    if codex:
-        attrs += ' data-src="codex"'
+    if src in ('codex', 'gemini'):
+        attrs += ' data-src="%s"' % src
     head_html = ''.join(['<header class="head"><div class="crumbs">', crumbs, '</div><h1>', esc(c['title']), '</h1><div class="facts">',
                          ''.join(facts), '</div>', changed_files(c, s.cwd), '</header>'])
     # 拼接而不是 % 格式化：内嵌的样式和脚本里有 % 号
@@ -732,15 +747,17 @@ def session_page(s, c, mode, parent=None, state='', back=None, info=None):
 
 
 def sidebar(counts, page):
-    """左边栏顶部：标识与右上角 会话/统计 滑块；来源切换（Claude / Codex 并列 + 独立的小“全部”按钮）。"""
+    """左边栏顶部：标识与右上角 会话/统计 滑块；来源切换（多来源并列 + 独立的小“全部”按钮）。"""
+    active = [(k, lbl, counts.get(k, 0)) for k, lbl in SRC_META if counts.get(k, 0)]
     srcs = ''
-    if counts.get('codex'):
+    if len(active) >= 2:
+        names = '、'.join(lbl for _, lbl, _ in active)
+        btns = ''.join('<button type="button" data-s="%s">%s<small>%d</small></button>' % x for x in active)
+        cls = 'seg srcs s3' if len(active) >= 3 else 'seg srcs'
         srcs = ('<div class="src-row" id="src">'
-                '<div class="seg srcs" title="在 Claude 与 Codex 之间切换（按 S 循环切换）">'
-                '<button type="button" data-s="claude">Claude<small>%d</small></button>'
-                '<button type="button" data-s="codex">Codex<small>%d</small></button></div>'
-                '<button type="button" class="src-all" data-s="all" title="同时显示 Claude 和 Codex">全部</button></div>'
-                % (counts.get('claude', 0), counts['codex']))
+                '<div class="%s" title="在 %s 之间切换（按 S 循环切换）">%s</div>'
+                '<button type="button" class="src-all" data-s="all" title="同时显示 %s">全部</button></div>'
+                % (cls, names, btns, names))
     on = lambda p: ' class="on" aria-current="page"' if p == page else ''
     return ('<div class="side-top"><a class="brand" href="/"><img src="/static/icon.svg" width="26" height="26" alt="">'
             '<span>Sessiontool</span></a>'
@@ -752,6 +769,8 @@ def index_row(s, c, depth, now, i, accounts):
     tags = ''
     if s.src == 'codex':
         tags += '<span class="badge cx srcb">Codex</span>'
+    elif s.src == 'gemini':
+        tags += '<span class="badge gm srcb">Gemini</span>'
     if s.parent:
         tags += '<span class="badge">复刻</span>'
     if s.archived:
@@ -763,7 +782,7 @@ def index_row(s, c, depth, now, i, accounts):
         sub = '<span class="lbl">最近</span>' + esc(recent)
     else:
         sub = esc(first) or '（没有文字提问）'
-    ident = s.cli_ids[-1] if getattr(s, 'unlisted', False) or s.orphan or s.src == 'codex' else s.id
+    ident = s.cli_ids[-1] if getattr(s, 'unlisted', False) or s.orphan or s.src != 'claude' else s.id
     acts = ('<button type="button" class="ib sm" data-copy="%s" data-copied="会话 ID" title="复制会话 ID" aria-label="复制会话 ID">%s</button>'
             '<button type="button" class="ib sm" data-act="info" title="详情" aria-label="详情">%s</button>'
             % (esc(ident), icon('copy'), icon('info')))
@@ -803,18 +822,19 @@ def index_page(entries, state='', accounts=None):
         projects.setdefault(s.proj, collections.Counter())[s.src] += 1
         if s.account:
             people.setdefault(s.account, collections.Counter())[s.src] += 1
-    tabs = ('<button type="button" class="tab on" data-p="" data-c="%d" data-x="%d"><span>全部会话</span><small></small></button>'
-            % (sum(n['claude'] for n in projects.values()), sum(n['codex'] for n in projects.values()))) + ''.join(
-        '<button type="button" class="tab" data-p="%s" data-c="%d" data-x="%d"><i style="background:hsl(%d 55%% 55%%)"></i>'
-        '<span>%s</span><small></small></button>' % (esc(p), n['claude'], n['codex'], hue(p), esc(p)) for p, n in projects.items())
+    tabs = ('<button type="button" class="tab on" data-p="" data-c="%d" data-x="%d" data-g="%d"><span>全部会话</span><small></small></button>'
+            % (sum(n['claude'] for n in projects.values()), sum(n['codex'] for n in projects.values()),
+               sum(n['gemini'] for n in projects.values()))) + ''.join(
+        '<button type="button" class="tab" data-p="%s" data-c="%d" data-x="%d" data-g="%d"><i style="background:hsl(%d 55%% 55%%)"></i>'
+        '<span>%s</span><small></small></button>' % (esc(p), n['claude'], n['codex'], n['gemini'], hue(p), esc(p)) for p, n in projects.items())
     counts = collections.Counter(s.src for s, _, _, _ in entries)
     acct_box = ''
     if people:
-        acct_opts = ('<button type="button" class="tab on" data-acct="" data-c="%d" data-x="%d">'
-                     '<span>全部账号</span><small></small></button>' % (counts['claude'], counts['codex'])) + ''.join(
-            '<button type="button" class="tab" data-acct="%s" data-c="%d" data-x="%d" title="%s">'
+        acct_opts = ('<button type="button" class="tab on" data-acct="" data-c="%d" data-x="%d" data-g="%d">'
+                     '<span>全部账号</span><small></small></button>' % (counts['claude'], counts['codex'], counts['gemini'])) + ''.join(
+            '<button type="button" class="tab" data-acct="%s" data-c="%d" data-x="%d" data-g="%d" title="%s">'
             '<i style="background:hsl(%d 55%% 55%%)"></i><span>%s</span><small></small></button>'
-            % (esc(k), n['claude'], n['codex'], esc((accounts.get(k) or {}).get('email') or k),
+            % (esc(k), n['claude'], n['codex'], n['gemini'], esc((accounts.get(k) or {}).get('email') or k),
                hue((accounts.get(k) or {}).get('email') or k), esc((accounts.get(k) or {}).get('name') or k[:8]))
             for k, n in people.items())
         acct_box = ('<div class="side-acct"><div class="side-h">账号</div><details class="menu acct-dd" id="ac">'
@@ -866,7 +886,7 @@ def stats_page(sessions, state=''):
 
 
 def session_markdown(s, c):
-    who = 'Codex' if getattr(s, 'src', '') == 'codex' else 'Claude'
+    who = SRC_WHO.get(getattr(s, 'src', 'claude'), SRC_WHO['claude'])[0]
     out = ['# %s\n' % c['title'],
            '%s　·　%s → %s　·　你 %d 条 / %s %d 段\n' % (s.cwd, fmt(c['first']), fmt(c['last']), c['n_user'], who, c['n_asst'])]
 

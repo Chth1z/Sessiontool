@@ -2,10 +2,10 @@
    浅色为默认；跟随系统时由媒体查询切到深色；手动选择写在 <html data-theme> 上，优先于系统 */
 :root{
   --bg:#f6f4ee;--side:#efece4;--panel:#fffdf9;--fg:#1d1c1a;--mut:#69645b;--faint:#a19b8f;--line:#e6e1d6;--line2:#d4cec1;
-  --you:#2c62ab;--you-bg:#e7eef9;--claude:#b5532b;--codex:#1d7a5c;--on-accent:#fff;--code:#edeae2;
+  --you:#2c62ab;--you-bg:#e7eef9;--claude:#b5532b;--codex:#1d7a5c;--gemini:#5b4ec9;--on-accent:#fff;--code:#edeae2;
   --hit:#ffe27a;--cur:#ffad42;--err:#bf3b2b;--ok:#2e8b57;
   /* 图表：分类色按固定顺序给模型（亮、暗两套都用色盲校验脚本验过）；热力格是同一色相由浅到深的四级 */
-  --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s0:#b5afa3;
+  --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#7c5ce6;--s8:#0099b8;--s9:#c94a4a;--s10:#8c6d46;--s0:#b5afa3;
   --h0:#ece8de;--h1:#86b6ef;--h2:#3987e5;--h3:#256abf;--h4:#104281;
   --grid:#ece8de;--axis:#cfc9bc;--warn:#fab219;--crit:#d03b3b;
   --shadow:0 1px 2px rgba(40,30,10,.06),0 12px 32px rgba(40,30,10,.12);
@@ -17,9 +17,9 @@
 }
 @media(prefers-color-scheme:dark){:root:not([data-theme=light]){
   --bg:#151413;--side:#100f0e;--panel:#1d1c1a;--fg:#ece8e0;--mut:#a8a297;--faint:#716c63;--line:#2a2826;--line2:#3d3a35;
-  --you:#8ab7ef;--you-bg:#19232f;--claude:#e39168;--codex:#5cc79f;--on-accent:#151413;--code:#222120;
+  --you:#8ab7ef;--you-bg:#19232f;--claude:#e39168;--codex:#5cc79f;--gemini:#a398f7;--on-accent:#151413;--code:#222120;
   --hit:#6e5c14;--cur:#a86518;--err:#ee7466;--ok:#6fcf97;
-  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s0:#5d5952;
+  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#967ef2;--s8:#2ab7ca;--s9:#e06666;--s10:#b59469;--s0:#5d5952;
   --h0:#262523;--h1:#184f95;--h2:#2a78d6;--h3:#6da7ec;--h4:#b7d3f6;
   --grid:#2a2826;--axis:#3d3a35;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.5);
@@ -28,9 +28,9 @@
 }}
 :root[data-theme=dark]{
   --bg:#151413;--side:#100f0e;--panel:#1d1c1a;--fg:#ece8e0;--mut:#a8a297;--faint:#716c63;--line:#2a2826;--line2:#3d3a35;
-  --you:#8ab7ef;--you-bg:#19232f;--claude:#e39168;--codex:#5cc79f;--on-accent:#151413;--code:#222120;
+  --you:#8ab7ef;--you-bg:#19232f;--claude:#e39168;--codex:#5cc79f;--gemini:#a398f7;--on-accent:#151413;--code:#222120;
   --hit:#6e5c14;--cur:#a86518;--err:#ee7466;--ok:#6fcf97;
-  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s0:#5d5952;
+  --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#967ef2;--s8:#2ab7ca;--s9:#e06666;--s10:#b59469;--s0:#5d5952;
   --h0:#262523;--h1:#184f95;--h2:#2a78d6;--h3:#6da7ec;--h4:#b7d3f6;
   --grid:#2a2826;--axis:#3d3a35;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.5);
@@ -73,6 +73,7 @@ input[type=checkbox]{accent-color:var(--you);margin:0}
 .badge.err{color:var(--err);border-color:color-mix(in srgb,var(--err) 60%,transparent)}
 .badge.go{color:var(--claude);border-color:color-mix(in srgb,var(--claude) 60%,transparent)}
 .badge.cx{color:var(--codex);border-color:color-mix(in srgb,var(--codex) 55%,transparent)}
+.badge.gm{color:var(--gemini);border-color:color-mix(in srgb,var(--gemini) 55%,transparent)}
 /* 账号：邮箱 @ 前面那段；颜色由邮箱决定，同一个账号到处一个颜色 */
 .acct{display:inline-flex;align-items:center;gap:6px;flex:none;max-width:15em;font-size:11.5px;line-height:1.75;padding:0 8px 0 7px;border-radius:999px;color:hsl(var(--h) 45% 30%);background:hsl(var(--h) 60% 50% / .1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .acct i{width:6px;height:6px;border-radius:50%;background:hsl(var(--h) 55% 50%);flex:none}
@@ -121,15 +122,19 @@ details.menu [data-act=auto].on:after{content:"开";color:var(--ok);font-weight:
 .modes a{position:relative;z-index:1;padding:3.5px 10px;font-size:12.5px;line-height:1.45;text-align:center;text-decoration:none;color:var(--mut);font-weight:500;transition:color .16s}
 .modes a:hover{color:var(--fg)}
 .modes a.on{color:var(--fg);font-weight:650}
-/* 来源切换：Claude 与 Codex 并列为主滑块，“全部”作为独立的小辅助按钮放在右侧 */
+/* 来源切换：多来源并列为主滑块，“全部”作为独立的小辅助按钮放在右侧 */
 .src-row{display:flex;align-items:center;gap:6px;margin:15px 2px 0}
 .srcs{display:flex;flex:1;min-width:0}
 .srcs button{flex:1;padding:4px 7px;font-size:12.5px}
 .srcs small{margin-left:4px;font-size:11px;opacity:.65}
+.srcs.s3 button{padding:4px 3px;font-size:11.5px;letter-spacing:-.01em}
+.srcs.s3 small{margin-left:2px;font-size:10.5px}
+.src-row:has(.srcs.s3){gap:5px}
+.src-row:has(.srcs.s3) .src-all{padding:0 8px;font-size:11.5px}
 .src-all{flex:none;height:31px;padding:0 10px;font-size:12px;border-radius:8px;color:var(--mut);background:transparent;border:1px dashed var(--line2)}
 .src-all:hover{border-style:solid;border-color:var(--mut);color:var(--fg);background:var(--panel)}
 .src-all.on{border-style:solid;border-color:var(--fg);background:var(--fg);color:var(--bg);font-weight:600}
-body[data-src=claude] .srcb,body[data-src=codex] .srcb{display:none}
+body[data-src=claude] .srcb,body[data-src=codex] .srcb,body[data-src=gemini] .srcb{display:none}
 /* 左栏分区标题（账号 / 项目 / 选项 / 摘要）：字号加大、主色突出；内部选项保持克制紧凑 */
 .side-acct{margin:2px 2px 0}
 .side-h{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:15px;font-weight:650;color:var(--fg);letter-spacing:-.005em;margin:18px 6px 8px}
@@ -232,6 +237,8 @@ details.acct-dd div>button.tab.on{background:var(--bg);box-shadow:none}
 .hs>a:focus{text-decoration:underline}
 .who-you{color:var(--you)!important}
 .who-claude{color:var(--claude)!important}
+.who-codex{color:var(--codex)!important}
+.who-gemini{color:var(--gemini)!important}
 mark{background:var(--hit);color:inherit;border-radius:3px;padding:0 1px}
 mark.cur{background:var(--cur)}
 
@@ -287,12 +294,14 @@ mark.cur{background:var(--cur)}
 .user .av{background:var(--you)}
 .asst .av{background:var(--claude)}
 .asst.cx .av{background:var(--codex)}
+.asst.gm .av{background:var(--gemini)}
 .mc{flex:1;min-width:0}
 .msg header{display:flex;align-items:center;gap:10px;height:30px;font-size:12px;color:var(--faint)}
 .msg header b{font-size:13.5px;font-weight:650}
 .user header b{color:var(--you)}
 .asst header b{color:var(--claude)}
 .asst.cx header b{color:var(--codex)}
+.asst.gm header b{color:var(--gemini)}
 .msg header .spent{font-size:11.5px;color:var(--faint)}
 .facts .spent{color:var(--fg);font-weight:600;cursor:help}
 .num{color:var(--faint);text-decoration:none}
@@ -411,8 +420,10 @@ body.result details.steps,body.result .step,body.result details.tools,body.resul
 .msg.user.flash .body,.msg.user.flash:not(:has(.body)) img.pic{animation:glow-you 2.1s var(--ease)}
 .msg.asst.flash .body:after,.step.flash:after{content:"";position:absolute;inset:-8px -12px;border-radius:14px;pointer-events:none;animation:glow-claude 2.1s var(--ease)}
 .msg.asst.cx.flash .body:after,body[data-src=codex] .step.flash:after{animation-name:glow-codex}
+.msg.asst.gm.flash .body:after,body[data-src=gemini] .step.flash:after{animation-name:glow-gemini}
 details.fold.flash,details.tool.flash,.sent.flash{border-radius:10px;animation:glow-claude 2.1s var(--ease)}
 body[data-src=codex] details.fold.flash,body[data-src=codex] details.tool.flash,body[data-src=codex] .sent.flash{animation-name:glow-codex}
+body[data-src=gemini] details.fold.flash,body[data-src=gemini] details.tool.flash,body[data-src=gemini] .sent.flash{animation-name:glow-gemini}
 /* 不在最底下时来了新内容 */
 .newpill{position:fixed;left:50%;bottom:22px;z-index:7;display:inline-flex;align-items:center;gap:6px;padding:7px 13px 7px 16px;border:0;border-radius:999px;background:var(--fg);color:var(--bg);box-shadow:var(--shadow);font-size:13px;opacity:0;pointer-events:none;transform:translate(-50%,10px);transition:opacity .2s,transform .22s var(--ease)}
 .newpill.on{opacity:1;pointer-events:auto;transform:translate(-50%,0)}
@@ -469,7 +480,7 @@ a.rel:hover{border-color:var(--mut)}
 .hero{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 12px;margin:2px 0 12px}
 .hero b{font-size:30px;line-height:1.15;font-weight:650;letter-spacing:-.02em}
 .hero span{font-size:12px;color:var(--mut)}
-.s1,.c1{--c:var(--s1)}.s2,.c2{--c:var(--s2)}.s3,.c3{--c:var(--s3)}.s4,.c4{--c:var(--s4)}.s5,.c5{--c:var(--s5)}.s6{--c:var(--s6)}.s0{--c:var(--s0)}
+.s1,.c1{--c:var(--s1)}.s2,.c2{--c:var(--s2)}.s3,.c3{--c:var(--s3)}.s4,.c4{--c:var(--s4)}.s5,.c5{--c:var(--s5)}.s6{--c:var(--s6)}.s7{--c:var(--s7)}.s8{--c:var(--s8)}.s9{--c:var(--s9)}.s10{--c:var(--s10)}.s0{--c:var(--s0)}
 .stack{display:flex;gap:2px;height:10px;margin:2px 0 8px;border-radius:5px;overflow:hidden}
 .stack>i{display:block;min-width:3px;background:var(--c)}
 .legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin:8px 0 12px;font-size:12px;color:var(--mut)}
@@ -501,6 +512,7 @@ table.grid td:first-child{max-width:18em;overflow:hidden;text-overflow:ellipsis}
 .st-hero{display:grid;grid-template-columns:minmax(230px,1fr) 3fr;gap:12px;margin:18px 0 14px}
 .big{display:flex;flex-direction:column;justify-content:center;padding:18px 22px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
 .big b{font-size:52px;line-height:1.05;font-weight:650;letter-spacing:-.03em}
+.big b.na{font-size:28px;line-height:1.25;color:var(--mut);letter-spacing:0}
 .big span{margin-top:10px;font-size:12.5px;color:var(--mut)}
 .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:10px}
 .kpi{display:flex;flex-direction:column;min-width:0;padding:10px 14px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
@@ -563,8 +575,9 @@ table.grid td:first-child{max-width:18em;overflow:hidden;text-overflow:ellipsis}
 ol.toplist{margin:0;padding:0;list-style:none}
 ol.toplist li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:0 14px;padding:8px 0;border-bottom:1px solid var(--line)}
 ol.toplist li:last-child{border-bottom:0}
-ol.toplist a,ol.toplist small{grid-column:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-ol.toplist a{color:var(--fg);font-size:13.5px;font-weight:550;text-decoration:none}
+ol.toplist .tl-title,ol.toplist small{grid-column:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ol.toplist .tl-title{display:flex;align-items:center;gap:7px}
+ol.toplist a{color:var(--fg);font-size:13.5px;font-weight:550;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 ol.toplist a:hover{text-decoration:underline}
 ol.toplist small{color:var(--faint);font-size:12px}
 ol.toplist b{grid-column:2;grid-row:1/span 2;align-self:center;font-variant-numeric:tabular-nums}
@@ -584,6 +597,7 @@ ol.toplist b{grid-column:2;grid-row:1/span 2;align-self:center;font-variant-nume
 @keyframes glow-you{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--you),0 0 18px 3px color-mix(in srgb,var(--you) 42%,transparent),0 0 34px 8px color-mix(in srgb,var(--you) 16%,transparent)}}
 @keyframes glow-claude{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--claude),0 0 18px 3px color-mix(in srgb,var(--claude) 38%,transparent),0 0 32px 6px color-mix(in srgb,var(--claude) 14%,transparent)}}
 @keyframes glow-codex{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--codex),0 0 18px 3px color-mix(in srgb,var(--codex) 38%,transparent),0 0 32px 6px color-mix(in srgb,var(--codex) 14%,transparent)}}
+@keyframes glow-gemini{0%,100%{box-shadow:0 0 0 0 transparent,0 0 0 0 transparent}16%,44%{box-shadow:0 0 0 1.5px var(--gemini),0 0 18px 3px color-mix(in srgb,var(--gemini) 38%,transparent),0 0 32px 6px color-mix(in srgb,var(--gemini) 14%,transparent)}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}}
 @keyframes pop{from{opacity:0;transform:translateY(-4px) scale(.98)}}

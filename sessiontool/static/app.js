@@ -107,7 +107,14 @@
     if (x >= 1000) return '$' + Math.round(x).toLocaleString('en-US');
     return '$' + (x >= 0.01 || !x ? x.toFixed(2) : x.toFixed(3));
   }
-  function cost(u) { return u.cost ? money(u.cost) + (u.unpriced ? '+' : '') : u.unpriced ? '价格未知' : money(0); }
+  function cost(u) { return u.cost ? money(u.cost) + (u.unpriced ? '+' : '') : u.unpriced ? '暂缺价格' : money(0); }
+  function unpricedNote(u) {
+    if (!u || !u.unpriced) return '';
+    if (u.unpriced_models && u.unpriced_models.length) {
+      return u.unpriced + ' 次回复暂缺价格（' + u.unpriced_models.join('、') + '），可在 prices.json 补充';
+    }
+    return u.unpriced + ' 次回复未记录模型，未计入';
+  }
   function pct(x, digits) { return x == null ? '—' : (x * 100).toFixed(digits == null ? 1 : digits) + '%'; }
   function bytes(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : (n / 1048576).toFixed(1) + ' MB'; }
   function span(a, b) {
@@ -459,9 +466,12 @@
   var PERMISSION = { 'default': '每次询问', acceptEdits: '自动接受编辑', plan: '计划模式', auto: '自动判断', bypassPermissions: '跳过权限确认',
     never: '从不询问', 'on-request': '需要时询问', 'on-failure': '失败时询问', untrusted: '不受信任的命令要询问' };
   var STATUS = { completed: '已完成', review_ready: '等你过目', blocked: '受阻', in_progress: '进行中', needs_input: '等你处理', failed: '失败' };
+  var SRC_NAME = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini' };
+  var SRC_WHO_CLS = { claude: 'who-claude', codex: 'who-codex', gemini: 'who-gemini' };
   var ORIGIN = { codex_exec: '命令行（codex exec）', 'codex-tui': '终端界面', codex_cli_rs: '命令行', vscode: 'VS Code 扩展', codex_vscode: 'VS Code 扩展',
     cli: '命令行（Claude Code）', 'sdk-cli': '命令行（SDK）', 'claude-vscode': 'VS Code 扩展',
-    'claude-desktop': 'Claude 桌面应用', 'claude-desktop-3p': 'Claude 桌面应用', 'local-agent': 'Claude 桌面应用', local_agent: 'Claude 桌面应用' };
+    'claude-desktop': 'Claude 桌面应用', 'claude-desktop-3p': 'Claude 桌面应用', 'local-agent': 'Claude 桌面应用', local_agent: 'Claude 桌面应用',
+    antigravity: 'Antigravity 应用', 'antigravity-cli': '命令行（Antigravity CLI）' };
 
   function usageSection(b, u, agents) {
     var s = section(b, '费用与用量');
@@ -473,29 +483,30 @@
     tiles(s, [['缓存命中率', pct(u.rate)], ['输出', u.output], ['未缓存的输入', u.input], ['读缓存', u.cache_read],
       ['写缓存', u.cache_write], ['其中思考', u.thinking, 1], ['网页搜索', u.web, 1]]);
     s.appendChild(el('small', 'hint', '订阅不按 token 计费，这是同样的用量按 API 计价的金额。缓存命中率是读缓存占全部输入的比例。'
-      + (u.unpriced ? u.unpriced + ' 次回复的模型没有价格，没有计入。' : '')));
+      + (u.unpriced ? ' ' + unpricedNote(u) + '。' : '')));
     if (u.models.length) {
       s = section(b, '按模型');
       s.appendChild(grid(['模型', '回复', '输出', '命中率', '费用'], u.models.map(function (m) {
-        return [m.name || '（未知）', m.n, compact(m.output), pct(m.rate, 0), m.priced ? money(m.cost) : '—'];
+        return [m.name || '未记录模型', m.n, compact(m.output), pct(m.rate, 0), m.priced ? money(m.cost) : '—'];
       }), { share: u.models.map(function (m) { return u.cost ? m.cost / u.cost : 0; }) }));
     }
     if (u.efforts.length) {
       s = section(b, '按推理强度');
       s.appendChild(grid(['推理强度', '回复', '输出', '费用'], u.efforts.map(function (e) {
-        return [e.effort || '（未记录）', e.n, compact(e.output), money(e.cost)];
+        return [e.effort || '（未记录）', e.n, compact(e.output), cost(e)];
       }), { share: u.efforts.map(function (e) { return u.cost ? e.cost / u.cost : 0; }) }));
     }
   }
 
   function fillInfo(b, d) {
-    var codex = d.src === 'codex';
+    var codex = d.src === 'codex', gemini = d.src === 'gemini';
     var t = el('div', 'dtitle');
     t.appendChild(el('strong', null, d.title));
     var tags = el('div', 'dtags');
     tags.appendChild(el('span', 'badge', d.proj));
     if (d.account) tags.appendChild(acctChip(d.account));
     if (codex) tags.appendChild(el('span', 'badge cx', 'Codex'));
+    if (gemini) tags.appendChild(el('span', 'badge gm', 'Gemini'));
     if (d.parent) tags.appendChild(el('span', 'badge', '复刻'));
     if (d.archived) tags.appendChild(el('span', 'badge', '已归档'));
     if (d.orphan) tags.appendChild(el('span', 'badge', '不在应用列表中'));
@@ -516,7 +527,9 @@
 
     var s = section(b, '标识');
     if (d.id) s.appendChild(field('应用会话 ID', d.id, { hint: '在 Claude 里提到这个会话时用它' }));
-    s.appendChild(field(codex ? '线程 ID' : '记录 ID', d.cli, { hint: codex ? 'Codex 用它找到这个会话' : '当前记录文件的编号，可以用来恢复会话' }));
+    s.appendChild(field(codex ? '线程 ID' : gemini ? '会话 ID' : '记录 ID', d.cli, {
+      hint: codex ? 'Codex 用它找到这个会话' : gemini ? 'Antigravity 用它标识这个会话' : '当前记录文件的编号，可以用来恢复会话'
+    }));
     d.files.filter(function (f) { return !f.current; }).forEach(function (f) { s.appendChild(field('更早的记录 ID', f.id)); });
     s.appendChild(field('恢复命令', d.resume, { hint: '在终端里的项目文件夹下运行' }));
     if (d.link) s.appendChild(field('应用链接', d.link));
@@ -526,11 +539,14 @@
       if (d.account && d.account.email) s.appendChild(field('邮箱', d.account.email));
       if (d.account && d.account.id) s.appendChild(field('账号 ID', d.account.id));
       if (d.org) s.appendChild(field('组织 ID', d.org));
-      pairs(s, [['multi-claude 配置', d.store], [codex ? 'Codex 版本' : 'Claude Code 版本', d.version], ['从哪里开始的', ORIGIN[d.origin] || d.origin]]);
+      pairs(s, [['multi-claude 配置', d.store], [codex ? 'Codex 版本' : gemini ? 'Antigravity 版本' : 'Claude Code 版本', d.version], ['从哪里开始的', ORIGIN[d.origin] || d.origin]]);
+    } else if (d.origin || d.version) {
+      s = section(b, '来源');
+      pairs(s, [['从哪里开始的', ORIGIN[d.origin] || d.origin], ['版本', d.version]]);
     }
 
     s = section(b, '位置');
-    s.appendChild(field('项目文件夹', d.cwd || '（未知）'));
+    s.appendChild(field('项目文件夹', d.cwd || '无文件夹', d.cwd ? {} : { plain: true, copy: false }));
     d.files.forEach(function (f) { s.appendChild(field(f.current ? '记录文件（当前）' : '记录文件', f.path, { note: bytes(f.size) })); });
 
     s = section(b, '时间');
@@ -582,6 +598,20 @@
         if (live) s.appendChild(a); else s.appendChild(el('div', 'rel', p[0] + '：' + p[1].title));
       });
     }
+    if (d.subagents && d.subagents.length) {
+      s = section(b, '子代理（' + d.subagents.length + '）');
+      d.subagents.forEach(function (ag) {
+        if (live) {
+          var a = el('a', 'rel');
+          a.href = '/agent/' + encodeURIComponent(ag.id);
+          a.appendChild(el('small', null, ag.id.slice(0, 8)));
+          a.appendChild(el('span', null, ag.name));
+          s.appendChild(a);
+        } else {
+          s.appendChild(el('div', 'rel', ag.name));
+        }
+      });
+    }
   }
   function openInfo(page) {
     var b = openLayer('drawer', '会话详情');
@@ -599,13 +629,15 @@
   }
 
   function openKeys() {
+    var srcLbl = srcSeg ? '切换 ' + srcOrder().map(function (k) { return k === 'all' ? '全部' : (SRC_NAME[k] || k); }).join(' / ')
+      : '切换 Claude / Codex / Gemini / 全部';
     var rows = [['/', '聚焦搜索框'], ['R', '立刻重读磁盘'], ['L', '暂停或继续实时更新'], ['?', '打开这张快捷键表'], ['Esc', '关闭浮层、清空搜索']];
     if (isIndex) rows = rows.concat([['J  K  ↓  ↑', '在会话和搜索结果之间移动'], ['Enter', '打开选中的会话'], ['I', '选中会话的详情'],
-      ['C', '复制选中会话的 ID'], ['S', '切换 Claude / Codex / 全部']]);
+      ['C', '复制选中会话的 ID'], ['S', srcLbl]]);
     if (isSession) rows = rows.concat([['J  K', '下一条 / 上一条你的提问'], ['1  2  3', '完整 / 对话 / 结果视图'],
       ['E', '折起或展开当前这一轮的过程'], ['I', '会话详情'], ['Enter  Shift+Enter', '搜索时跳到下一处 / 上一处'],
       ['←  →', '放大图片时切换上一张 / 下一张']]);
-    if (isStats) rows = rows.concat([['S', '切换 Claude / Codex / 全部']]);
+    if (isStats) rows = rows.concat([['S', srcLbl]]);
     var b = openLayer('modal', '键盘快捷键'), list = el('div', 'keys');
     rows.forEach(function (r) {
       var d = el('div');
@@ -865,13 +897,17 @@
     setTimeout(connect, 300);               // 等页面先画完再连
   }
 
-  /* ================= 来源：Claude / Codex / 全部 ================= */
+  /* ================= 来源：Claude / Codex / Gemini / 全部 ================= */
 
   var srcSeg = $('#src'), source = 'all', onSource = null;
+  function srcOrder() {
+    return srcSeg ? $$('button', srcSeg).map(function (b) { return b.dataset.s; }) : ['all'];
+  }
   // user：是你点的（记住选择，并让页面重新筛选）；打开页面时恢复上次的选择不算
   function pickSource(v, user) {
     if (!srcSeg) return;
-    if (['claude', 'codex', 'all'].indexOf(v) < 0) v = 'claude';
+    var order = srcOrder();
+    if (order.indexOf(v) < 0) v = order[0] || 'all';
     source = v;
     body.dataset.src = v;
     $$('button', srcSeg).forEach(function (b) { b.classList.toggle('on', b.dataset.s === v); });
@@ -880,12 +916,15 @@
       if (onSource) onSource(v);
     }
   }
-  if (srcSeg) {
-    srcSeg.addEventListener('click', function (e) {
+  function bindSrcSeg(elSeg) {
+    if (!elSeg || elSeg.dataset.bound) return;
+    elSeg.dataset.bound = '1';
+    elSeg.addEventListener('click', function (e) {
       var b = e.target.closest('button');
       if (b) pickSource(b.dataset.s, true);
     });
   }
+  bindSrcSeg(srcSeg);
   function srcParam() { return source === 'all' ? '' : source; }
 
   /* ================= 点击与按键的统一入口 ================= */
@@ -935,7 +974,7 @@
     else if (e.key === 'l' && live) { e.preventDefault(); ACTIONS.live(); }
     else if (e.key === 's' && srcSeg) {
       e.preventDefault();
-      var order = ['claude', 'codex', 'all'];
+      var order = srcOrder();
       pickSource(order[(order.indexOf(source) + 1) % order.length], true);
     }
   }, true);
@@ -1453,8 +1492,8 @@
 
     // 项目、账号两组标签各自计数：只数当前来源的会话，没有的就不显示
     function count(t) {
-      var c = +t.dataset.c || 0, x = +t.dataset.x || 0;
-      return source === 'claude' ? c : source === 'codex' ? x : c + x;
+      var c = +t.dataset.c || 0, x = +t.dataset.x || 0, g = +t.dataset.g || 0;
+      return source === 'claude' ? c : source === 'codex' ? x : source === 'gemini' ? g : c + x + g;
     }
     function paintTabs() {
       $$('#pj .tab, #ac .tab').forEach(function (t) {
@@ -1462,6 +1501,8 @@
         if (small) small.textContent = n;
         t.hidden = !all && !n;
       });
+      var acctWrap = $('.side-acct');
+      if (acctWrap) acctWrap.hidden = !$$('#ac .tab').some(function (t) { return t.dataset.acct !== '' && !t.hidden; });
       pick(project);
       pickAcct(account);
     }
@@ -1532,9 +1573,11 @@
         var ul = el('ul');
         s.hits.forEach(function (h) {
           var li = el('li'), link = el('a'), who = WHO[h.who];
+          var wname = h.who === 'asst' ? (SRC_NAME[s.src] || who[0]) : who[0];
+          var wcls = h.who === 'asst' ? (SRC_WHO_CLS[s.src] || who[1]) : who[1];
           link.href = base + '#' + h.anchor;
           link.appendChild(el('small', null, h.time + '　'));
-          link.appendChild(el('small', who[1], (h.who === 'asst' && s.src === 'codex' ? 'Codex' : who[0]) + '　'));
+          link.appendChild(el('small', wcls, wname + '　'));
           link.appendChild(document.createTextNode('…' + h.pre));
           link.appendChild(el('mark', null, h.hit));
           link.appendChild(document.createTextNode(h.post + '…'));
@@ -1596,9 +1639,17 @@
       } else if (!ac && $('.side-acct', doc) && $('.side-head')) {
         $('.side-head').appendChild($('.side-acct', doc));
       }
-      if (srcSeg && $('#src', doc)) {
-        var nsmall = $$('#src small', doc);
-        $$('small', srcSeg).forEach(function (s, i) { if (nsmall[i]) s.textContent = nsmall[i].textContent; });
+      var nsrc = $('#src', doc);
+      if (srcSeg && nsrc) {
+        if (srcSeg.innerHTML !== nsrc.innerHTML) {
+          srcSeg.innerHTML = nsrc.innerHTML;
+          pickSource(source);
+        }
+      } else if (!srcSeg && nsrc && $('.side-top')) {
+        $('.side-top').insertAdjacentElement('afterend', nsrc);
+        srcSeg = $('#src');
+        bindSrcSeg(srcSeg);
+        pickSource(store('src') || 'claude');
       }
       $('#totals').textContent = $('#totals', doc).textContent;
       body.dataset.sig = nb.dataset.sig;
@@ -1819,7 +1870,7 @@
     function fmtMetric(v, m) { return m === 'cost' ? money(v) : m === 'n' ? compact(v) + ' 次' : compact(v); }
     function shortDate(d) { var p = d.split('-'); return (+p[1]) + '/' + (+p[2]); }
     function dayName(d) { var t = new Date(d + 'T00:00:00'); return d + ' 周' + WEEK[(t.getDay() + 6) % 7]; }
-    function slotClass(i) { return i < 6 ? 's' + (i + 1) : 's0'; }
+    function slotClass(i) { return i < data.slots.length ? 's' + (i + 1) : 's0'; }
     function slotName(i) { return i < data.slots.length ? data.slots[i] : '其他'; }
 
     // ----- 每天：按模型堆起来的柱子 -----
@@ -1856,7 +1907,7 @@
         g.appendChild(hit);
         hover(g, function (e) {
           var rows = segs.slice().reverse().map(function (m) { return [fmtMetric(m[idx], metric), slotName(m[0]), slotClass(m[0])]; });
-          rows.push([fmtMetric(totals[i], metric), '合计']);
+          rows.push([metric === 'cost' ? cost(d) : fmtMetric(totals[i], metric), '合计']);
           if (d.n) rows.push([d.n + ' 次', '回复']);
           showTip(e, rows, dayName(d.d));
         });
@@ -1879,7 +1930,7 @@
       var rows = data.days.slice().reverse().filter(function (d) { return d.n || d.prompts; }).map(function (d) {
         var by = {};
         d.models.forEach(function (m) { by[m[0]] = m; });
-        return [dayName(d.d), d.prompts, d.n, compact(d.tokens), pct(d.rate, 0), money(d.cost)].concat(slots.map(function (i) {
+        return [dayName(d.d), d.prompts, d.n, compact(d.tokens), pct(d.rate, 0), cost(d)].concat(slots.map(function (i) {
           return by[i] ? money(by[i][1]) : '';
         }));
       });
@@ -1927,7 +1978,7 @@
           if (d) {
             (function (d) {
               hover(rect, function (e) {
-                showTip(e, [[d.n + ' 次', '回复'], [d.prompts + ' 次', '提问'], [money(d.cost), '费用'], [compact(d.tokens), 'tokens']],
+                showTip(e, [[d.n + ' 次', '回复'], [d.prompts + ' 次', '提问'], [cost(d), '费用'], [compact(d.tokens), 'tokens']],
                   dayName(d.d));
               });
             })(d);
@@ -2016,6 +2067,8 @@
     function fillAccounts(list) {
       if (!acctMenu) return false;
       var visible = (list || []).filter(function (a) { return source === 'all' || a.src === source; });
+      var pickWrap = acctMenu.closest('.pick');
+      if (pickWrap) pickWrap.hidden = !visible.length;
       if (acct && !visible.some(function (a) { return a.key === acct; })) {
         acct = '';
         store('st-acct', '');
@@ -2212,9 +2265,10 @@
 
       // 开头：一个最主要的数字，再加一排小卡片
       var top = el('section', 'st-hero'), big = el('div', 'big');
-      big.appendChild(el('b', null, cost(t)));
+      var bigNum = el('b', !t.cost && t.unpriced ? 'na' : null, cost(t));
+      big.appendChild(bigNum);
       big.appendChild(el('span', null, '按 API 价格估算 · ' + (d.range.days ? '最近 ' + d.range.days + ' 天' : '全部时间')
-        + (t.unpriced ? ' · ' + t.unpriced + ' 次回复没有价格' : '')));
+        + (t.unpriced ? ' · ' + unpricedNote(t) : '')));
       top.appendChild(big);
       var kpis = el('div', 'kpis');
       [['Tokens', compact(t.tokens), '其中输出 ' + compact(t.output)],
@@ -2257,10 +2311,11 @@
           compact(m.cache_read), compact(m.cache_write), pct(m.rate, 0), m.priced ? money(m.cost) : '—'];
       }), { share: d.models.map(function (m) { return t.cost ? m.cost / t.cost : 0; }) }));
 
-      if (d.by_account.length || d.quota.length) {
+      var hasRealAcct = d.by_account.some(function (a) { return !!a.key; });
+      if (hasRealAcct || d.quota.length) {
         c = card('账号', d.quota.length ? '额度是应用自己记下的最近一次：5 小时窗口和 7 天窗口用了多少' : '');
         c.body.appendChild(grid(['账号', '会话', '回复', 'Tokens', '命中率', '费用'], d.by_account.map(function (a) {
-          return [a.key ? acctChip(a) : '（未知账号）', a.sessions, compact(a.n), compact(a.tokens), pct(a.rate, 0), cost(a)];
+          return [a.key ? acctChip(a) : '未关联账号', a.sessions, compact(a.n), compact(a.tokens), pct(a.rate, 0), cost(a)];
         }), { share: d.by_account.map(function (a) { return t.cost ? a.cost / t.cost : 0; }) }));
         if (d.quota.length) {
           var qs = el('div', 'quota');
@@ -2286,19 +2341,23 @@
       c = card('推理强度', '');
       two.appendChild(c.box);
       c.body.appendChild(grid(['推理强度', '回复', '输出', '其中思考', '费用'], d.efforts.map(function (e) {
-        return [e.effort || '（未记录）', compact(e.n), compact(e.output), compact(e.thinking), money(e.cost)];
+        return [e.effort || '（未记录）', compact(e.n), compact(e.output), compact(e.thinking), cost(e)];
       }), { share: d.efforts.map(function (e) { return t.cost ? e.cost / t.cost : 0; }) }));
       c = card('项目', '前 20 个');
       two.appendChild(c.box);
       c.body.appendChild(grid(['项目', '会话', '回复', 'Tokens', '费用'], d.projects.map(function (p) {
-        return [p.proj + (source === 'all' && p.src === 'codex' ? '（Codex）' : ''), p.sessions, compact(p.n), compact(p.tokens), cost(p)];
+        return [p.proj + (source === 'all' && p.src !== 'claude' ? '（' + (SRC_NAME[p.src] || p.src) + '）' : ''), p.sessions, compact(p.n), compact(p.tokens), cost(p)];
       }), { share: d.projects.map(function (p) { return t.cost ? p.cost / t.cost : 0; }) }));
       c = card('花得最多的会话', '');
       var ol = el('ol', 'toplist');
       d.top.forEach(function (x) {
-        var li = el('li'), a = el('a', null, x.title);
+        var li = el('li'), head = el('div', 'tl-title'), a = el('a', null, x.title);
         a.href = '/s/' + x.page;
-        li.appendChild(a);
+        head.appendChild(a);
+        if (source === 'all' && x.src !== 'claude') {
+          head.appendChild(el('span', 'badge ' + (x.src === 'codex' ? 'cx' : 'gm'), SRC_NAME[x.src] || x.src));
+        }
+        li.appendChild(head);
         var meta = el('small', null, x.proj + (x.account ? ' · ' + x.account : '') + ' · ' + compact(x.n) + ' 次回复');
         li.appendChild(meta);
         li.appendChild(el('b', null, cost(x)));

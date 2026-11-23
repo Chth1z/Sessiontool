@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from . import pricing
 
-SLOTS = 6           # 图上单独着色的模型数，其余并成“其他”
+SLOTS = 10          # 图上单独着色的模型数，其余并成“其他”
 
 
 def when(ts):
@@ -31,15 +31,18 @@ def streaks(days, today):
 
 
 def compute(cat, src='', account='', days=0):
-    """src：claude / codex / 空（全部）；account：账号的 key，空是全部；days：只看最近几天，0 是全部。"""
+    """src：claude / codex / gemini / 空（全部）；account：账号的 key，空是全部；days：只看最近几天，0 是全部。"""
     now = datetime.now().astimezone()
     today = now.date()
     start = today - timedelta(days=days - 1) if days else None
     rows = cat.index.usage()
-    # 模型的颜色按全部时间的花费排定，筛选时不变色
+    # 每行只算一次所属会话与费用分项；颜色按当前来源的全部时间排定（切时间范围/账号不变色，也不被其他来源挤占槽位）
+    sessions_of = [cat.by_cli.get(r['sid']) or cat.owner.get(r['file']) for r in rows]
+    parts_of = [pricing.row_parts(r) for r in rows]
     order = collections.Counter()
-    for r in rows:
-        order[r['model']] += sum(pricing.row_parts(r) or ()) or r['out'] / 1e6
+    for r, s, p in zip(rows, sessions_of, parts_of):
+        if r['model'] and s and (not src or s.src == src):
+            order[r['model']] += sum(p or ()) or r['out'] / 1e6
     slot = {m: i for i, (m, _) in enumerate(order.most_common(SLOTS))}
 
     def keep(s):
@@ -51,14 +54,12 @@ def compute(cat, src='', account='', days=0):
     day_model = collections.defaultdict(lambda: collections.defaultdict(lambda: [0.0, 0]))
     hours = [[0] * 24 for _ in range(7)]
     active, sess_seen = set(), set()
-    for r in rows:
-        s = cat.by_cli.get(r['sid']) or cat.owner.get(r['file'])
+    for r, s, p in zip(rows, sessions_of, parts_of):
         if not keep(s):
             continue
         t = when(r['ts'])
         if not t or (start and t.date() < start):
             continue
-        p = pricing.row_parts(r)
         d = t.date()
         for tally in (total, by_day[d], by_model[r['model']], by_effort[r['effort']], by_acct[s.account],
                       by_proj[(s.src, s.proj)], by_sess[s.id]):
@@ -94,27 +95,31 @@ def compute(cat, src='', account='', days=0):
     span = [first + timedelta(days=i) for i in range((today - first).days + 1)]
     best, cur = streaks(active, today)
     peak = max(((w, h) for w in range(7) for h in range(24)), key=lambda x: hours[x[0]][x[1]])
-    fav = max(by_model.items(), key=lambda kv: kv[1].n, default=(None, None))
+    named_models = [(m, t) for m, t in by_model.items() if m]
+    fav = max(named_models or list(by_model.items()), key=lambda kv: kv[1].n, default=(None, None))
 
     def acct_info(key):
         a = cat.accounts.get(key) or {}
-        return {'key': key, 'name': a.get('name') or '（未知账号）', 'email': a.get('email', ''), 'src': a.get('src', '')}
+        return {'key': key, 'name': a.get('name') or '未关联账号', 'email': a.get('email', ''), 'src': a.get('src', '')}
 
     sessions_in = collections.Counter(by_id[i].account for i in sess_seen if i in by_id)
     proj_sessions = collections.Counter((by_id[i].src, by_id[i].proj) for i in sess_seen if i in by_id)
-    models = [dict(t.json(), model=m, name=pricing.model_name(m) or '（未知）', slot=slot.get(m, SLOTS), priced=bool(pricing.key(m)))
+    models = [dict(t.json(), model=m, name=pricing.model_name(m) or '未记录模型', slot=slot.get(m, SLOTS), priced=bool(pricing.key(m)))
               for m, t in sorted(by_model.items(), key=lambda kv: (-kv[1].cost, -kv[1].n))]
+    total_json = total.json()
+    total_json['unpriced_models'] = [m['name'] for m in models if m['model'] and m['unpriced']]
     return {
         'range': {'days': days, 'from': span[0].isoformat(), 'to': today.isoformat()},
         'filters': {'src': src, 'account': account},
         'accounts': sorted((acct_info(k) for k in cat.accounts), key=lambda a: (a['src'], a['name'])),
-        'total': total.json(), 'sessions': len(sess_seen), 'prompts': prompts, 'tools': tools,
+        'total': total_json, 'sessions': len(sess_seen), 'prompts': prompts, 'tools': tools,
         'active_days': len(active), 'streak': cur, 'best_streak': best,
         'peak': {'weekday': peak[0], 'hour': peak[1], 'n': hours[peak[0]][peak[1]]} if total.n else None,
-        'favorite': {'name': pricing.model_name(fav[0]), 'share': fav[1].n / total.n} if fav[1] and total.n else None,
+        'favorite': {'name': pricing.model_name(fav[0]) or '未记录模型', 'share': fav[1].n / total.n} if fav[1] and total.n else None,
         'slots': [pricing.model_name(m) for m, _ in order.most_common(SLOTS)],
         'days': [{'d': d.isoformat(), 'cost': round(by_day[d].cost, 6) if d in by_day else 0,
                   'tokens': by_day[d].tokens if d in by_day else 0, 'n': by_day[d].n if d in by_day else 0,
+                  'unpriced': by_day[d].unpriced if d in by_day else 0,
                   'prompts': per_day_prompts[d], 'rate': by_day[d].rate() if d in by_day else None,
                   'models': [[k, round(v[0], 6), v[1]] for k, v in sorted(day_model[d].items())]} for d in span],
         'hours': hours,
@@ -127,7 +132,7 @@ def compute(cat, src='', account='', days=0):
         'top': [dict(t.json(), page=by_id[i].page, title=cat.content(by_id[i])['title'], proj=by_id[i].proj, src=by_id[i].src,
                      account=(cat.account(by_id[i]) or {}).get('name', ''))
                 for i, t in sorted(by_sess.items(), key=lambda kv: -kv[1].cost)[:12] if i in by_id],
-        'quota': quota(cat, account),
+        'quota': quota(cat, account) if src in ('', 'claude') else [],
     }
 
 
