@@ -119,7 +119,8 @@ python -m sessiontool reindex              # 删除索引并重建
     multi-claude 的各个配置在 `~/.multi-claude/data/Claude-<配置名>/claude-code-sessions`
   - 额度用量：上面各个应用数据目录里的 `plan-usage-history.json`
   - 账号的邮箱：Claude Code 在终端登录的账号（`~/.claude.json`）；记录里写着的邮箱；
-    Codex 登录的账号（`~/.codex/auth.json` 里只解开身份令牌中写着邮箱的那段，不读、不用任何令牌）
+    Codex 登录的账号（`~/.codex/auth.json` 里只解开身份令牌中写着邮箱的那段，不读、不用任何令牌）；
+    Gemini（Antigravity）登录的账号（`Antigravity/app_storage.json` 中的 `agy.onboarding.lastLoginUsername` 或 `~/.gemini/antigravity-cli/cli.log`）
   - Codex：`~/.codex/sessions/**/rollout-*.jsonl`、`~/.codex/archived_sessions`，标题和归档取自 `~/.codex/state_*.sqlite`（只读打开）
   - Gemini（Antigravity）：`~/.gemini/antigravity/brain/*/.system_generated/logs/transcript_full.jsonl` 及 `~/.gemini/antigravity-cli` 下同结构记录；标题、工作区、归档与子代理归属取自 `conversation_summaries.db`，项目名取自 `~/.gemini/config/projects/*.json`，各步骤的精确模型、用量与思考 token 取自 `conversations/*.db`（均只读打开）
 - **写入的位置**：只有索引 `~/.sessiontool/index.db`（可用环境变量 `SESSIONTOOL_HOME` 改位置）。

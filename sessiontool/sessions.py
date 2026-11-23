@@ -527,17 +527,22 @@ class Catalog:
                         votes[s.account][f['email']] += 1
         email_of = {a: c.most_common(1)[0][0] for a, c in votes.items()}
         email_of.update(emails)
-        by_email = {e.lower(): a for a, e in email_of.items()}
+        other_accts = {s.account for s in sessions if s.src != 'claude' and s.account}
+        by_email = {e.lower(): a for a, e in email_of.items() if not a.startswith('gemini:') and a not in other_accts}
+        gemini_acct = next((k for k in emails if k.startswith('gemini:')), '')
         for s in sessions:
             if s.src == 'claude' and not s.account:
                 e = next((f['email'] for f in reversed(s.files) if f['email']), '')
                 s.account = by_email.get(e.lower(), e) if e else ''
+            elif s.src == 'gemini' and not s.account and gemini_acct:
+                s.account = gemini_acct
         self.accounts = {}
         for s in sessions:
             a = s.account
             if a and a not in self.accounts:
                 email = email_of.get(a) or (a if '@' in a else '')
-                self.accounts[a] = {'key': a, 'id': '' if '@' in a else a, 'email': email, 'src': s.src, 'profile': names.get(a, ''),
+                self.accounts[a] = {'key': a, 'id': '' if ('@' in a or a.startswith('gemini:')) else a, 'email': email,
+                                    'src': s.src, 'profile': names.get(a, ''),
                                     'name': email.split('@')[0] if email else names.get(a) or a[:8]}
 
     def account(self, s):

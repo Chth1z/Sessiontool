@@ -11,6 +11,24 @@ from .util import readonly_sqlite
 # 清单里只留用得到的字段：完整的记录带着几十 KB 的提示词快照，缓存起来没有意义
 KEEP = ('sessionId', 'cliSessionId', 'priorCliSessionIds', 'title', 'cwd', 'createdAt', 'lastActivityAt', 'isArchived',
         'forkedFromSessionId', 'model', 'effort', 'permissionMode', 'completedTurns', 'writtenBranches', 'postTurnSummary')
+EMAIL_EXACT = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+GEMINI_CLI_EMAIL = re.compile(r'(?:applyAuthResult:\s*email=|authenticated successfully as\s+)([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})')
+
+
+def gemini_app_dirs():
+    """Antigravity 桌面应用本地配置目录（用于读取登录邮箱元数据 app_storage.json）。"""
+    home = os.path.expanduser('~')
+    seen, dirs = set(), []
+    for base in (os.environ.get('APPDATA'), os.path.join(home, 'Library', 'Application Support'), os.path.join(home, '.config')):
+        if not base:
+            continue
+        d = os.path.join(base, 'Antigravity')
+        if os.path.isfile(os.path.join(d, 'app_storage.json')):
+            key = os.path.normcase(os.path.realpath(d))
+            if key not in seen:
+                seen.add(key)
+                dirs.append(d)
+    return dirs
 
 
 def app_dirs():
@@ -123,6 +141,7 @@ class Sources:
             self.apps = [(os.path.dirname(d), name) for d, name in self.stores]
         self.codex = os.path.abspath(codex or os.environ.get('CODEX_HOME') or os.path.join(user, '.codex'))
         self.gemini = os.path.abspath(gemini or os.environ.get('GEMINI_HOME') or os.path.join(user, '.gemini'))
+        self.gemini_app = gemini_app_dirs() if gemini is None else [self.gemini]
         # Claude Code 自己登录的账号记在这里（设了 CLAUDE_CONFIG_DIR 时在那个目录里）
         self.profile = profile or os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or user, '.claude.json')
         self.home = os.path.abspath(home or os.environ.get('SESSIONTOOL_HOME') or os.path.join(user, '.sessiontool'))
@@ -212,10 +231,13 @@ class Sources:
         return jobs, titles
 
     def account_hints(self):
-        """能确定的账号 → 邮箱：Claude Code 在终端里登录的账号，Codex 登录的账号。
+        """能确定的账号 → 邮箱：Claude Code 终端登录账号、Codex 登录账号、Antigravity 登录账号。
         另外给出 multi-claude 各配置最近登录的账号 → 配置名，没有邮箱时拿它当名字。文件没改过就用上次的结果。"""
         codex_auth = os.path.join(self.codex, 'auth.json')
-        paths = [self.profile, codex_auth] + [os.path.join(p, 'config.json') for p, n in self.apps if n]
+        gem_storages = [os.path.join(d, 'app_storage.json') for d in self.gemini_app]
+        gem_cli_log = os.path.join(self.gemini, 'antigravity-cli', 'cli.log')
+        paths = ([self.profile, codex_auth, gem_cli_log] + gem_storages
+                 + [os.path.join(p, 'config.json') for p, n in self.apps if n])
 
         def build():
             emails, names = {}, {}
@@ -229,6 +251,26 @@ class Sources:
             acct = (claims.get('https://api.openai.com/auth') or {}).get('chatgpt_account_id')
             if acct and claims.get('email'):
                 emails[acct] = claims['email']
+            gem_email = ''
+            for sp in gem_storages:
+                gd = read_json(sp)
+                u = (gd.get('agy.onboarding.lastLoginUsername') or '').strip() if isinstance(gd, dict) else ''
+                if EMAIL_EXACT.fullmatch(u):
+                    gem_email = u
+                    break
+            if not gem_email:
+                log_cands = [gem_cli_log] + sorted(glob.glob(os.path.join(self.gemini, 'antigravity-cli', 'log', 'cli-*.log')), reverse=True)
+                for lp in log_cands:
+                    try:
+                        with open(lp, encoding='utf-8', errors='ignore') as f:
+                            found = GEMINI_CLI_EMAIL.findall(f.read(200000))
+                        if found:
+                            gem_email = found[-1]
+                            break
+                    except OSError:
+                        pass
+            if gem_email:
+                emails['gemini:' + gem_email.lower()] = gem_email
             for path, name in self.apps:
                 d = read_json(os.path.join(path, 'config.json')) if name else None
                 if isinstance(d, dict) and d.get('lastKnownAccountUuid'):
