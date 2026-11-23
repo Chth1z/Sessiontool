@@ -6,6 +6,7 @@
 - 回复进行中追加的消息记在 attachment 行里，不是 user 行。
 - 应用的会话清单按 <账号>/<组织>/ 分目录存放；multi-claude 的每个配置各有一份清单。
 - Codex 一个线程一份记录，标题、归档这些在它自己的线程表里。
+- Gemini（Antigravity）一个会话一份记录，标题、工作区、归档与子代理归属在 conversation_summaries.db 里。
 """
 import collections
 import json
@@ -15,13 +16,14 @@ import threading
 import time
 import zlib
 
-from . import codex as codex_mod, pricing
+from . import codex as codex_mod, gemini as gemini_mod, pricing
 from .index import is_agent_file
 
 AUTO_CONTINUE = 'I hit my usage limit while you were working'
 INTERRUPT = re.compile(r'\[Request interrupted by user[^\]]*\]')
 NOTE_PREFIX = ('<task-notification', '<ci-monitor-event')
-EDIT_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch')
+EDIT_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch',
+              'edit_file', 'write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content')
 DESKTOP_ENTRYPOINTS = ('claude-desktop', 'claude-desktop-3p', 'local-agent', 'local_agent')
 # 内置斜杠命令（/model、/compact 等）：哪怕后面带参数也不算真正的首问标题；用户自定义技能带参数时则保留
 BUILTIN_CMDS = frozenset((
@@ -268,7 +270,9 @@ def summary(rows):
         models.setdefault(r['model'] or '', pricing.Tally()).add(r, p)
         efforts.setdefault(r['effort'] or '', pricing.Tally()).add(r, p)
     out = total.json()
-    out['models'] = [dict(t.json(), model=m, name=pricing.model_name(m), priced=bool(pricing.key(m)))
+    out['unpriced_models'] = [pricing.model_name(m) or m for m, t in sorted(models.items(), key=lambda kv: -kv[1].n)
+                              if m and t.unpriced]
+    out['models'] = [dict(t.json(), model=m, name=pricing.model_name(m) or '未记录模型', priced=bool(pricing.key(m)))
                      for m, t in sorted(models.items(), key=lambda kv: (-kv[1].cost, -kv[1].n))]
     out['efforts'] = [dict(t.json(), effort=e) for e, t in sorted(efforts.items(), key=lambda kv: -kv[1].n)]
     return out
@@ -296,8 +300,8 @@ def first_line(text, n=80):
 
 
 def project(cwd):
-    # 没选文件夹就开始的会话，应用给它建了个临时目录，名字没有意义
-    return '无文件夹' if 'scratch-workspaces' in cwd else (os.path.basename(cwd.rstrip('\\/')) or cwd or '（未知）')
+    # 没选文件夹就开始的会话（空路径或桌面应用建的 scratch-workspaces 临时目录）统一归入“无文件夹”
+    return '无文件夹' if not cwd or 'scratch-workspaces' in cwd else (os.path.basename(cwd.rstrip('\\/')) or cwd or '无文件夹')
 
 
 class Catalog:
@@ -308,7 +312,7 @@ class Catalog:
         self.lock = threading.RLock()
         self.checked = 0
         self.inputs = None
-        self.sessions, self.by_page, self.by_cli, self.owner, self.agents, self.accounts = [], {}, {}, {}, {}, {}
+        self.sessions, self.by_page, self.by_cli, self.owner, self.agents, self.agent_labels, self.accounts = [], {}, {}, {}, {}, {}, {}
         self._merged, self._content = {}, {}
 
     def refresh(self, progress=None, force=False):
@@ -317,9 +321,9 @@ class Catalog:
             if not force and time.time() - self.checked < 2:
                 return False
             changed = self.index.sync(progress) > 0
-            # 清单、Codex 的线程表、账号线索、CLI 旁路文件都没改过时，比较起来很快
+            # 清单、Codex 的线程表、账号线索、CLI 旁路文件、Gemini 元数据与项目配置都没改过时，比较起来很快
             inputs = (self.sources.app_sessions(), self.sources.codex_threads(), self.sources.account_hints(),
-                      self.sources.claude_sidecars())
+                      self.sources.claude_sidecars(), self.sources.gemini_summaries(), self.sources.gemini_projects())
             if changed or inputs != self.inputs:
                 self.inputs = inputs
                 self._build(*inputs)
@@ -327,12 +331,17 @@ class Catalog:
             self.checked = time.time()
             return changed
 
-    def _build(self, apps, threads, hints, sidecars=({}, {})):
+    def _build(self, apps, threads, hints, sidecars=({}, {}), gemini_meta=None, gemini_projs=None):
         jobs, custom_titles = sidecars
-        files, codex, agents_of, self.agents = {}, [], collections.defaultdict(list), {}
+        gemini_meta, gemini_projs = gemini_meta or {}, gemini_projs or {}
+        nonempty = self.index.nonempty_files()
+        files, codex, gemini_files, agents_of = {}, [], [], collections.defaultdict(list)
+        self.agents, self.agent_labels = {}, {}
         for f in self.index.files():
             if f['src'] == 'codex':
                 codex.append(f)
+            elif f['src'] == 'gemini':
+                gemini_files.append(f)
             elif is_agent_file(f['path']):     # 子代理的记录不是独立会话，按编号挂到调用它的地方
                 self.agents[re.sub(r'^agent-', '', f['cli'])] = f
                 agents_of[os.path.basename(os.path.dirname(os.path.dirname(f['path'])))].append(f)
@@ -363,10 +372,13 @@ class Catalog:
             own = [files[i] for i in ids if i in files]
             if not own:
                 continue
+            unlisted = bool(r.get('_unlisted'))
+            # 跳过完全没有对话记录也没有用量的未登记空占位文件（如仅含 file-history-snapshot 的 200B 空文件）
+            if unlisted and not any(f['id'] in nonempty for f in own):
+                continue
             fctx = {}
             for f in own:
                 fctx.update(json.loads(f['ctx'] or '{}'))
-            unlisted = bool(r.get('_unlisted'))
             entrypoint = fctx.get('entrypoint') or ''
             # 只有桌面应用建的会话（entrypoint 是桌面应用）却不在桌面应用清单里，才提示“不在应用列表中”；CLI 本来就不写那份清单
             orphan = unlisted and entrypoint in DESKTOP_ENTRYPOINTS
@@ -394,6 +406,8 @@ class Catalog:
                 branches=[b.split('\x00')[-1] for b in r.get('writtenBranches') or [] if isinstance(b, str)],
                 status={k: str(status.get(k) or '') for k in ('status_category', 'status_detail', 'needs_action')})
         for f in codex:
+            if f['id'] not in nonempty:
+                continue
             ctx = json.loads(f['ctx'] or '{}')
             tid = ctx.get('sid') or f['cli']
             t = threads.get(tid) or {}
@@ -411,6 +425,59 @@ class Catalog:
                 model=t.get('model') or ctx.get('model') or '', effort=t.get('reasoning_effort') or ctx.get('effort') or '',
                 permission=t.get('approval_mode') or '', branches=[b for b in [t.get('git_branch') or ctx.get('branch')] if b],
                 version=ctx.get('version') or t.get('cli_version') or '', origin=ctx.get('origin') or t.get('originator') or '')
+        gemini_by_id = {f['cli']: f for f in gemini_files}
+        gemini_roots = []
+        for f in gemini_files:
+            cid = f['cli']
+            cur, anc, seen_p = cid, None, {cid}
+            for _ in range(8):
+                pid = (gemini_meta.get(cur) or {}).get('parent_conversation_id') or ''
+                if not pid or pid in seen_p:
+                    break
+                seen_p.add(pid)
+                if pid in gemini_by_id:
+                    anc = pid
+                cur = pid
+            if anc:
+                self.agents[cid] = f
+                agents_of[anc].append(f)
+                m = gemini_meta.get(cid) or {}
+                lbl = (m.get('agent_name') or m.get('title') or '').strip()
+                if lbl:
+                    self.agent_labels[cid] = lbl
+            else:
+                gemini_roots.append(f)
+        for f in gemini_roots:
+            cid = f['cli']
+            ag_list = agents_of.get(cid, [])
+            if f['id'] not in nonempty and not any(a['id'] in nonempty for a in ag_list):
+                continue
+            ctx = json.loads(f['ctx'] or '{}')
+            m = gemini_meta.get(cid) or {}
+            cwd = ''
+            ws = m.get('workspace_uris') or ''
+            if ws:
+                try:
+                    uris = json.loads(ws) if isinstance(ws, str) else ws
+                except ValueError:
+                    uris = [ws]
+                if isinstance(uris, list) and uris:
+                    cwd = gemini_mod.uri_to_path(uris[0])
+            pid = m.get('project_id') or ''
+            gp = gemini_projs.get(pid) or {}
+            if not cwd and gp.get('cwd'):
+                cwd = gemini_mod.uri_to_path(gp['cwd'])
+            cwd = cwd or f['cwd'] or ''
+            proj = project(cwd) if cwd else (gp.get('name') if gp.get('name') and pid != 'default-cli-project' else '无文件夹')
+            is_cli = (m.get('source') == 'CORTEX_TRAJECTORY_SOURCE_CLI'
+                      or '/antigravity-cli/' in f['path'].replace('\\', '/').lower())
+            origin = 'antigravity-cli' if is_cli else 'antigravity'
+            g_title = (m.get('title') or '').strip() or None
+            sessions['gemini_' + cid] = Session(
+                src='gemini', id='gemini_' + cid, page=page(cid.replace('-', '')),
+                record_title=g_title, cwd=cwd, proj=proj, archived=bool(m.get('archived')),
+                cli_ids=[cid], files=[f], size=f['size'], agent_files=ag_list,
+                model=ctx.get('model') or '', effort=ctx.get('effort') or '', origin=origin)
         for s in sessions.values():
             p = sessions.get(s.parent_id)
             s.parent = p if p is not s else None
@@ -423,6 +490,9 @@ class Catalog:
                 self.owner.setdefault(f['id'], s)
             for i in s.cli_ids:
                 self.by_cli.setdefault(i, s)
+            for a in s.agent_files:
+                if a['src'] == 'gemini':
+                    self.by_cli.setdefault(a['cli'], s)
 
     def _accounts(self, sessions, emails, names):
         """会话属于哪个账号，账号叫什么。
@@ -465,7 +535,7 @@ class Catalog:
     def spend(self, s):
         """这个会话自己花的用量，按时间排：各份记录和它调用的子代理里、由它自己的记录编号产生的回复。
         复刻会话里从原会话带来的那段（编号是原会话的）不算，那是原会话的花费。"""
-        own = set(s.cli_ids)
+        own = set(s.cli_ids) | {a['cli'] for a in s.agent_files if a['src'] == 'gemini'}
         return [r for r in self.index.usage([f['id'] for f in list(s.files) + list(s.agent_files)]) if r['sid'] in own]
 
     def merged(self, s, depth=0):
@@ -545,14 +615,18 @@ class Catalog:
         c = self.content(s)
         current = s.cli_ids[-1]
         link = lambda x: {'page': x.page, 'title': self.content(x)['title']}
-        codex = s.src == 'codex'
-        no_app = s.unlisted or s.orphan or codex
+        codex, gemini = s.src == 'codex', s.src == 'gemini'
+        no_app = s.unlisted or s.orphan or codex or gemini
+        subagents = []
+        for a in s.agent_files:
+            aid = re.sub(r'^agent-', '', a['cli'])
+            subagents.append({'id': aid, 'name': self.agent_labels.get(aid) or aid[:8]})
         return {
             'src': s.src, 'page': s.page, 'title': c['title'], 'id': None if no_app else s.id, 'cli': current,
             'orphan': s.orphan, 'archived': s.archived, 'cwd': s.cwd, 'proj': s.proj,
             'account': self.account(s), 'org': s.org, 'store': s.store, 'version': s.version, 'origin': s.origin,
             'files': [{'id': f['cli'], 'path': f['path'], 'size': f['size'], 'current': f['cli'] == current} for f in s.files],
-            'agents': len(s.agent_files),
+            'agents': len(s.agent_files), 'subagents': subagents,
             'created': s.created or None, 'first': c['first'], 'last': c['last'],
             'model': s.model, 'effort': s.effort, 'permission': s.permission,
             'turns': s.turns, 'branches': s.branches, 'status': s.status if any(s.status.values()) else None,
@@ -564,7 +638,7 @@ class Catalog:
             'parent': link(s.parent) if s.parent else None,
             'children': [link(x) for x in self.sessions if x.parent is s],
             'link': None if no_app else 'claude://claude.ai/epitaxy/' + s.id,
-            'resume': ('codex resume ' if codex else 'claude --resume ') + current}
+            'resume': ('codex resume ' if codex else 'agy --conversation ' if gemini else 'claude --resume ') + current}
 
     def agent_content(self, agent_id):
         """一个子代理自己的对话，整理成和会话一样的条目。没有这份记录时返回 None。"""
@@ -582,14 +656,18 @@ class Catalog:
             items = assemble(recs, {}, set(), False)
             c = {'sig': sig, 'items': items, 'nfiles': 1}
             c.update(stats(items))
-            c['title'] = '子代理：' + (c['first_prompt'][:40] or agent_id)
+            c['title'] = '子代理：' + (self.agent_labels.get(agent_id) or c['first_prompt'][:40] or agent_id)
             self._content['agent:' + agent_id] = c
             return c
 
     def agent_owner(self, agent_id):
-        """子代理属于哪个会话：它的记录在 <项目>/<会话的记录编号>/subagents/ 下。"""
+        """子代理属于哪个会话。Claude 放在 <会话>/subagents/ 下；Gemini 按 conversation_summaries 的父会话归属。"""
         f = self.agents.get(agent_id)
-        cli = os.path.basename(os.path.dirname(os.path.dirname(f['path']))) if f else None
+        if not f:
+            return None
+        if f['src'] == 'gemini':
+            return self.by_cli.get(f['cli'])
+        cli = os.path.basename(os.path.dirname(os.path.dirname(f['path'])))
         return next((s for s in self.sessions if cli in s.cli_ids), None)
 
     def find(self, key):

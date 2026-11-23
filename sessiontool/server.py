@@ -23,6 +23,7 @@ STATIC_TYPES = {'app.css': 'text/css; charset=utf-8', 'app.js': 'text/javascript
                 'theme.js': 'text/javascript; charset=utf-8', 'icon.svg': 'image/svg+xml'}
 LOCAL_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
 RANGES = (0, 7, 30, 90, 365)
+SOURCES = ('claude', 'codex', 'gemini')
 
 
 class App:
@@ -191,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/stats':
             app.refresh(force=fresh)
             days = int(arg('days')) if arg('days').isdigit() and int(arg('days')) in RANGES else 0
-            src = arg('src') if arg('src') in ('claude', 'codex') else ''
+            src = arg('src') if arg('src') in SOURCES else ''
             return self.reply_json(app.figures_for(src, arg('account'), days))
         if path == '/api/live':
             return self.live(arg('page'))
@@ -211,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply_json({'sig': app.catalog.state(s)})
         if path == '/api/search':
             q = arg('q').strip()
-            src = arg('src') if arg('src') in ('claude', 'codex') else None
+            src = arg('src') if arg('src') in SOURCES else None
             if not q:
                 return self.reply_json({'q': q, 'total': 0, 'sessions': []})
             groups = app.catalog.search(q, tools=arg('tools') == '1', src=src)
@@ -235,9 +236,10 @@ class Handler(BaseHTTPRequestHandler):
             if not c:
                 return self.not_found()
             owner = app.catalog.agent_owner(agent_id)
+            f = app.catalog.agents.get(agent_id)
             back = ('/s/' + owner.page, '回到会话') if owner else ('/', '全部会话')
-            pseudo = Session(id='agent:' + agent_id, page='', cwd=owner.cwd if owner else '', proj=owner.proj if owner else '子代理',
-                             orphan=True)
+            pseudo = Session(src=owner.src if owner else (f['src'] if f else 'claude'), id='agent:' + agent_id, page='',
+                             cwd=owner.cwd if owner else '', proj=owner.proj if owner else '子代理', orphan=True)
             return self.reply(render.session_page(pseudo, c, render.ServerMode(app.catalog.agents), back=back))
         if path == '/local':
             got = load_local_image(app.sources, arg('p'))

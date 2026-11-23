@@ -21,8 +21,8 @@ def progress(i, n, path, size):
 
 
 def open_app(args):
-    app = App(Sources(root=args.root, home=args.home, codex=args.codex))
-    if not os.path.isdir(app.sources.root):
+    app = App(Sources(root=args.root, home=args.home, codex=args.codex, gemini=args.gemini))
+    if not (os.path.isdir(app.sources.root) or os.path.isdir(app.sources.codex) or app.sources.gemini_dirs()):
         sys.exit('找不到会话记录目录：%s' % app.sources.root)
     if not app.index.files():
         print('首次运行，正在建立索引（记录越多越久，之后只读新增内容）…')
@@ -97,7 +97,7 @@ def cmd_export(args):
 
 
 def cmd_reindex(args):
-    sources = Sources(root=args.root, home=args.home, codex=args.codex)
+    sources = Sources(root=args.root, home=args.home, codex=args.codex, gemini=args.gemini)
     for name in ('index.db', 'index.db-wal', 'index.db-shm'):
         path = os.path.join(sources.home, name)
         if os.path.exists(path):
@@ -110,10 +110,11 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(errors='replace')
-    ap = argparse.ArgumentParser(prog='sessiontool', description='在本机完整查看 Claude 桌面应用、Claude Code 和 Codex 的会话记录，统计用量和费用')
+    ap = argparse.ArgumentParser(prog='sessiontool', description='在本机完整查看 Claude 桌面应用、Claude Code、Codex 和 Gemini 的会话记录，统计用量和费用')
     ap.add_argument('--version', action='version', version=__version__)
     ap.add_argument('--root', help='会话记录目录（默认 ~/.claude/projects）')
     ap.add_argument('--codex', help='Codex 的数据目录（默认 ~/.codex，或环境变量 CODEX_HOME）')
+    ap.add_argument('--gemini', help='Gemini（Antigravity）的数据目录（默认 ~/.gemini，或环境变量 GEMINI_HOME）')
     ap.add_argument('--home', help='索引存放的文件夹（默认 ~/.sessiontool）')
     sub = ap.add_subparsers(dest='cmd')
     p = sub.add_parser('serve', help='启动本地网页并打开浏览器（默认）')

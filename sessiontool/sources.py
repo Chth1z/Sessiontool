@@ -1,4 +1,4 @@
-"""数据位置：会话记录（Claude Code 和 Codex）、桌面应用的会话清单（含 multi-claude 的各个配置）、本工具自己的索引。"""
+"""数据位置：会话记录（Claude Code、Codex 和 Gemini）、桌面应用的会话清单（含 multi-claude 的各个配置）、本工具自己的索引。"""
 import base64
 import glob
 import json
@@ -62,7 +62,7 @@ def read_json(path):
 
 
 class Sources:
-    def __init__(self, root=None, stores=None, home=None, codex=None, profile=None, jobs=None):
+    def __init__(self, root=None, stores=None, home=None, codex=None, profile=None, jobs=None, gemini=None):
         user = os.path.expanduser('~')
         config = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(user, '.claude')
         self.root = os.path.abspath(root or os.path.join(config, 'projects'))
@@ -75,21 +75,53 @@ class Sources:
             self.stores = [s if isinstance(s, tuple) else (s, '') for s in stores]
             self.apps = [(os.path.dirname(d), name) for d, name in self.stores]
         self.codex = os.path.abspath(codex or os.environ.get('CODEX_HOME') or os.path.join(user, '.codex'))
+        self.gemini = os.path.abspath(gemini or os.environ.get('GEMINI_HOME') or os.path.join(user, '.gemini'))
         # Claude Code 自己登录的账号记在这里（设了 CLAUDE_CONFIG_DIR 时在那个目录里）
         self.profile = profile or os.path.join(os.environ.get('CLAUDE_CONFIG_DIR') or user, '.claude.json')
         self.home = os.path.abspath(home or os.environ.get('SESSIONTOOL_HOME') or os.path.join(user, '.sessiontool'))
         self._manifests = {}        # 清单文件 → (文件状态, 记录)：只重读改过的
         self._sidecars = {}         # CLI 后台任务与标题旁路文件 → (文件状态, 记录)
         self._threads = (None, {})
+        self._gemini = (None, {})
+        self._gemini_projects = (None, {})
         self._hints = (None, ({}, {}))
 
+    def gemini_dirs(self):
+        """Gemini（Antigravity 应用与 CLI）的数据目录 → [(目录, 来源)]。
+        支持直接指向 ~/.gemini（自动找下面的 antigravity 和 antigravity-cli），也支持直接指向其中某一个目录。"""
+        cands = [
+            (os.path.join(self.gemini, 'antigravity-cli'), 'antigravity-cli'),
+            (os.path.join(self.gemini, 'antigravity'), 'antigravity'),
+            (self.gemini, 'antigravity-cli' if os.path.basename(self.gemini).lower().endswith('-cli') else 'antigravity'),
+        ]
+        seen, dirs = set(), []
+        for d, origin in cands:
+            if not (os.path.isdir(os.path.join(d, 'brain')) or os.path.isfile(os.path.join(d, 'conversation_summaries.db'))):
+                continue
+            key = os.path.normcase(os.path.realpath(d))
+            if key not in seen:
+                seen.add(key)
+                dirs.append((d, origin))
+        return dirs
+
     def transcripts(self):
-        """[(路径, 来源)]：Claude Code 的会话记录和各会话里子代理的记录；Codex 的会话记录，含已归档的。"""
+        """[(路径, 来源)]：Claude Code、Codex 和 Gemini（Antigravity）的会话记录。"""
         claude = (glob.glob(os.path.join(self.root, '*', '*.jsonl'))
                   + glob.glob(os.path.join(self.root, '*', '*', 'subagents', '*.jsonl')))
         codex = (glob.glob(os.path.join(self.codex, 'sessions', '**', 'rollout-*.jsonl'), recursive=True)
                  + glob.glob(os.path.join(self.codex, 'archived_sessions', '**', 'rollout-*.jsonl'), recursive=True))
-        return sorted([(p, 'claude') for p in claude] + [(p, 'codex') for p in codex])
+        gemini = []
+        for d, _ in self.gemini_dirs():
+            for conv in glob.glob(os.path.join(d, 'brain', '*')):
+                logs = os.path.join(conv, '.system_generated', 'logs')
+                full = os.path.join(logs, 'transcript_full.jsonl')
+                if os.path.isfile(full):
+                    gemini.append(full)
+                else:
+                    compact = os.path.join(logs, 'transcript.jsonl')
+                    if os.path.isfile(compact):
+                        gemini.append(compact)
+        return sorted([(p, 'claude') for p in claude] + [(p, 'codex') for p in codex] + [(p, 'gemini') for p in gemini])
 
     def app_sessions(self):
         """应用的会话清单：{sessionId: 记录}。记录里补上 _account、_org（清单所在的子目录，也就是登录的账号和组织）
@@ -230,6 +262,91 @@ class Sources:
             except sqlite3.Error:
                 pass
         self._threads = (stamp, out)
+        return out
+
+    def gemini_summaries(self):
+        """Gemini（Antigravity）的会话元数据 {会话 ID: 行}（标题、工作区、父会话、是否归档……），
+        来自各数据目录的 conversation_summaries.db（只读打开）。数据库改过才重读。"""
+        dbs = []
+        for d, origin in self.gemini_dirs():
+            db = os.path.join(d, 'conversation_summaries.db')
+            if os.path.isfile(db):
+                dbs.append((db, origin))
+        stamp = []
+        for db, _ in dbs:
+            for p in (db, db + '-wal'):
+                try:
+                    st = os.stat(p)
+                    stamp.append((p, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    pass
+        if self._gemini[0] == stamp:
+            return self._gemini[1]
+        out = {}
+        cols = ('conversation_id', 'title', 'preview', 'workspace_uris', 'project_id', 'status', 'source',
+                'agent_name', 'parent_conversation_id', 'nesting_depth', 'killed')
+        for db, _ in dbs:
+            try:
+                con = sqlite3.connect('file:%s?mode=ro' % pathname2url(db), uri=True, timeout=1)
+                try:
+                    con.row_factory = sqlite3.Row
+                    have = {r[1] for r in con.execute('PRAGMA table_info(conversation_summaries)')}
+                    pick = [c for c in cols if c in have]
+                    if 'conversation_id' in pick:
+                        for r in con.execute('SELECT %s FROM conversation_summaries' % ','.join(pick)):
+                            r = dict(r)
+                            cid = r.get('conversation_id')
+                            if not cid:
+                                continue
+                            cur = out.setdefault(cid, {})
+                            cur.update({k: v for k, v in r.items() if v is not None and (v != '' or k not in cur)})
+                    try:
+                        for cid, arch in con.execute('SELECT conversation_id, MAX(archived) FROM conversations_fts GROUP BY conversation_id'):
+                            if cid and arch:
+                                out.setdefault(cid, {})['archived'] = 1
+                    except sqlite3.Error:
+                        pass
+                finally:
+                    con.close()
+            except sqlite3.Error:
+                pass
+        self._gemini = (stamp, out)
+        return out
+
+    def gemini_projects(self):
+        """Antigravity 项目配置 {project_id: {'name': 名称, 'cwd': 路径}}，位于 ~/.gemini/config/projects/*.json。"""
+        base = os.path.join(self.gemini, 'config', 'projects')
+        files = sorted(glob.glob(os.path.join(base, '*.json')))
+        stamp = []
+        for p in files:
+            try:
+                st = os.stat(p)
+                stamp.append((p, st.st_mtime_ns, st.st_size))
+            except OSError:
+                pass
+        if self._gemini_projects[0] == stamp:
+            return self._gemini_projects[1]
+        out = {}
+        for p in files:
+            d = read_json(p)
+            if not isinstance(d, dict) or not isinstance(d.get('id'), str) or not d['id']:
+                continue
+            name = str(d.get('name') or '').strip()
+            cwd = ''
+            pr = d.get('projectResources')
+            res = pr.get('resources') if isinstance(pr, dict) else pr if isinstance(pr, list) else None
+            for item in res or ():
+                if isinstance(item, dict):
+                    u = item.get('uri') or item.get('path') or item.get('workspaceUri') or ''
+                elif isinstance(item, str):
+                    u = item
+                else:
+                    u = ''
+                if isinstance(u, str) and u.strip():
+                    cwd = u.strip()
+                    break
+            out[d['id']] = {'name': name, 'cwd': cwd}
+        self._gemini_projects = (stamp, out)
         return out
 
     def plan_usage(self):

@@ -7,7 +7,7 @@ import base64
 import os
 import re
 
-from . import codex
+from . import codex, gemini
 from .index import LOCAL_IMAGE, flatten_result, is_base64_image
 
 PERSISTED = re.compile(r'Full output saved to: ([^\r\n]+)')
@@ -31,6 +31,8 @@ def block(index, ref, parts=(3,)):
     d = d if isinstance(d, dict) else {}
     if src == 'codex':
         content = codex.content(d)
+    elif src == 'gemini':
+        content = gemini.content(d)
     else:
         # 普通消息的内容在 message.content；回复进行中追加的消息在 attachment.prompt
         content = (d.get('message') or {}).get('content') or (d.get('attachment') or {}).get('prompt')
@@ -80,6 +82,21 @@ def load_tool(index, sources, use_ref, res_ref=None):
     return out
 
 
+def inside_gemini(sources, path):
+    """只允许读 Gemini（Antigravity）数据目录里的媒体文件。"""
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        return None
+    for d, _ in sources.gemini_dirs():
+        root = os.path.realpath(d)
+        try:
+            if os.path.commonpath([real, root]) == root:
+                return real
+        except ValueError:
+            continue
+    return None
+
+
 def load_image(index, ref):
     """→ (字节, 媒体类型) 或 None。"""
     blk, nums = block(index, ref, parts=(3, 4))
@@ -90,14 +107,31 @@ def load_image(index, ref):
         if not isinstance(inner, list) or nums[3] >= len(inner) or not isinstance(inner[nums[3]], dict):
             return None
         blk = inner[nums[3]]
-    if blk.get('type') != 'image' or not is_base64_image(blk):
+    if blk.get('type') != 'image':
         return None
-    try:
-        data = base64.b64decode(blk['source']['data'])
-    except ValueError:
-        return None
-    media = blk['source'].get('media_type') or 'image/png'
-    return data, (media if media in IMAGE_TYPES.values() else 'image/png')
+    src = blk.get('source') or {}
+    if is_base64_image(blk):
+        try:
+            data = base64.b64decode(src['data'])
+        except ValueError:
+            return None
+        media = src.get('media_type') or 'image/png'
+        return data, (media if media in IMAGE_TYPES.values() else 'image/png')
+    if src.get('type') == 'file' and isinstance(src.get('path'), str):
+        real = inside_gemini(index.sources, src['path'])
+        if not real:
+            return None
+        media = src.get('media_type') or IMAGE_TYPES.get(os.path.splitext(real)[1].lower())
+        if media not in IMAGE_TYPES.values():
+            media = IMAGE_TYPES.get(os.path.splitext(real)[1].lower())
+        if not media:
+            return None
+        try:
+            with open(real, 'rb') as f:
+                return f.read(), media
+        except OSError:
+            return None
+    return None
 
 
 def load_sent_image(index, ref):

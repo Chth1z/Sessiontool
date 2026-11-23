@@ -11,9 +11,9 @@ import re
 import sqlite3
 import threading
 
-from . import codex
+from . import codex, gemini
 
-SCHEMA = 9
+SCHEMA = 11
 LOCAL_IMAGE = re.compile(r'\[Image: source: ([^\]\r\n]+\.(?:png|jpe?g|gif|webp))\]', re.I)
 EMAIL = re.compile(r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)')
 
@@ -274,8 +274,13 @@ class Index:
             cli = os.path.splitext(os.path.basename(path))[0]
             if src == 'codex':          # rollout-<时间>-<线程 ID>
                 cli = cli[-36:]
+            elif src == 'gemini':       # …/brain/<会话 ID>/.system_generated/logs/transcript_full.jsonl
+                cli = gemini.conv_id(path)
             fid = con.execute('INSERT INTO files(path, src, cli, size, mtime, off, guard) VALUES(?,?,?,0,0,0,?)',
                               (path, src, cli, '')).lastrowid
+        if src == 'gemini':
+            ctx.setdefault('sid', known['cli'] if known else cli)
+        gen_meta = gemini.conv_gen_meta(path) if src == 'gemini' else None
         rows, uses, off = [], [], start
         last_ts = ctx.get('ts', '')
         if src == 'claude' and known and start:
@@ -311,6 +316,16 @@ class Index:
                     recs, use = codex.parse_line(d, ctx)
                     for i, (kind, data, text, tool) in enumerate(recs):
                         # Codex 的行没有编号：用位置和线程 ID 拼一个，前 8 位是位置，当页面里的锚点
+                        uuid = '%08x%s-%s' % (off & 0xffffffff, '' if i == 0 else '.%d' % i, ctx.get('sid') or fid)
+                        rows.append((fid, off, uuid, ctx.get('last'), last_ts, ctx.get('sid'), kind,
+                                     json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
+                        ctx['last'] = uuid
+                    if use:
+                        used(use, ctx.get('sid'))
+                elif isinstance(d, dict) and src == 'gemini':
+                    last_ts = d.get('created_at') or last_ts
+                    recs, use = gemini.parse_line(d, ctx, gen_meta)
+                    for i, (kind, data, text, tool) in enumerate(recs):
                         uuid = '%08x%s-%s' % (off & 0xffffffff, '' if i == 0 else '.%d' % i, ctx.get('sid') or fid)
                         rows.append((fid, off, uuid, ctx.get('last'), last_ts, ctx.get('sid'), kind,
                                      json.dumps(data, ensure_ascii=False) if data is not None else None, text, tool))
@@ -360,6 +375,8 @@ class Index:
             ctx['ts'] = last_ts
             cwd = ctx.get('cwd') or cwd
             title = ctx.get('title') or None
+        elif src == 'gemini':
+            ctx['ts'] = last_ts
         else:
             title = ctx.get('agent_name') or ctx.get('custom_title') or ctx.get('ai_title') or ctx.get('summary') or None
         con.execute('UPDATE files SET size=?, mtime=?, off=?, guard=?, title=?, cwd=?, email=?, org=?, ctx=? WHERE id=?',
@@ -370,6 +387,11 @@ class Index:
 
     def files(self):
         return [dict(r) for r in self.con().execute('SELECT * FROM files ORDER BY path')]
+
+    def nonempty_files(self):
+        """至少含有一条非连接记录或用量记录的文件编号集合，用来跳过空占位文件。"""
+        return {r[0] for r in self.con().execute(
+            "SELECT DISTINCT file FROM rec WHERE kind!='link' UNION SELECT DISTINCT file FROM usage")}
 
     def rows(self, file_id, start=0):
         """一份记录里的各行（start：只要从这个位置起的），按位置排。"""
