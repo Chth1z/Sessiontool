@@ -11,8 +11,10 @@ import json
 import os
 import re
 
-# Anthropic 官方价目（2026-10）。写缓存：保留 5 分钟是输入价的 1.25 倍，1 小时是 2 倍
+# Anthropic 官方价目（2026-11）。写缓存：保留 5 分钟是输入价的 1.25 倍，1 小时是 2 倍
 CLAUDE = {
+    'claude-fable-5-2': (8, 40, 0.2, 10, 16),
+    'claude-mythos-5-2': (8, 40, 0.2, 10, 16),
     'claude-fable-5-1': (10, 50, 0.25, 12.5, 20),
     'claude-mythos-5-1': (10, 50, 0.25, 12.5, 20),
     'claude-fable-5': (10, 50, 1, 12.5, 20),
@@ -24,7 +26,7 @@ CLAUDE = {
     'claude-opus-4-5': (5, 25, 0.5, 6.25, 10),
     'claude-opus-4-1': (15, 75, 1.5, 18.75, 30),
     'claude-opus-4': (15, 75, 1.5, 18.75, 30),
-    'claude-sonnet-5-5': (2, 10, 0.2, 2.5, 4),
+    'claude-sonnet-5-5': (2, 10, 0.1, 2.5, 4),
     'claude-sonnet-5': (2, 10, 0.2, 2.5, 4),
     'claude-sonnet-4-6': (3, 15, 0.3, 3.75, 6),
     'claude-sonnet-4-5': (3, 15, 0.3, 3.75, 6),
@@ -34,12 +36,21 @@ CLAUDE = {
     'claude-haiku-4-5': (1, 5, 0.1, 1.25, 2),
     'claude-3-5-haiku': (0.8, 4, 0.08, 1, 1.6),
 }
-# OpenAI（Codex 用的模型）：GPT-6 系列取自第三方整理的价目，没有和 OpenAI 官方价目页核对过；
-# GPT-5 系列是 2025 年的官方价。OpenAI 不单收写缓存的钱，按输入价计
+# OpenAI（Codex 用的模型）官方价目（2026-11）：GPT-6.1/6.2 写缓存 30 分钟为输入价 1.25 倍、12 小时为 2.5 倍；
+# GPT-5 与早期模型不单收写缓存费用，按输入价计
 OPENAI = {
+    'gpt-6.2-astra': (8, 40, 0.4, 10, 20),
+    'gpt-6.2-sol': (2, 10, 0.1, 2.5, 5),
+    'gpt-6.1-sol': (2, 10, 0.1, 2.5, 5),
+    'gpt-6.1-terra': (1, 5, 0.05, 1.25, 2.5),
     'gpt-6-astra': (10, 50, 1, 10, 10),
-    'gpt-6.1-sol': (2, 10, 0.1, 2.5, 2.5),
     'gpt-6-sol': (2, 10, 0.2, 2, 2),
+    'gpt-6-luna': (0.1, 0.5, 0.01, 0.1, 0.1),
+    'gpt-5.4': (2.5, 15, 0.25, 2.5, 2.5),
+    'gpt-5.4-mini': (0.75, 4.5, 0.075, 0.75, 0.75),
+    'gpt-5.4-nano': (0.2, 1.25, 0.02, 0.2, 0.2),
+    'gpt-5.3-codex': (1.75, 14, 0.175, 1.75, 1.75),
+    'gpt-5.3-chat': (1.75, 14, 0.175, 1.75, 1.75),
     'gpt-5.2': (1.75, 14, 0.175, 1.75, 1.75),
     'gpt-5.1-codex-max': (1.25, 10, 0.125, 1.25, 1.25),
     'gpt-5.1-codex-mini': (0.25, 2, 0.025, 0.25, 0.25),
@@ -54,17 +65,53 @@ OPENAI = {
     'o3': (2, 8, 0.5, 2, 2),
     'gpt-4.1': (2, 8, 0.5, 2, 2),
 }
+# Google Gemini 官方价目（2026-11 标准价）。Gemini 4 隐式缓存读取按输入价的 5% 计；不单收写缓存费用，按输入价计
+GEMINI = {
+    'gemini-4-neon': (3, 15, 0.15, 3, 3),
+    'gemini-4-argon': (4, 20, 0.2, 4, 4),
+    'gemini-4-carbon': (4, 20, 0.2, 4, 4),
+    'gemini-4-hydrogen': (1.5, 7.5, 0.075, 1.5, 1.5),
+    'gemini-3.8-flash': (1.5, 7.5, 0.15, 1.5, 1.5),
+    'gemini-3.7-flash': (1.5, 7.5, 0.15, 1.5, 1.5),
+    'gemini-3.5-flash-lite': (0.3, 2.5, 0.03, 0.3, 0.3),
+    'gemini-3.1-pro': (2, 12, 0.2, 2, 2),
+    'gemini-3.1-flash-lite': (0.25, 1.5, 0.025, 0.25, 0.25),
+    'gemini-3-pro': (2, 12, 0.2, 2, 2),
+    'gemini-3-flash': (0.5, 3, 0.05, 0.5, 0.5),
+    'gemini-2.5-pro': (1.25, 10, 0.125, 1.25, 1.25),
+    'gemini-2.5-flash': (0.3, 2.5, 0.03, 0.3, 0.3),
+    'gemini-2.5-flash-lite': (0.1, 0.4, 0.01, 0.1, 0.1),
+}
 # 一次请求的提示词（输入 + 缓存）超过这么多 token 时整次改用另一档价格
 TIERS = {
     'claude-haiku-5-5': (100000, (0.5, 2.5, 0.05, 0.625, 1)),
+    'gpt-6.2-astra': (272000, (16, 60, 0.8, 20, 40)),
+    'gpt-6.2-sol': (272000, (4, 15, 0.2, 5, 10)),
+    'gpt-6.1-sol': (272000, (4, 15, 0.2, 5, 10)),
+    'gpt-6.1-terra': (272000, (2, 7.5, 0.1, 2.5, 5)),
     'gpt-6-astra': (272000, (20, 75, 2, 20, 20)),
-    'gpt-6.1-sol': (272000, (4, 10, 0.2, 2.5, 2.5)),
+    'gpt-5.4': (272000, (5, 22.5, 0.5, 5, 5)),
+    'gemini-3.1-pro': (200000, (4, 18, 0.4, 4, 4)),
+    'gemini-3-pro': (200000, (4, 18, 0.4, 4, 4)),
+    'gemini-2.5-pro': (200000, (2.5, 15, 0.25, 2.5, 2.5)),
 }
-FAST = {'claude-opus-5-5': 2, 'claude-opus-5': 2, 'gpt-6-astra': 2}   # 快速模式的倍数
+FAST = {
+    'claude-fable-5-2': 2, 'claude-mythos-5-2': 2, 'claude-fable-5-1': 2, 'claude-mythos-5-1': 2,
+    'claude-opus-5-5': 2, 'claude-opus-5': 2,
+    'gpt-6.2-astra': 2, 'gpt-6.2-sol': 2, 'gpt-6.1-sol': 2, 'gpt-6.1-terra': 2, 'gpt-6-astra': 2,
+}   # 快速模式的倍数
 WEB_SEARCH = 0.01                                         # 每次网页搜索
-ALIASES = {'gpt6astra': 'gpt-6-astra'}
+ALIASES = {
+    'gpt6astra': 'gpt-6-astra',
+    'gpt62astra': 'gpt-6.2-astra',
+    'gpt62sol': 'gpt-6.2-sol',
+    'gpt61sol': 'gpt-6.1-sol',
+    'gpt61terra': 'gpt-6.1-terra',
+    'gpt6sol': 'gpt-6-sol',
+    'gpt6luna': 'gpt-6-luna',
+}
 
-TABLE = dict(CLAUDE, **OPENAI)
+TABLE = dict(CLAUDE, **OPENAI, **GEMINI)
 
 
 def configure(home):
@@ -72,6 +119,7 @@ def configure(home):
     TABLE.clear()
     TABLE.update(CLAUDE)
     TABLE.update(OPENAI)
+    TABLE.update(GEMINI)
     key.cache_clear()
     try:
         with open(os.path.join(home, 'prices.json'), encoding='utf-8') as f:
@@ -84,14 +132,16 @@ def configure(home):
 
 
 def bare(model):
-    """去掉 [1m] 这类标记和云平台的前缀（anthropic.、us.anthropic.、openai. ……），统一常见简写。"""
+    """去掉 [1m] 这类标记和云平台的前缀（anthropic.、us.anthropic.、openai.、google. ……），统一常见简写。"""
     m = re.sub(r'\[[^\]]*\]$', '', (model or '').strip().lower())
-    m = re.sub(r'^(?:[\w-]+\.)*(?:anthropic|openai)\.', '', m)
-    for p in ('claude-', 'gpt-'):
+    m = re.sub(r'^(?:[\w-]+\.)*(?:anthropic|openai|google|vertex)\.', '', m)
+    for p in ('claude-', 'gpt-', 'gemini-'):
         i = m.find(p)
         if i > 0:
             m = m[i:]
             break
+    if m.startswith('gemini-'):
+        m = re.sub(r'(?:-tiered)?-(?:minimal|low|medium|high|xhigh|max|thinking)$', '', m)
     for k, v in ALIASES.items():
         if m == k or m.startswith(k + '-') or m.startswith(k + '@'):
             return v + m[len(k):]
@@ -100,10 +150,10 @@ def bare(model):
 
 @functools.lru_cache(maxsize=None)
 def key(model):
-    """模型 ID → 价格表里的那一项（取最长的匹配；后面只允许跟日期后缀）。没有返回 None。"""
+    """模型 ID → 价格表里的那一项（取最长的匹配；后面只允许跟日期、preview 或 latest 后缀）。没有返回 None。"""
     m, best = bare(model), None
     for k in TABLE:
-        if m == k or (m.startswith(k) and re.match(r'[-@]\d{4}-?\d{2}-?\d{2}', m[len(k):])):
+        if m == k or (m.startswith(k) and re.match(r'(?:[-@]\d{4}-?\d{2}-?\d{2}|-(?:preview|exp|latest)(?:-\d{2}-\d{2})?$)', m[len(k):])):
             if not best or len(k) > len(best):
                 best = k
     return best
@@ -169,7 +219,7 @@ class Tally:
 
 
 def model_name(model):
-    """claude-opus-5-5 → Opus 5.5，claude-3-5-haiku-20241022 → Haiku 3.5；别的原样返回。"""
+    """claude-opus-5-5 → Opus 5.5，gemini-4-neon → Gemini 4 Neon；别的原样返回。"""
     m = bare(model)
     x = re.fullmatch(r'claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:[-@]\d{8})?', m)
     if x:
@@ -177,4 +227,8 @@ def model_name(model):
     x = re.fullmatch(r'claude-(\d+)(?:-(\d+))?-([a-z]+)(?:[-@]\d{8})?', m)
     if x:
         return '%s %s%s' % (x.group(3).capitalize(), x.group(1), '.' + x.group(2) if x.group(2) else '')
+    x = re.fullmatch(r'gemini-(\d+(?:\.\d+)?)-([a-z]+(?:-[a-z]+)*?)(?:-(?:preview|exp|latest)(?:-\d{2}-\d{2})?)?', m)
+    if x:
+        tail = '-'.join(w.capitalize() for w in x.group(2).split('-'))
+        return 'Gemini %s %s' % (x.group(1), tail)
     return model or ''
