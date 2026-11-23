@@ -8,7 +8,7 @@ import tempfile
 import threading
 import unittest
 
-from sessiontool import render
+from sessiontool import providers, render
 from sessiontool.details import load_image, load_sent_image, load_tool
 from sessiontool.export import export_html, export_markdown
 from sessiontool.server import App, make_server
@@ -554,6 +554,10 @@ class SearchAndDetailsTest(Case):
         self.assertIn('data:image/png;base64,', page)
         self.assertNotIn('/api/tool', page)
         self.assertNotIn('/static/', page)
+        # 独立导出只内嵌会话页所需脚本，不夹带索引页或统计页代码
+        self.assertIn('window.ST', page)
+        self.assertNotIn('buildQuips', page)
+        self.assertNotIn('/api/search', page)
         self.assertIn('看这张图里的蓝鲸', export_markdown(cat, s))
 
     def test_http_server(self):
@@ -562,10 +566,21 @@ class SearchAndDetailsTest(Case):
         s, c = self.content(cat, 'local_a')
         status, body, _ = get('/')
         self.assertEqual(status, 200)
-        self.assertIn('local_a', body.decode())
+        idx_text = body.decode()
+        self.assertIn('local_a', idx_text)
+        self.assertIn('/static/index.js', idx_text)
+        self.assertNotIn('/static/stats.js', idx_text)
+        self.assertNotIn('/static/session.js', idx_text)
+        status, body, _ = get('/stats')
+        self.assertEqual(status, 200)
+        self.assertIn('/static/stats.js', body.decode())
+        self.assertNotIn('/static/index.js', body.decode())
         status, body, r = get('/s/' + s.page)
         self.assertEqual(status, 200)
-        self.assertIn('图里是一头蓝鲸', body.decode())
+        sess_text = body.decode()
+        self.assertIn('图里是一头蓝鲸', sess_text)
+        self.assertIn('/static/session.js', sess_text)
+        self.assertNotIn('/static/stats.js', sess_text)
         self.assertIn("script-src 'self'", r.getheader('Content-Security-Policy'))
         t1 = [t for it in c['items'] if it['kind'] == 'tools' for t in it['tools']][0]
         status, body, _ = get('/api/tool?u=%s&r=%s' % (t1['use'], t1['res']))
@@ -579,11 +594,37 @@ class SearchAndDetailsTest(Case):
         self.assertEqual(get('/local?p=' + self.secret.replace(os.sep, '/'))[0], 404)
         self.assertEqual(get('/', host='evil.example.com')[0], 403)
         self.assertEqual(json.loads(get('/api/state?page=' + s.page)[1])['sig'], cat.state(s))
-        self.assertEqual(get('/static/theme.js')[0], 200)
+        for asset in ('theme.js', 'core.js', 'info.js', 'session.js', 'index.js', 'stats.js', 'app.css', 'icon.svg'):
+            self.assertEqual(get('/static/' + asset)[0], 200)
+        self.assertEqual(get('/static/app.js')[0], 404)
         self.assertEqual(get('/static/../server.py')[0], 404)
         info = json.loads(get('/api/info?page=' + s.page)[1])
         self.assertEqual((info['id'], info['cli'], info['children'][0]['title']), ('local_a', 'aaaa1111', 'local_f'))
         self.assertEqual(get('/api/info?page=nope')[0], 404)
+
+    def test_index_cache_and_provider_registry(self):
+        cat = self.build()
+        h1 = self.app.index_html()
+        cached_key = self.app._index_cache[0]
+        h2 = self.app.index_html()
+        self.assertEqual(self.app._index_cache[0], cached_key)
+        self.assertIn('<time id="synced">', h2)
+        self.assertEqual(len(cat.index.nonempty_files()), 2)
+        # 写入新记录并刷新后，首页缓存键失效并重渲染
+        self.write('ffff0002', [user('f8', 'f1', '缓存失效测试', 25, 'ffff0002')], mode='a')
+        cat.refresh(force=True)
+        h3 = self.app.index_html()
+        self.assertNotEqual(self.app._index_cache[0], cached_key)
+        self.assertIn('缓存失效测试', h3)
+        # 来源注册表与工具集合一致性
+        self.assertEqual(providers.PROVIDER_KEYS, ('claude', 'codex', 'gemini'))
+        for k, p in providers.PROVIDERS.items():
+            self.assertEqual(p.key, k)
+            self.assertTrue(p.edit_tools)
+            self.assertTrue(callable(p.module.content))
+            self.assertTrue(callable(p.module.file_cli))
+            self.assertTrue(callable(p.module.finalize_meta))
+        self.assertTrue({'Edit', 'apply_patch', 'edit_file'}.issubset(providers.EDIT_TOOLS))
 
     def test_refresh_button_rereads_the_disk_at_once(self):
         cat = self.build()

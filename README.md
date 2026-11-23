@@ -146,14 +146,19 @@ python -m unittest discover -s tests
 
 | 模块 | 作用 |
 |---|---|
-| `sources.py` | 找到会话记录、各处的应用会话清单（含 multi-claude）、Codex 与 Gemini 的数据、账号线索和索引的位置 |
-| `index.py` | 把 `.jsonl` 增量解析进 SQLite，每次回复的用量另存一张表 |
-| `codex.py` | 把 Codex 的记录整理成和 Claude 一样的形状 |
-| `gemini.py` | 把 Gemini（Antigravity）的记录整理成和 Claude 一样的形状 |
-| `sessions.py` | 合并同一会话的多份记录，识别复刻与改写分支，整理成条目；账号；每个会话的用量；搜索 |
-| `pricing.py` | 模型价格、按 API 价格估算费用、模型的显示名 |
-| `stats.py` | 统计页的数据 |
-| `details.py` | 按偏移量从原记录取工具的完整输入输出和图片 |
-| `render.py` | 条目 → HTML / Markdown |
-| `server.py` | 本地网页服务；实时更新的事件流 |
-| `export.py` | 导出单个文件 |
+| `util.py` | 零依赖公共基础工具（工具提示提取、内容扁平化、只读 SQLite 连接、ISO 本地时间解析） |
+| `claude.py` | 解析 Claude Code / 桌面应用的 `.jsonl` 记录与用量 |
+| `codex.py` | 将 Codex 记录整理为统一数据结构 |
+| `gemini.py` | 将 Gemini（Antigravity）记录与 `conversations/*.db` 元数据整理为统一数据结构 |
+| `providers.py` | 多来源适配器注册表（统一维护各来源元数据、编辑工具集合与解析入口） |
+| `sources.py` | 发现会话记录、各处应用清单（含 multi-claude）、Codex 与 Gemini 数据及账号线索 |
+| `index.py` | 将各来源 `.jsonl` 增量解析入 SQLite，并按文件与消息索引对话和用量 |
+| `sessions.py` | 合并同一会话的多份记录，识别复刻与改写分支，整理条目、账号归属、用量与全文搜索 |
+| `pricing.py` | 模型价目表、按 API 价格估算费用与模型显示名归一化 |
+| `stats.py` | 计算统计页的时间序列、热力图、模型槽位、账号额度与汇总指标 |
+| `details.py` | 按偏移量从原记录或允许目录按需读取工具详情与图片 |
+| `markdown.py` | 面向消息正文的零依赖 Markdown → HTML 渲染器 |
+| `render.py` | 条目 → HTML / Markdown，按页面装配样式与前端脚本 |
+| `server.py` | 本地只读 HTTP 服务、首页渲染缓存与 SSE 实时更新事件流 |
+| `export.py` | 导出离线单文件 HTML / Markdown |
+| `static/` | 按页拆分的零构建前端资源（`theme.js`、`core.js`、`info.js`、`session.js`、`index.js`、`stats.js`、`app.css`、`icon.svg`） |
