@@ -1,16 +1,20 @@
-"""账号与多份会话清单（multi-claude）、Codex 的记录、用量和费用、总的统计、实时更新用到的接口。"""
+"""账号与多份会话清单（multi-claude）、Codex 与 Gemini 的记录、用量和费用、总的统计、实时更新用到的接口。"""
 import base64
 import json
 import os
 import socket
 import sqlite3
 
-from sessiontool import pricing, render, stats
+from sessiontool import gemini, pricing, render, stats
 from sessiontool.details import load_image, load_tool
+from sessiontool.export import export_html
 from sessiontool.sessions import Catalog
 from test_core import PNG, Case, asst, ts, user
 
 TID = '01a181a5-33c8-7153-aeed-e07609968ed2'
+GID = '71727329-fc51-4de2-a5e8-1805a6dcf1df'
+GSUB = 'aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb'
+GCLI = 'cccccccc-2222-4333-8444-dddddddddddd'
 
 
 def reply(uuid, parent, mid, text, n, sid, model='claude-opus-5-5', out=100, cw1h=500, effort='max', **extra):
@@ -54,7 +58,8 @@ class StoreCase(Case):
         from sessiontool.server import App
         from sessiontool.sources import Sources
         self.app = App(Sources(root=self.root, stores=stores, home=os.path.join(self.tmp.name, 'home'),
-                               codex=os.path.join(self.tmp.name, 'codex'), profile=os.path.join(self.tmp.name, 'claude.json')))
+                               codex=os.path.join(self.tmp.name, 'codex'), gemini=os.path.join(self.tmp.name, 'gemini'),
+                               profile=os.path.join(self.tmp.name, 'claude.json')))
         self.app.catalog.refresh(force=True)
         return self.app.catalog
 
@@ -247,6 +252,301 @@ class CodexTest(StoreCase):
         self.assertEqual(cat.content({s.id: s for s in cat.sessions}['codex_' + tid2])['title'], '流式改名')
 
 
+class GeminiTest(StoreCase):
+    def gwrite(self, cid, steps, flavor='antigravity', mode='w'):
+        logs = os.path.join(self.tmp.name, 'gemini', flavor, 'brain', cid, '.system_generated', 'logs')
+        os.makedirs(logs, exist_ok=True)
+        with open(os.path.join(logs, 'transcript_full.jsonl'), mode, encoding='utf-8', newline='\n') as f:
+            for r in steps:
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+
+    def gdb(self, flavor, rows, fts_rows=()):
+        db = os.path.join(self.tmp.name, 'gemini', flavor, 'conversation_summaries.db')
+        os.makedirs(os.path.dirname(db), exist_ok=True)
+        con = sqlite3.connect(db)
+        con.execute('CREATE TABLE conversation_summaries(conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT, '
+                    'workspace_uris TEXT, project_id TEXT, status TEXT, source TEXT, agent_name TEXT, '
+                    'parent_conversation_id TEXT, nesting_depth INT, killed INT)')
+        con.executemany('INSERT INTO conversation_summaries VALUES(?,?,?,?,?,?,?,?,?,?,?)', rows)
+        con.execute('CREATE TABLE conversations_fts(conversation_id TEXT, archived INT)')
+        con.executemany('INSERT INTO conversations_fts VALUES(?,?)', fts_rows)
+        con.commit()
+        con.close()
+
+    def build(self):
+        ag_root = os.path.join(self.tmp.name, 'gemini', 'antigravity')
+        pic_u = os.path.join(ag_root, 'brain', GID, 'user_pic.png')
+        pic_t = os.path.join(ag_root, 'brain', GID, 'shot.png')
+        os.makedirs(os.path.dirname(pic_u), exist_ok=True)
+        for p in (pic_u, pic_t):
+            with open(p, 'wb') as f:
+                f.write(PNG)
+        outside = os.path.join(self.tmp.name, 'outside.png')
+        with open(outside, 'wb') as f:
+            f.write(PNG)
+        pic_u_uri = 'file:///' + pic_u.replace('\\', '/').lstrip('/')
+        self.gwrite(GID, [
+            {'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE', 'created_at': ts(1),
+             'content': '<USER_REQUEST>\n帮我把 Gemini 接入进来\n</USER_REQUEST>\n'
+                        '<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-23.\n</ADDITIONAL_METADATA>\n'
+                        '<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>',
+             'media': [{'mime_type': 'image/png', 'uri': pic_u_uri}, {'mime_type': 'image/png', 'uri': outside}]},
+            {'step_index': 1, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(2),
+             'input_tokens': 1000, 'cache_read_tokens': 2000, 'output_tokens': 100,
+             'thinking': '先看文件并调用子代理',
+             'tool_calls': [
+                 {'name': 'edit_file', 'args': {'Path': 'd:\\work\\gmproj\\app.py', 'Target': 'a', 'Replacement': 'b'}},
+                 {'name': 'run_command', 'args': {'CommandLine': 'pytest -q', 'toolSummary': '运行测试'}},
+                 {'name': 'invoke_subagent', 'args': {'Role': 'Code Researcher', 'TypeName': 'research', 'Prompt': '查一下'}}]},
+            {'step_index': 2, 'source': 'MODEL', 'type': 'GENERIC', 'status': 'DONE', 'created_at': ts(3),
+             'content': 'Created At: 2026-11-23T21:00:00+08:00\nCompleted At: 2026-11-23T21:00:01+08:00\nEdited app.py'},
+            {'step_index': 3, 'source': 'MODEL', 'type': 'GENERIC', 'status': 'ERROR', 'created_at': ts(4),
+             'content': 'Created At: 2026-11-23T21:00:01+08:00\nCompleted At: 2026-11-23T21:00:02+08:00\n1 failed',
+             'error': 'exit code 1', 'media': [{'mime_type': 'image/png', 'uri': pic_t}]},
+            {'step_index': 4, 'source': 'MODEL', 'type': 'GENERIC', 'status': 'DONE', 'created_at': ts(5),
+             'content': 'Created At: 2026-11-23T21:00:02+08:00\nCompleted At: 2026-11-23T21:00:03+08:00\nLaunched subagent conversationId: %s' % GSUB},
+            {'step_index': 5, 'source': 'SYSTEM', 'type': 'SYSTEM_MESSAGE', 'status': 'DONE', 'created_at': ts(6),
+             'content': 'The following is a <SYSTEM_MESSAGE>\n子代理已完成\n</SYSTEM_MESSAGE>'},
+            {'step_index': 6, 'source': 'SYSTEM', 'type': 'CHECKPOINT', 'status': 'DONE', 'created_at': ts(7),
+             'content': '压缩后的上下文摘要'},
+            {'step_index': 7, 'source': 'SYSTEM', 'type': 'ERROR_MESSAGE', 'status': 'ERROR', 'created_at': ts(8),
+             'error': '网络短暂抖动'},
+            {'step_index': 8, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(9),
+             'model': 'gemini-4-neon-xhigh', 'input_tokens': 500, 'cache_read_tokens': 10000, 'output_tokens': 200,
+             'content': 'Gemini 已经接好了。'},
+        ])
+        self.gwrite(GSUB, [
+            {'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE', 'created_at': ts(5),
+             'content': '<USER_REQUEST>\n子代理查一下配置\n</USER_REQUEST>'},
+            {'step_index': 1, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(6),
+             'model': 'gemini-4-hydrogen-tiered-high', 'input_tokens': 400, 'cache_read_tokens': 1000, 'output_tokens': 80,
+             'content': '子代理发现关键线索'},
+        ])
+        self.gwrite(GCLI, [
+            {'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE', 'created_at': ts(10),
+             'content': '<USER_REQUEST>\n命令行跑一次\n</USER_REQUEST>'},
+            {'step_index': 1, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(11),
+             'model': 'gemini-4-neon-high', 'input_tokens': 100, 'cache_read_tokens': 0, 'output_tokens': 20,
+             'content': '命令行完成'},
+        ], flavor='antigravity-cli')
+        self.gdb('antigravity-cli', [
+            (GID, '', '', '', '', '', '', '', '', 0, 0),
+        ])
+        self.gdb('antigravity', [
+            (GID, '接入 Gemini 支持', '', json.dumps(['file:///d%3A/work/gmproj']), 'p-main', 'CASCADE_RUN_STATUS_IDLE', '', '', '', 0, 0),
+            (GSUB, 'Subagent research', '', '', '', 'CASCADE_RUN_STATUS_IDLE', '', 'research', GID, 1, 0),
+            (GCLI, 'CLI 归档会话', '', json.dumps(['file:///d%3A/work/cli']), 'default-cli-project', 'CASCADE_RUN_STATUS_IDLE',
+             'CORTEX_TRAJECTORY_SOURCE_CLI', '', '', 0, 0),
+        ], fts_rows=[(GID, 0), (GCLI, 1)])
+        # 同时放一个 Claude 和一个 Codex 会话，验证三来源并存
+        self.write('aaaa1111', [user('u1', None, 'Claude 这边接入', 1, 'aaaa1111')])
+        d = os.path.join(self.tmp.name, 'codex', 'sessions', '2026', '01', '01')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'rollout-2026-01-01T00-00-00-%s.jsonl' % TID), 'w', encoding='utf-8', newline='\n') as f:
+            for r in (cx(0, 'session_meta', {'id': TID, 'cwd': 'C:\\work\\cxproj'}),
+                      cx(1, 'response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Codex 这边接入'}]})):
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        return self.open()
+
+    def test_antigravity_transcripts_subagents_images_and_three_sources(self):
+        cat = self.build()
+        gms = {s.cli_ids[0]: s for s in cat.sessions if s.src == 'gemini'}
+        self.assertEqual(sorted(gms), sorted([GID, GCLI]))              # 子代理不列作顶层会话
+        s, cli_s = gms[GID], gms[GCLI]
+        c = cat.content(s)
+        self.assertEqual((s.proj, s.archived, s.origin, s.model, s.effort), ('gmproj', False, 'antigravity', 'gemini-4-neon', 'xhigh'))
+        self.assertEqual((cli_s.proj, cli_s.archived, cli_s.origin), ('cli', True, 'antigravity-cli'))
+        self.assertEqual(c['title'], '接入 Gemini 支持')
+        self.assertEqual(c['first_prompt'], '帮我把 Gemini 接入进来')
+        self.assertEqual([it['kind'] for it in c['items']], ['user', 'think', 'tools', 'note', 'compact', 'summary', 'notice', 'asst'])
+        # 用户图片在 ~/.gemini 内允许读取，目录外的图片拒绝读取
+        prompt = c['items'][0]
+        self.assertEqual(load_image(self.app.index, prompt['imgs'][0]), (PNG, 'image/png'))
+        self.assertIsNone(load_image(self.app.index, prompt['imgs'][1]))
+        # 工具调用配对、修改过的文件、失败输出、截图与子代理链接
+        ed, cmd, sub_call = c['items'][2]['tools']
+        self.assertEqual((ed['name'], ed['hint'], ed['preview']), ('edit_file', 'd:\\work\\gmproj\\app.py', 'Edited app.py'))
+        self.assertEqual([p for p, _, _ in c['changed']], ['d:\\work\\gmproj\\app.py'])
+        self.assertEqual((cmd['name'], cmd['hint'], cmd['error'], cmd['nimg']), ('run_command', '运行测试', True, 1))
+        self.assertEqual(sub_call['agent'], GSUB)
+        d = load_tool(self.app.index, self.app.sources, cmd['use'], cmd['res'])
+        self.assertTrue(d['error'])
+        self.assertIn('1 failed', d['result'])
+        self.assertIn('exit code 1', d['result'])
+        self.assertEqual(load_image(self.app.index, d['images'][0]), (PNG, 'image/png'))
+        # 用量包含主会话两步（老版本由 USER_SETTINGS_CHANGE 补出的 3.8 Flash + 4 Neon）以及子代理的 4 Hydrogen
+        u = c['usage']
+        self.assertEqual((u['n'], u['input'], u['cache_read'], u['output']), (3, 1900, 13000, 380))
+        expected = ((1000 * 1.5 + 2000 * 0.15 + 100 * 7.5)
+                    + (500 * 3 + 10000 * 0.15 + 200 * 15)
+                    + (400 * 1.5 + 1000 * 0.075 + 80 * 7.5)) / 1e6
+        self.assertAlmostEqual(u['cost'], expected, places=7)
+        self.assertEqual({m['name'] for m in u['models']}, {'Gemini 3.8 Flash', 'Gemini 4 Neon', 'Gemini 4 Hydrogen'})
+        self.assertEqual({e['effort'] for e in u['efforts']}, {'high', 'xhigh'})
+        # 详情、子代理页、独立导出、搜索与统计
+        info = cat.info(s)
+        self.assertEqual((info['resume'], info['link'], info['id']), ('agy --conversation ' + GID, None, None))
+        self.assertEqual(info['subagents'], [{'id': GSUB, 'name': 'research'}])
+        self.assertEqual(cat.search('子代理发现关键线索'), [])          # 子代理不混进主搜索
+        self.assertEqual([g['session'].src for g in cat.search('接入', src='gemini')], ['gemini'])
+        st = stats.compute(cat, src='gemini')
+        self.assertEqual((st['sessions'], st['total']['n'], st['quota']), (2, 4, []))
+        page = render.session_page(s, c, render.ServerMode(cat.agents), info=info)
+        self.assertIn('<b>Gemini</b>', page)
+        self.assertIn('data-src="gemini"', page)
+        self.assertIn('href="/agent/%s"' % GSUB, page)
+        self.assertIn('Gemini', render.session_markdown(s, c))
+        exported = export_html(cat, s, images=True)
+        self.assertIn('data:image/png;base64,', exported)
+        self.assertNotIn('/static/', exported)
+        idx_html = self.app.index_html()
+        self.assertIn('class="seg srcs s3"', idx_html)
+        self.assertIn('data-s="gemini"', idx_html)
+        self.assertIn('data-g="', idx_html)
+        # HTTP 接口：子代理页、搜索与统计按 src=gemini 筛选
+        get = self.serve()
+        status, body, _ = get('/agent/' + GSUB)
+        self.assertEqual(status, 200)
+        self.assertIn('子代理发现关键线索', body.decode())
+        self.assertIn('<b>Gemini</b>', body.decode())
+        self.assertEqual(json.loads(get('/api/stats?src=gemini&days=0')[1])['total']['n'], 4)
+        self.assertEqual(json.loads(get('/api/search?q=%E6%8E%A5%E5%85%A5&src=gemini')[1])['total'], 1)
+        # 增量追加后刷新
+        self.gwrite(GID, [{'step_index': 9, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE',
+                           'created_at': ts(12), 'content': '<USER_REQUEST>\n再来一轮\n</USER_REQUEST>'}], mode='a')
+        self.assertTrue(cat.refresh(force=True))
+        self.assertEqual(self.texts(cat.content(cat.by_page[s.page])['items'], 'user'), ['帮我把 Gemini 接入进来', '再来一轮'])
+
+    def test_uri_and_model_parsing(self):
+        self.assertEqual(gemini.parse_model('gemini-4-neon-xhigh'), ('gemini-4-neon', 'xhigh'))
+        self.assertEqual(gemini.parse_model('gemini-4-hydrogen-tiered-high'), ('gemini-4-hydrogen', 'high'))
+        self.assertEqual(gemini.parse_model('gemini-4-argon-trial'), ('gemini-4-argon', ''))
+        self.assertEqual(gemini.parse_model('gemini-4-argon-e'), ('gemini-4-argon', ''))
+        self.assertEqual(gemini.parse_model('gemini-3.8-flash-n'), ('gemini-3.8-flash', ''))
+        self.assertEqual(gemini.parse_model('gemini-3.8-flash-tiered'), ('gemini-3.8-flash', ''))
+        self.assertEqual(gemini.parse_model('Gemini 3.8 Flash (High)'), ('gemini-3.8-flash', 'high'))
+        self.assertEqual(gemini.parse_model('Claude Opus 5.5 (High)'), ('claude-opus-5-5', 'high'))
+        self.assertEqual(gemini.parse_model('None'), ('', ''))
+        p = gemini.uri_to_path('file:///d%3A/Github/Sessiontool')
+        self.assertTrue(p.lower().replace('\\', '/').endswith('d:/github/sessiontool'))
+        self.assertFalse(p.startswith('\\d:') or p.startswith('/d:'))
+
+    def test_conv_db_gen_metadata_recovers_model_tokens_and_thinking(self):
+        def varint(n):
+            out = bytearray()
+            while True:
+                b = n & 0x7f
+                n >>= 7
+                out.append(b | (0x80 if n else 0))
+                if not n:
+                    return bytes(out)
+
+        def f_varint(fn, n):
+            return varint((fn << 3) | 0) + varint(n)
+
+        def f_bytes(fn, data):
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+            return varint((fn << 3) | 2) + varint(len(data)) + data
+
+        def gen_blob(steps, raw_model, label, inp, out_tok, cr, think):
+            usage = f_varint(2, inp) + f_varint(3, out_tok) + f_varint(5, cr) + f_varint(9, think)
+            inner = f_bytes(4, usage) + (f_bytes(19, raw_model) if raw_model else b'') + (f_bytes(21, label) if label else b'')
+            packed = b''.join(varint(s) for s in steps)
+            return f_bytes(1, inner) + f_bytes(2, packed)
+
+        cid = '33333333-3333-4333-8333-333333333333'
+        # transcript_full.jsonl 里既没有 model（步骤 1）也没有 token 字段（步骤 2）
+        self.gwrite(cid, [
+            {'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE', 'created_at': ts(1),
+             'content': '<USER_REQUEST>\n用 gen_metadata 补齐\n</USER_REQUEST>'},
+            {'step_index': 1, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(2),
+             'input_tokens': 1000, 'cache_read_tokens': 2000, 'output_tokens': 300, 'content': '第一步'},
+            {'step_index': 2, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(3),
+             'content': '第二步'},
+        ])
+        cdb = os.path.join(self.tmp.name, 'gemini', 'antigravity', 'conversations', cid + '.db')
+        os.makedirs(os.path.dirname(cdb), exist_ok=True)
+        con = sqlite3.connect(cdb)
+        con.execute('CREATE TABLE gen_metadata(idx INT PRIMARY KEY, data BLOB)')
+        con.execute('INSERT INTO gen_metadata VALUES(0, ?)',
+                    (gen_blob([1], 'gemini-3.8-flash-tiered', '', 1000, 300, 2000, 180),))
+        con.execute('INSERT INTO gen_metadata VALUES(1, ?)',
+                    (gen_blob([2], 'gemini-4-argon-trial', 'Gemini 4 Argon (High)', 500, 120, 4000, 90),))
+        con.commit()
+        con.close()
+        cat = self.open()
+        s = [x for x in cat.sessions if x.cli_ids[0] == cid][0]
+        u = cat.content(s)['usage']
+        self.assertEqual((u['n'], u['unpriced'], u['thinking']), (2, 0, 270))
+        self.assertEqual({m['name'] for m in u['models']}, {'Gemini 3.8 Flash', 'Gemini 4 Argon'})
+        self.assertEqual((s.model, s.effort), ('gemini-4-argon', 'high'))
+
+    def test_empty_stubs_skipped_and_unknown_projects_and_models_handled(self):
+        # Claude 空占位文件（仅含 file-history-snapshot）和 Codex 仅含 session_meta 的空文件不生成空会话
+        self.write('stub0001', [{'type': 'file-history-snapshot', 'messageId': 'x'}])
+        d = os.path.join(self.tmp.name, 'codex', 'sessions', '2026', '01', '01')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'rollout-2026-01-01T00-00-00-%s.jsonl' % TID), 'w', encoding='utf-8', newline='\n') as f:
+            f.write(json.dumps(cx(0, 'session_meta', {'id': TID, 'cwd': 'C:\\work\\empty'})) + '\n')
+        # Antigravity：一个无 workspace 但绑定 config/projects 自定义项目，一个完全无文件夹且含未记录模型的回复
+        g_proj, g_free = '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'
+        self.gwrite(g_proj, [
+            {'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE', 'created_at': ts(1),
+             'content': '<USER_REQUEST>\n带项目配置\n</USER_REQUEST>'},
+            {'step_index': 1, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(2),
+             'model': 'gemini-4-neon-xhigh', 'input_tokens': 100, 'cache_read_tokens': 0, 'output_tokens': 10, 'content': '好'},
+        ])
+        self.gwrite(g_free, [
+            {'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE', 'created_at': ts(3),
+             'content': '<USER_REQUEST>\n没选文件夹的提问\n</USER_REQUEST>'},
+            {'step_index': 1, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(4),
+             'input_tokens': 100, 'cache_read_tokens': 0, 'output_tokens': 10, 'content': '回复'},
+            {'step_index': 2, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(5),
+             'model': 'brand-new-model-9', 'input_tokens': 50, 'cache_read_tokens': 0, 'output_tokens': 5, 'content': '新模型'},
+        ])
+        self.gdb('antigravity', [
+            (g_proj, '项目内对话', '', '', 'proj-custom', 'CASCADE_RUN_STATUS_IDLE', '', '', '', 0, 0),
+            (g_free, '随手一问', '', '', 'builtin-playground', 'CASCADE_RUN_STATUS_IDLE', '', '', '', 0, 0),
+        ])
+        pdir = os.path.join(self.tmp.name, 'gemini', 'config', 'projects')
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, 'proj-custom.json'), 'w', encoding='utf-8') as f:
+            json.dump({'id': 'proj-custom', 'name': '我的自定义项目', 'projectResources': {}}, f, ensure_ascii=False)
+        cat = self.open()
+        self.assertEqual(len(cat.sessions), 2)
+        by = {s.cli_ids[0]: s for s in cat.sessions}
+        self.assertEqual(by[g_proj].proj, '我的自定义项目')
+        self.assertEqual(by[g_free].proj, '无文件夹')
+        st = stats.compute(cat, src='gemini')
+        self.assertEqual(st['favorite']['name'], 'Gemini 4 Neon')       # 优先有名字的模型，且空模型不占彩色槽位
+        by_m = {m['model']: m for m in st['models']}
+        self.assertEqual(by_m['']['name'], '未记录模型')
+        self.assertEqual(by_m['']['slot'], stats.SLOTS)
+        self.assertEqual(st['total']['unpriced_models'], ['brand-new-model-9'])
+        self.assertEqual(cat.content(by[g_free])['usage']['unpriced_models'], ['brand-new-model-9'])
+
+    def test_stats_slots_are_scoped_per_source(self):
+        # 其他来源占满 10 个高花费模型时，切到 Claude 视图后 Claude 自己的模型仍应各自获得独立槽位而非归入“其他”
+        steps = []
+        for i in range(12):
+            steps.append({'step_index': i, 'source': 'MODEL', 'type': 'PLANNER_RESPONSE', 'status': 'DONE', 'created_at': ts(i + 1),
+                          'model': 'gemini-4-neon' if i == 0 else 'custom-big-model-%d' % i,
+                          'input_tokens': 100000, 'cache_read_tokens': 0, 'output_tokens': 100000, 'content': 'ok'})
+        self.gwrite(GID, [{'step_index': 0, 'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'status': 'DONE',
+                           'created_at': ts(0), 'content': '<USER_REQUEST>\n高消耗\n</USER_REQUEST>'}] + steps)
+        self.write('aaaa1111', [
+            user('u1', None, '问一', 1, 'aaaa1111'),
+            reply('a1', 'u1', 'm1', '答一', 2, 'aaaa1111', model='claude-opus-5-5', out=10),
+            reply('a2', 'a1', 'm2', '答二', 3, 'aaaa1111', model='claude-fable-5-2', out=10),
+            reply('a3', 'a2', 'm3', '答三', 4, 'aaaa1111', model='claude-haiku-5-5', out=10),
+        ])
+        cat = self.open()
+        st = stats.compute(cat, src='claude')
+        self.assertEqual(set(st['slots']), {'Opus 5.5', 'Fable 5.2', 'Haiku 5.5'})
+        self.assertTrue(all(m['slot'] < len(st['slots']) for m in st['models']))
+
+
 class UsageTest(StoreCase):
     def build(self):
         self.write('pppp0001', [user('p1', None, '原会话的问题', 1, 'pppp0001'),
@@ -305,19 +605,43 @@ class PricingTest(StoreCase):
     def test_model_ids_and_tiers(self):
         self.assertEqual(pricing.key('claude-opus-4-1-20250805'), 'claude-opus-4-1')
         self.assertEqual(pricing.key('claude-opus-4-20250514'), 'claude-opus-4')
+        self.assertEqual(pricing.key('claude-fable-5-2'), 'claude-fable-5-2')
+        self.assertEqual(pricing.key('claude-mythos-5-2'), 'claude-mythos-5-2')
         self.assertEqual(pricing.key('claude-fable-5-1[1m]'), 'claude-fable-5-1')
         self.assertEqual(pricing.key('us.anthropic.claude-sonnet-4-5-20250929-v1:0'), 'claude-sonnet-4-5')
         self.assertEqual(pricing.key('gpt-5-codex'), 'gpt-5-codex')
         self.assertEqual(pricing.key('gpt-6-astra'), 'gpt-6-astra')
         self.assertEqual(pricing.key('gpt6astra'), 'gpt-6-astra')
+        self.assertEqual(pricing.key('gpt-6.2-astra'), 'gpt-6.2-astra')
+        self.assertEqual(pricing.key('gpt62astra'), 'gpt-6.2-astra')
+        self.assertEqual(pricing.key('gpt-6.2-sol'), 'gpt-6.2-sol')
+        self.assertEqual(pricing.key('gpt-6.1-terra'), 'gpt-6.1-terra')
+        self.assertEqual(pricing.key('gpt-6-luna'), 'gpt-6-luna')
+        self.assertEqual(pricing.key('gpt-5.4'), 'gpt-5.4')
+        self.assertEqual(pricing.key('gpt-5.3-codex'), 'gpt-5.3-codex')
         self.assertEqual(pricing.key('gpt-6-astra-2026-10-01'), 'gpt-6-astra')
         self.assertEqual(pricing.key('global.openai.gpt-6-astra'), 'gpt-6-astra')
+        self.assertEqual(pricing.parts('claude-fable-5-2', '', 100000, 10000, 100000, 0, 0, 0)[:3], (0.8, 0.4, 0.02))
+        self.assertEqual(pricing.parts('claude-fable-5-2', 'fast', 100000, 10000, 100000, 0, 0, 0)[:3], (1.6, 0.8, 0.04))
+        self.assertEqual(pricing.parts('claude-sonnet-5-5', '', 100000, 10000, 100000, 0, 0, 0)[:3], (0.2, 0.1, 0.01))
+        self.assertEqual(pricing.parts('gpt-6.2-astra', '', 100000, 10000, 100000, 0, 0, 0)[:3], (0.8, 0.4, 0.04))
+        self.assertEqual(pricing.parts('gpt-6.2-astra', '', 200000, 10000, 100000, 0, 0, 0)[:3], (3.2, 0.6, 0.08))
+        self.assertEqual(pricing.parts('gpt-6.2-astra', 'fast', 100000, 10000, 100000, 0, 0, 0)[:3], (1.6, 0.8, 0.08))
+        self.assertEqual(pricing.parts('gpt-6.2-sol', '', 100000, 10000, 100000, 0, 0, 0)[:3], (0.2, 0.1, 0.01))
+        self.assertEqual(pricing.parts('gpt-6.1-terra', '', 100000, 10000, 100000, 0, 0, 0)[:3], (0.1, 0.05, 0.005))
         self.assertEqual(pricing.parts('gpt6astra', '', 100000, 10000, 100000, 0, 0, 0)[:3], (1.0, 0.5, 0.1))
         self.assertEqual(pricing.parts('gpt-6-astra', '', 200000, 10000, 100000, 0, 0, 0)[:3], (4.0, 0.75, 0.2))
         self.assertEqual(pricing.parts('gpt-6-astra', 'fast', 100000, 10000, 100000, 0, 0, 0)[:3], (2.0, 1.0, 0.2))
         self.assertIsNone(pricing.key('claude-opus-4-9'))
-        self.assertEqual([pricing.model_name(m) for m in ('claude-opus-5-5', 'claude-3-5-haiku-20241022', 'claude-opus-4-20250514', 'gpt-6.1-sol')],
-                         ['Opus 5.5', 'Haiku 3.5', 'Opus 4', 'gpt-6.1-sol'])
+        self.assertEqual([pricing.model_name(m) for m in ('claude-fable-5-2', 'claude-opus-5-5', 'claude-3-5-haiku-20241022', 'claude-opus-4-20250514', 'gpt-6.1-sol',
+                                                          'gemini-4-neon', 'gemini-4-hydrogen-tiered-high', 'gemini-3.8-flash', 'gemini-2.5-flash-lite')],
+                         ['Fable 5.2', 'Opus 5.5', 'Haiku 3.5', 'Opus 4', 'gpt-6.1-sol',
+                          'Gemini 4 Neon', 'Gemini 4 Hydrogen', 'Gemini 3.8 Flash', 'Gemini 2.5 Flash-Lite'])
+        self.assertEqual(pricing.key('gemini-4-neon-xhigh'), 'gemini-4-neon')
+        self.assertEqual(pricing.key('gemini-4-hydrogen-tiered-high'), 'gemini-4-hydrogen')
+        self.assertEqual(pricing.key('google.gemini-3.1-pro-preview'), 'gemini-3.1-pro')
+        self.assertEqual(pricing.parts('gemini-4-neon', '', 100000, 10000, 100000, 0, 0, 0)[:3], (0.3, 0.15, 0.015))
+        self.assertEqual(pricing.parts('gemini-3.1-pro', '', 150000, 10000, 100000, 0, 0, 0)[:3], (0.6, 0.18, 0.04))
         small = pricing.parts('claude-haiku-5-5', '', 1000, 0, 0, 0, 0, 0)
         big = pricing.parts('claude-haiku-5-5', '', 150000, 0, 0, 0, 0, 0)
         self.assertAlmostEqual(big[0] / 150, small[0] * 5)              # 提示词超过 10 万 token 换一档

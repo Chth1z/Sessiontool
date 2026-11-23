@@ -68,7 +68,8 @@ class Case(unittest.TestCase):
         if self.app:
             self.app.index.close()
         self.app = App(Sources(root=self.root, stores=[self.store], home=os.path.join(self.tmp.name, 'home'),
-                               codex=os.path.join(self.tmp.name, 'codex'), profile=os.path.join(self.tmp.name, 'claude.json')))
+                               codex=os.path.join(self.tmp.name, 'codex'), gemini=os.path.join(self.tmp.name, 'gemini'),
+                               profile=os.path.join(self.tmp.name, 'claude.json')))
         self.app.catalog.refresh(force=True)
         return self.app.catalog
 
